@@ -1,6 +1,5 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::fmt::Debug;
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -477,15 +476,6 @@ pub struct IssuedCredential {
     pub actor_id: ActorId,
     pub secret: String,
 }
-pub trait EventStore: Send + Sync {
-    fn append_mutation<T: Serialize + Debug>(
-        &self,
-        ctx: &SessionContext,
-        key: &IdempotencyKey,
-        request: &T,
-    ) -> CoreResult<Mutation<serde_json::Value>>;
-}
-
 #[cfg(test)]
 mod authentication_contract_tests {
     use super::*;
