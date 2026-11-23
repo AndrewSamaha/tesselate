@@ -12,3 +12,6 @@ uuid = { version = "1", features = ["serde", "v4"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 sha2 = "0.10"
 toml = "0.8"
+rmcp = { version = "3.11", default-features = false, features = ["server", "transport-io"] }
+tokio = { version = "1.54", features = ["io-util", "io-std", "macros", "net", "rt-multi-thread", "sync"] }
+libc = "0.2"
