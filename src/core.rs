@@ -189,6 +189,7 @@ pub struct Message {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Workspace {
     pub id: WorkspaceId,
+    pub assignment_id: String,
     pub task_id: TaskId,
     pub repository_id: RepositoryId,
     pub base_commit: String,
@@ -380,6 +381,18 @@ pub struct InspectWorkspace {
     pub workspace_id: WorkspaceId,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WorkspaceInspection {
+    pub workspace: Workspace,
+    pub head: CommitRef,
+    pub clean: bool,
+    pub changed_paths: Vec<String>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CaptureWorkspaceCommits {
+    pub workspace_id: WorkspaceId,
+    pub expected_head: String,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CleanupWorkspace {
     pub workspace_id: WorkspaceId,
 }
@@ -471,6 +484,8 @@ pub enum GitCheckpoint {
     MutationStarted,
     GitApplied,
     Recorded,
+    CleanupStarted,
+    Cleaned,
     Conflict,
 }
 

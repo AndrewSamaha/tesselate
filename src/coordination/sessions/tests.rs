@@ -421,8 +421,25 @@ fn lease_generation_is_revision_fenced_against_reassignment_and_workspace_is_ret
             IdempotencyKey("assignment".into()),
         )
         .unwrap();
+    let assignment_id =
+        f.db.list_entities::<AssignmentRecord>(
+            EntityKind::Assignment,
+            &EntityScope {
+                task_id: Some(task.id.0.to_string()),
+                ..Default::default()
+            },
+            PageRequest {
+                limit: 20,
+                after: None,
+            },
+        )
+        .unwrap()
+        .items[0]
+            .id
+            .clone();
     let workspace = Workspace {
         id: WorkspaceId::new(),
+        assignment_id,
         task_id: task.id,
         repository_id: RepositoryId::new(),
         base_commit: "base".into(),
