@@ -17,4 +17,4 @@
 - A client can reconnect after service restart, read missed messages/events, and continue with its retained assignment.
 - The tool namespace and JSON shapes match F00's contract tests.
 
-**Boundary:** Tesselate does not launch or host models. A demonstration harness may launch clients externally.
+**Boundary:** Tesselate does not launch or host models. F08 exposes the coordinator runner over injected `Coordination` and `SessionAuthenticator` services; F09 owns concrete application composition and process startup. A demonstration harness may launch MCP clients externally.

@@ -782,6 +782,19 @@ fn available_work_allows_supervisors_and_persists_expired_run_stop() {
         )
         .unwrap();
     assert!(work.items.is_empty());
+    let events_after_stop = db.event_count().unwrap();
+    let repeated_poll = engine
+        .available_work(
+            &supervisor,
+            project,
+            PageRequest {
+                limit: 50,
+                after: None,
+            },
+        )
+        .unwrap();
+    assert!(repeated_poll.items.is_empty());
+    assert_eq!(db.event_count().unwrap(), events_after_stop);
     let stopped = db
         .load::<Run>(EntityKind::Run, &run.id.0.to_string())
         .unwrap()
