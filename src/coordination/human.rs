@@ -245,6 +245,14 @@ impl HumanCoordinator {
         question: String,
         context: String,
     ) -> CoreResult<()> {
+        let evidence_generation = if gate_key.starts_with("run_completion:") {
+            Some(self.completion_evidence_generation(run_id)?)
+        } else {
+            None
+        };
+        let gate_key = evidence_generation.map_or(gate_key.clone(), |generation| {
+            format!("{gate_key}:evidence:{generation}")
+        });
         let id = gate_id(&gate_key);
         let mut decision = if let Some((decision, _)) = self
             .db
@@ -308,6 +316,34 @@ impl HumanCoordinator {
                 "human decision was escalated".into(),
             )),
         }
+    }
+
+    fn completion_evidence_generation(&self, run_id: RunId) -> CoreResult<u64> {
+        let scope = EventScope {
+            project_id: None,
+            run_id: Some(run_id),
+            task_id: None,
+        };
+        let mut cursor: Option<EventCursor> = None;
+        let mut generation = 0;
+        loop {
+            let page = self
+                .db
+                .events_after(scope.clone(), cursor.as_ref(), 500)
+                .map_err(storage_error)?;
+            let count = page.items.len();
+            for event in page.items {
+                if event.event_type.starts_with("task.") || event.event_type.starts_with("review.")
+                {
+                    generation = generation.max(event.sequence);
+                }
+            }
+            if count < 500 {
+                break;
+            }
+            cursor = page.next_cursor.map(EventCursor);
+        }
+        Ok(generation)
     }
 
     fn expire_if_due(&self, ctx: &SessionContext, id: HumanRequestId) -> CoreResult<bool> {
@@ -645,6 +681,42 @@ mod tests {
         }
     }
 
+    struct Workflow;
+    impl super::super::tasks::ProjectWorkflowPolicy for Workflow {
+        fn workflow_limits(&self, _: ProjectId) -> CoreResult<WorkflowLimits> {
+            Ok(WorkflowLimits {
+                max_duration_hours: 24,
+                max_concurrent_assignments: 2,
+                max_task_retries: 2,
+                max_review_rounds: 3,
+            })
+        }
+    }
+
+    struct Reviews;
+    impl super::super::tasks::ReviewCompletionGate for Reviews {
+        fn ensure_task_complete(
+            &self,
+            _: TaskId,
+        ) -> CoreResult<Vec<crate::persistence::StatePrecondition>> {
+            Ok(Vec::new())
+        }
+        fn reviewed_commits_for_run(&self, _: RunId) -> CoreResult<Vec<CommitRef>> {
+            Ok(Vec::new())
+        }
+    }
+
+    struct Leases;
+    impl super::super::tasks::AssignmentLeaseStatus for Leases {
+        fn expired_lease_fence(
+            &self,
+            _: TaskId,
+            _: ActorId,
+        ) -> CoreResult<super::super::tasks::LeaseFence> {
+            Err(CoreError::NotFound)
+        }
+    }
+
     fn context(role: Role) -> SessionContext {
         SessionContext::validated(SessionId::new(), ActorId::new(), role)
     }
@@ -871,6 +943,207 @@ mod tests {
             .unwrap();
         assert_eq!(resolved.value.status, HumanStatus::Resolved);
         coordinator.ensure_allowed(&supervisor, completion).unwrap();
+    }
+
+    #[test]
+    fn rejected_completion_gate_reopens_after_corrective_task_change() {
+        let (_temp, db, human, project, run, supervisor, cli) = fixture(Some(HumanGatePolicy {
+            completion_approval: true,
+        }));
+        let engine = super::super::tasks::TaskEngine::new(
+            db.clone(),
+            Arc::new(Workflow),
+            Arc::new(Reviews),
+            Arc::new(human),
+            Arc::new(Leases),
+        );
+        let completion = CompleteRun {
+            run_id: run.id,
+            outstanding_integration_steps: Vec::new(),
+        };
+        let key = IdempotencyKey("complete-after-gate".into());
+        assert!(matches!(
+            engine.complete_run(&supervisor, completion.clone(), key.clone()),
+            Err(CoreError::Recoverable(_))
+        ));
+        let first = db
+            .list_entities::<HumanDecision>(
+                EntityKind::HumanRequest,
+                &EntityScope {
+                    project_id: Some(project.id.0.to_string()),
+                    ..Default::default()
+                },
+                PageRequest {
+                    limit: 10,
+                    after: None,
+                },
+            )
+            .unwrap()
+            .items
+            .remove(0);
+        let human = HumanCoordinator::new(
+            db.clone(),
+            Arc::new(Policy(Some(HumanGatePolicy {
+                completion_approval: true,
+            }))),
+        );
+        human
+            .resolve_human(
+                &cli,
+                ResolveHumanRequest {
+                    request_id: first.id,
+                    choice: "reject".into(),
+                    reason: "more work is needed".into(),
+                },
+                IdempotencyKey("reject-first".into()),
+            )
+            .unwrap();
+        assert!(matches!(
+            engine.complete_run(&supervisor, completion.clone(), key.clone()),
+            Err(CoreError::Recoverable(_))
+        ));
+        let unchanged = human
+            .list_human_requests(
+                &cli,
+                ListHumanRequests {
+                    project_id: project.id,
+                    page: PageRequest {
+                        limit: 10,
+                        after: None,
+                    },
+                },
+            )
+            .unwrap();
+        assert_eq!(unchanged.items.len(), 1);
+        assert_eq!(unchanged.items[0].id, first.id);
+
+        let (run_record, run_revision) = db
+            .load::<Run>(EntityKind::Run, &run.id.0.to_string())
+            .unwrap()
+            .unwrap();
+        let task_id = TaskId::new();
+        let task = Task {
+            id: task_id,
+            run_id: run.id,
+            title: "corrective task".into(),
+            goal: "complete the requested fix".into(),
+            status: TaskStatus::Completed,
+            owner: None,
+            progress: None,
+            attempts: 1,
+            submitted_commits: Vec::new(),
+            result: Some("fixed".into()),
+        };
+        let record = super::super::tasks::TaskRecord {
+            task: task.clone(),
+            dependencies: Vec::new(),
+            waiting_on_dependencies: false,
+            final_disposition: Some(FinalTaskDisposition {
+                task_id,
+                outcome: FinalTaskOutcome::Completed,
+                reason: "corrective work complete".into(),
+            }),
+        };
+        let changes = vec![
+            StateChange::update(
+                EntityKind::Run,
+                run.id.0.to_string(),
+                EntityScope {
+                    project_id: Some(project.id.0.to_string()),
+                    run_id: Some(run.id.0.to_string()),
+                    ..Default::default()
+                },
+                run_revision,
+                &run_record,
+            )
+            .unwrap(),
+            StateChange::insert(
+                EntityKind::Task,
+                task_id.0.to_string(),
+                EntityScope {
+                    project_id: Some(project.id.0.to_string()),
+                    run_id: Some(run.id.0.to_string()),
+                    task_id: Some(task_id.0.to_string()),
+                    ..Default::default()
+                },
+                &record,
+            )
+            .unwrap(),
+        ];
+        db.commit_mutation(MutationInput {
+            context: &supervisor,
+            operation: "test.corrective_work",
+            idempotency_key: &IdempotencyKey("corrective-work".into()),
+            request: &task_id,
+            preconditions: Vec::new(),
+            result: &task,
+            changes,
+            event: NewEvent::from_context(
+                &supervisor,
+                "supervisor",
+                EventScope {
+                    project_id: Some(project.id),
+                    run_id: Some(run.id),
+                    task_id: Some(task_id),
+                },
+                "task.disposition",
+                json!({"outcome":"completed","reason":"corrective work complete"}),
+            ),
+        })
+        .unwrap();
+
+        assert!(matches!(
+            engine.complete_run(&supervisor, completion.clone(), key.clone()),
+            Err(CoreError::Recoverable(_))
+        ));
+        let decisions = human
+            .list_human_requests(
+                &cli,
+                ListHumanRequests {
+                    project_id: project.id,
+                    page: PageRequest {
+                        limit: 10,
+                        after: None,
+                    },
+                },
+            )
+            .unwrap();
+        assert_eq!(decisions.items.len(), 2);
+        let next = decisions
+            .items
+            .iter()
+            .find(|decision| decision.id != first.id)
+            .unwrap();
+        human
+            .resolve_human(
+                &cli,
+                ResolveHumanRequest {
+                    request_id: next.id,
+                    choice: "approve".into(),
+                    reason: "corrective work reviewed".into(),
+                },
+                IdempotencyKey("approve-second".into()),
+            )
+            .unwrap();
+        let completed = engine.complete_run(&supervisor, completion, key).unwrap();
+        assert_eq!(completed.value.status, RunStatus::Completed);
+        let history = human
+            .list_human_requests(
+                &cli,
+                ListHumanRequests {
+                    project_id: project.id,
+                    page: PageRequest {
+                        limit: 10,
+                        after: None,
+                    },
+                },
+            )
+            .unwrap();
+        assert_eq!(history.items.len(), 2);
+        assert!(history.items.iter().any(|decision| decision.id == first.id
+            && decision.resolution.as_ref().unwrap().choice == "reject"));
+        assert!(history.items.iter().any(|decision| decision.id == next.id
+            && decision.resolution.as_ref().unwrap().choice == "approve"));
     }
 
     #[test]
