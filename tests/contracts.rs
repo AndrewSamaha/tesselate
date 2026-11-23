@@ -11,6 +11,7 @@ fn event_envelope_is_versioned_and_stable() {
     };
     let event = Event {
         schema_version: 1,
+        sequence: 42,
         event_id: EventId::new(),
         occurred_at: Utc.timestamp_opt(1_800_000_000, 0).unwrap(),
         actor,
@@ -22,6 +23,7 @@ fn event_envelope_is_versioned_and_stable() {
     };
     let value = serde_json::to_value(event).unwrap();
     assert_eq!(value["schema_version"], 1);
+    assert_eq!(value["sequence"], 42);
     assert_eq!(value["actor"]["role"], "reviewer");
     assert_eq!(value["event_type"], "review.submitted");
     assert_eq!(value["payload"]["passed"], true);
@@ -29,41 +31,63 @@ fn event_envelope_is_versioned_and_stable() {
 
 #[test]
 fn mcp_request_response_shapes_are_versioned() {
-    let request = mcp::ToolRequest {
+    let request = mcp::MutationRequest {
         schema_version: mcp::PROTOCOL_VERSION,
         request_id: "r1".into(),
-        idempotency_key: Some(IdempotencyKey("i1".into())),
+        idempotency_key: IdempotencyKey("i1".into()),
         params: json!({"task_id": "t1"}),
     };
     let value = serde_json::to_value(request).unwrap();
+    assert_eq!(
+        value,
+        json!({"schema_version":1,"request_id":"r1","idempotency_key":"i1","params":{"task_id":"t1"}})
+    );
     assert_eq!(value["schema_version"], 1);
     assert_eq!(value["params"]["task_id"], "t1");
     let response = mcp::ToolResponse::<serde_json::Value> {
         schema_version: 1,
         request_id: "r1".into(),
-        result: Err(mcp::ToolError {
+        outcome: mcp::ToolOutcome::Error(mcp::ToolError {
             code: "forbidden".into(),
             message: "unauthorized".into(),
             retryable: false,
         }),
     };
     let value = serde_json::to_value(response).unwrap();
-    assert_eq!(value["result"]["Err"]["code"], "forbidden");
+    assert_eq!(
+        value,
+        json!({"schema_version":1,"request_id":"r1","outcome":{"status":"error","data":{"code":"forbidden","message":"unauthorized","retryable":false}}})
+    );
+    assert!(
+        serde_json::from_value::<mcp::MutationRequest<serde_json::Value>>(json!({
+            "schema_version": 1,
+            "request_id": "r3",
+            "params": {}
+        }))
+        .is_err()
+    );
+    assert!(value.get("session_context").is_none());
+    let success = mcp::ToolResponse {
+        schema_version: 1,
+        request_id: "r2".into(),
+        outcome: mcp::ToolOutcome::Success(json!({"ok":true})),
+    };
+    assert_eq!(
+        serde_json::to_value(success).unwrap()["outcome"]["status"],
+        "success"
+    );
 }
 
 #[test]
 fn context_carries_authority_separately_from_mutation_arguments() {
-    let context = SessionContext {
-        session_id: SessionId::new(),
-        actor_id: ActorId::new(),
-        role: Role::Coder,
-    };
     let request = UpdateProgress {
         task_id: TaskId::new(),
         progress: "working".into(),
     };
-    assert_eq!(context.role, Role::Coder);
-    assert!(!serde_json::to_value(request).unwrap().get("role").is_some());
+    let params = serde_json::to_value(request).unwrap();
+    assert!(params.get("role").is_none());
+    let forged_params = json!({"task_id": TaskId::new(), "progress":"x", "role":"supervisor"});
+    assert!(forged_params.get("role").is_some()); // Tool params cannot construct the opaque core context.
 }
 
 #[test]

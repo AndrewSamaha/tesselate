@@ -15,6 +15,8 @@ id_type!(
     EventId,
     MessageId,
     ReviewId,
+    ReviewRoundId,
+    FindingId,
     HumanRequestId,
     WorkspaceId,
     GitOperationId
@@ -31,11 +33,30 @@ pub enum Role {
     Reviewer,
     Cli,
 }
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionContext {
-    pub session_id: SessionId,
-    pub actor_id: ActorId,
-    pub role: Role,
+    session_id: SessionId,
+    actor_id: ActorId,
+    role: Role,
+}
+impl SessionContext {
+    #[allow(dead_code)] // Used by the F05 authenticator when its credential store is implemented.
+    pub(crate) fn validated(session_id: SessionId, actor_id: ActorId, role: Role) -> Self {
+        Self {
+            session_id,
+            actor_id,
+            role,
+        }
+    }
+    pub fn session_id(&self) -> SessionId {
+        self.session_id
+    }
+    pub fn actor_id(&self) -> ActorId {
+        self.actor_id
+    }
+    pub fn role(&self) -> Role {
+        self.role
+    }
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -138,16 +159,48 @@ pub struct Workspace {
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ReviewRound {
-    pub id: ReviewId,
+    pub id: ReviewRoundId,
     pub task_id: TaskId,
     pub round: u32,
+    pub commit_ids: Vec<String>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ReviewFinding {
+    pub id: FindingId,
+    pub severity: FindingSeverity,
+    pub location: String,
+    pub evidence: String,
+    pub proposed_correction: String,
+}
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FindingSeverity {
+    Low,
+    Medium,
+    High,
+    Critical,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FindingDisposition {
+    pub finding_id: FindingId,
+    pub disposition: DispositionKind,
+    pub reason: String,
+}
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DispositionKind {
+    Fixed,
+    Accepted,
+    Deferred,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Review {
     pub id: ReviewId,
+    pub round_id: ReviewRoundId,
     pub task_id: TaskId,
     pub reviewer: ActorId,
     pub passed: bool,
+    pub findings: Vec<ReviewFinding>,
     pub event_id: EventId,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -167,6 +220,15 @@ pub struct CreateTask {
 pub struct AssignTask {
     pub task_id: TaskId,
     pub assignee: ActorId,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ClaimTask {
+    pub task_id: TaskId,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ReleaseTask {
+    pub task_id: TaskId,
+    pub reason: String,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct UpdateProgress {
@@ -192,16 +254,79 @@ pub struct ReviewRequest {
     pub commit_ids: Vec<String>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct SubmitReview {
+pub struct ListReviews {
     pub task_id: TaskId,
-    pub passed: bool,
-    pub summary: String,
+    pub page: PageRequest,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct HumanRequest {
     pub task_id: Option<TaskId>,
     pub question: String,
     pub choices: Vec<String>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ListHumanRequests {
+    pub project_id: ProjectId,
+    pub page: PageRequest,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CreateRun {
+    pub project_id: ProjectId,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CreateTaskWithDependencies {
+    pub run_id: RunId,
+    pub title: String,
+    pub goal: String,
+    pub dependencies: Vec<TaskId>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SubmitTask {
+    pub task_id: TaskId,
+    pub commit_ids: Vec<String>,
+    pub summary: String,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CompleteRun {
+    pub run_id: RunId,
+    pub reviewed_commit_ids: Vec<String>,
+    pub outstanding_integration_steps: Vec<String>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AvailableWork {
+    pub tasks: Vec<Task>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ResolveHumanRequest {
+    pub request_id: HumanRequestId,
+    pub choice: String,
+    pub reason: String,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct InspectWorkspace {
+    pub workspace_id: WorkspaceId,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CleanupWorkspace {
+    pub workspace_id: WorkspaceId,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ReadMessages {
+    pub project_id: ProjectId,
+    pub task_id: Option<TaskId>,
+    pub page: PageRequest,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SubmitReview {
+    pub round_id: ReviewRoundId,
+    pub passed: bool,
+    pub summary: String,
+    pub findings: Vec<ReviewFinding>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DispositionFindings {
+    pub task_id: TaskId,
+    pub dispositions: Vec<FindingDisposition>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -213,8 +338,11 @@ pub struct Mutation<T> {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PageRequest {
     pub limit: u32,
-    pub after: Option<String>,
+    pub after: Option<EventCursor>,
 }
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(transparent)]
+pub struct EventCursor(pub String);
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Page<T> {
     pub items: Vec<T>,
@@ -229,6 +357,7 @@ pub struct EventScope {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Event {
     pub schema_version: u16,
+    pub sequence: u64,
     pub event_id: EventId,
     pub occurred_at: DateTime<Utc>,
     pub actor: Actor,
@@ -244,11 +373,23 @@ pub struct GitOperationIntent {
     pub id: GitOperationId,
     pub assignment_key: String,
     pub repository_id: RepositoryId,
+    pub canonical_repository_path: String,
     pub base_commit: String,
     pub branch: String,
     pub worktree_path: String,
     pub owner: ActorId,
-    pub phase: GitCheckpoint,
+    pub checkpoint: GitCheckpoint,
+    pub observed: Option<ObservedGitState>,
+    pub result: Option<Workspace>,
+    pub recovery_reason: Option<String>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ObservedGitState {
+    pub repository_path: String,
+    pub worktree_path: String,
+    pub branch: Option<String>,
+    pub head_commit: Option<String>,
+    pub clean: Option<bool>,
 }
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -261,13 +402,33 @@ pub enum GitCheckpoint {
 }
 
 pub trait CredentialIssuer: Send + Sync {
-    fn bootstrap(
+    fn bootstrap_supervisor(
         &self,
         bootstrap_secret: &str,
         actor_name: &str,
-        role: Role,
     ) -> CoreResult<IssuedCredential>;
-    fn revoke(&self, ctx: &SessionContext, session: SessionId) -> CoreResult<()>;
+    fn issue_agent(
+        &self,
+        supervisor: &SessionContext,
+        actor_name: &str,
+        role: AgentRole,
+    ) -> CoreResult<IssuedCredential>;
+    fn issue_cli(
+        &self,
+        supervisor: &SessionContext,
+        actor_name: &str,
+    ) -> CoreResult<IssuedCredential>;
+    fn revoke(&self, supervisor: &SessionContext, session: SessionId) -> CoreResult<()>;
+}
+/// Resolves a bearer credential to a coordinator-validated context. The result cannot be
+/// deserialized from client input or constructed outside this crate.
+pub trait SessionAuthenticator: Send + Sync {
+    fn authenticate(&self, bearer_credential: &str) -> CoreResult<SessionContext>;
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentRole {
+    Coder,
+    Reviewer,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IssuedCredential {
@@ -282,4 +443,34 @@ pub trait EventStore: Send + Sync {
         key: &IdempotencyKey,
         request: &T,
     ) -> CoreResult<Mutation<serde_json::Value>>;
+}
+
+#[cfg(test)]
+mod authentication_contract_tests {
+    use super::*;
+
+    struct CredentialMap;
+    impl SessionAuthenticator for CredentialMap {
+        fn authenticate(&self, credential: &str) -> CoreResult<SessionContext> {
+            match credential {
+                "coder-token" => Ok(SessionContext::validated(
+                    SessionId::new(),
+                    ActorId::new(),
+                    Role::Coder,
+                )),
+                _ => Err(CoreError::Unauthenticated),
+            }
+        }
+    }
+
+    #[test]
+    fn client_role_claim_cannot_override_validated_credential_role() {
+        let client_claim = Role::Supervisor;
+        let context = CredentialMap.authenticate("coder-token").unwrap();
+        assert_eq!(client_claim, Role::Supervisor);
+        assert_eq!(context.role(), Role::Coder);
+        assert!(CredentialMap
+            .authenticate("forged-supervisor-token")
+            .is_err());
+    }
 }
