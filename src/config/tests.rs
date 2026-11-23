@@ -100,6 +100,18 @@ fn absent_and_explicitly_disabled_human_gate_are_distinct() {
             high_severity_deferral_approval: true,
         })
     );
+
+    let high_severity_only =
+        format!("{no_table}\n[human]\nhigh_severity_deferral_approval = true\n");
+    assert_eq!(
+        parse_project_config(&high_severity_only, &temp.0)
+            .unwrap()
+            .human_gates,
+        Some(HumanGatePolicy {
+            completion_approval: false,
+            high_severity_deferral_approval: true,
+        })
+    );
 }
 
 #[test]
