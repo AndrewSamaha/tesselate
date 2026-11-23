@@ -504,6 +504,10 @@ fn directory_sync_failure_restores_the_previous_artifact() {
         },
     );
     assert!(result.is_err());
+    assert!(
+        destination.exists(),
+        "rollback must never leave the public path absent"
+    );
     assert_eq!(fs::read_to_string(destination).unwrap(), "old artifact");
 }
 
