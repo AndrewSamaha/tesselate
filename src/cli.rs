@@ -69,6 +69,8 @@ pub enum Command {
         #[command(subcommand)]
         action: ArtifactAction,
     },
+    /// Start the one shared coordinator for MCP harness sessions.
+    Serve,
     /// Invoke any versioned coordination operation using its JSON params contract.
     Call {
         tool: String,
@@ -420,6 +422,10 @@ pub fn execute(
                 }
             }
         }
+        Command::Serve => Err(CoreError::Invalid(
+            "serve must be started through the tesselate executable".into(),
+        )
+        .into()),
         Command::Call {
             tool,
             params,
@@ -957,6 +963,19 @@ completion_approval = {completion_gate}
         )
         .unwrap();
         assert_eq!(completed["value"]["status"], "completed");
+
+        let exported = execute(
+            &app,
+            &fixture.0.join("state"),
+            Some(&credential),
+            Command::Artifact {
+                action: ArtifactAction::Export {
+                    run_id: run_id.0.to_string(),
+                },
+            },
+        )
+        .unwrap();
+        assert!(exported["event_count"].as_u64().unwrap() >= 3);
     }
 
     #[test]
@@ -1040,6 +1059,18 @@ completion_approval = {completion_gate}
             )
             .unwrap()
             .value;
+        let inspection = execute(
+            &app,
+            &fixture.0.join("state"),
+            Some(&supervisor_credential),
+            Command::Workspace {
+                action: WorkspaceAction::Inspect {
+                    workspace_id: workspace.id.0.to_string(),
+                },
+            },
+        )
+        .unwrap();
+        assert_eq!(inspection["workspace"]["id"], json!(workspace.id));
         fs::write(
             Path::new(&workspace.path).join("dirty.txt"),
             "uncommitted\n",
@@ -1058,6 +1089,86 @@ completion_approval = {completion_gate}
         )
         .unwrap_err();
         assert!(error.to_string().contains("uncommitted changes"), "{error}");
+        fs::remove_file(Path::new(&workspace.path).join("dirty.txt")).unwrap();
+        let cleaned = execute(
+            &app,
+            &fixture.0.join("state"),
+            Some(&supervisor_credential),
+            Command::Workspace {
+                action: WorkspaceAction::Clean {
+                    workspace_id: workspace.id.0.to_string(),
+                    idempotency_key: "clean-after-dirty".into(),
+                },
+            },
+        )
+        .unwrap();
+        assert_eq!(cleaned["value"]["id"], json!(workspace.id));
+    }
+
+    #[test]
+    fn cli_credentials_are_returned_once_and_stored_in_private_files() {
+        let fixture = Fixture::new();
+        let app = fixture.app();
+        let state = fixture.0.join("state");
+        let bootstrap = execute(
+            &app,
+            &state,
+            None,
+            Command::Credential {
+                action: CredentialAction::Bootstrap {
+                    actor_name: "supervisor".into(),
+                },
+            },
+        )
+        .unwrap();
+        let supervisor_path = PathBuf::from(bootstrap["credential_file"].as_str().unwrap());
+        assert_eq!(
+            fs::read_to_string(&supervisor_path).unwrap(),
+            bootstrap["credential"].as_str().unwrap()
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&supervisor_path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+
+        let issued = execute(
+            &app,
+            &state,
+            Some(&supervisor_path),
+            Command::Credential {
+                action: CredentialAction::Issue {
+                    actor_name: "coder".into(),
+                    role: CredentialRole::Coder,
+                    idempotency_key: "issue-coder".into(),
+                },
+            },
+        )
+        .unwrap();
+        assert!(issued["credential"].as_str().is_some());
+        let coder_path = PathBuf::from(issued["credential_file"].as_str().unwrap());
+        assert_eq!(
+            fs::read_to_string(&coder_path).unwrap(),
+            issued["credential"].as_str().unwrap()
+        );
+        let replay = execute(
+            &app,
+            &state,
+            Some(&supervisor_path),
+            Command::Credential {
+                action: CredentialAction::Issue {
+                    actor_name: "coder".into(),
+                    role: CredentialRole::Coder,
+                    idempotency_key: "issue-coder".into(),
+                },
+            },
+        )
+        .unwrap();
+        assert!(replay["credential"].is_null());
+        assert!(replay["replayed"].as_bool().unwrap());
     }
 
     #[test]

@@ -1,12 +1,15 @@
 use clap::Parser;
-use std::process::ExitCode;
+use std::{process::ExitCode, sync::Arc};
 use tesselate::{
-    cli::{execute, prepare_state_dir, print_json, Cli},
-    coordination::application::Application,
+    cli::{execute, prepare_state_dir, print_json, Cli, Command},
+    coordination::{application::Application, Coordination},
+    core::SessionAuthenticator,
+    mcp::serve_coordinator,
     persistence::Database,
 };
 
-fn main() -> ExitCode {
+#[tokio::main]
+async fn main() -> ExitCode {
     let cli = Cli::parse();
     let state_dir = match prepare_state_dir(&cli.state_dir) {
         Ok(path) => path,
@@ -17,9 +20,17 @@ fn main() -> ExitCode {
         Err(error) => return report(error),
     };
     let application = match Application::new(db, state_dir.join("worktrees")) {
-        Ok(application) => application,
+        Ok(application) => Arc::new(application),
         Err(error) => return report(error),
     };
+    if matches!(cli.command, Command::Serve) {
+        let coordination: Arc<dyn Coordination> = application.clone();
+        let authenticator: Arc<dyn SessionAuthenticator> = application;
+        return match serve_coordinator(&state_dir, coordination, authenticator).await {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => report(error),
+        };
+    }
     match execute(
         &application,
         &state_dir,
