@@ -103,6 +103,45 @@ fn run_completion_does_not_accept_caller_claimed_reviewed_commits() {
 }
 
 #[test]
+fn run_request_and_snapshot_contract_include_goal_and_limits() {
+    let request = CreateRun {
+        project_id: ProjectId::new(),
+        goal: "ship feature".into(),
+    };
+    let value = serde_json::to_value(request).unwrap();
+    assert_eq!(value["goal"], "ship feature");
+    let run = Run {
+        id: RunId::new(),
+        project_id: ProjectId::new(),
+        goal: "ship feature".into(),
+        started_at: chrono::Utc::now(),
+        limits: WorkflowLimits {
+            max_duration_hours: 24,
+            max_concurrent_assignments: 4,
+            max_task_retries: 2,
+            max_review_rounds: 3,
+        },
+        status: RunStatus::Stopped,
+        reviewed_commit_ids: vec![],
+        outstanding_integration_steps: vec![],
+        outcome: Some(RunOutcome {
+            reason: "duration limit reached".into(),
+            remaining_task_ids: vec![TaskId::new()],
+        }),
+    };
+    let value = serde_json::to_value(run).unwrap();
+    assert_eq!(value["limits"]["max_task_retries"], 2);
+    assert_eq!(value["outcome"]["reason"], "duration limit reached");
+    assert_eq!(
+        value["outcome"]["remaining_task_ids"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
 fn context_carries_authority_separately_from_mutation_arguments() {
     let request = UpdateProgress {
         task_id: TaskId::new(),

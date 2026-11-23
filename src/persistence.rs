@@ -217,6 +217,39 @@ impl Database {
             .map_err(|_| PersistenceError::Poisoned)
     }
 
+    /// Look up a committed result before applying domain validation to a retry.
+    /// `commit_mutation` remains the transactional arbiter when no row exists yet.
+    pub fn prior_mutation<Q, R>(
+        &self,
+        context: &SessionContext,
+        operation: &str,
+        key: &IdempotencyKey,
+        request: &Q,
+    ) -> Result<Option<Mutation<R>>, PersistenceError>
+    where
+        Q: Serialize,
+        R: DeserializeOwned,
+    {
+        let request_json = canonical_json(request)?;
+        let connection = self.connection()?;
+        let stored = connection.query_row(
+            "SELECT request_json,result_json,event_id FROM idempotency_records WHERE session_id=?1 AND operation=?2 AND idempotency_key=?3",
+            params![context.session_id().0.to_string(), operation, key.0],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)),
+        ).optional()?;
+        let Some((prior_request, result_json, event_id)) = stored else {
+            return Ok(None);
+        };
+        if prior_request != request_json {
+            return Err(PersistenceError::IdempotencyConflict);
+        }
+        Ok(Some(Mutation {
+            value: serde_json::from_str(&result_json)?,
+            event_id: parse_event_id(&event_id)?,
+            replayed: true,
+        }))
+    }
+
     pub fn commit_mutation<Q, R>(
         &self,
         input: MutationInput<'_, Q, R>,

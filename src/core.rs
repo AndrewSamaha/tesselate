@@ -124,18 +124,38 @@ pub struct Repository {
 pub struct Run {
     pub id: RunId,
     pub project_id: ProjectId,
+    pub goal: String,
+    pub started_at: DateTime<Utc>,
+    pub limits: WorkflowLimits,
     pub status: RunStatus,
     pub reviewed_commit_ids: Vec<String>,
     pub outstanding_integration_steps: Vec<String>,
+    pub outcome: Option<RunOutcome>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkflowLimits {
+    pub max_duration_hours: u64,
+    pub max_concurrent_assignments: u32,
+    pub max_task_retries: u32,
+    pub max_review_rounds: u32,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RunOutcome {
+    pub reason: String,
+    pub remaining_task_ids: Vec<TaskId>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Task {
     pub id: TaskId,
     pub run_id: RunId,
     pub title: String,
+    pub goal: String,
     pub status: TaskStatus,
     pub owner: Option<ActorId>,
     pub progress: Option<String>,
+    pub attempts: u32,
+    pub commit_ids: Vec<String>,
+    pub result: Option<String>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Actor {
@@ -291,6 +311,7 @@ pub struct ListHumanRequests {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CreateRun {
     pub project_id: ProjectId,
+    pub goal: String,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CreateTaskWithDependencies {
