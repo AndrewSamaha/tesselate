@@ -36,6 +36,9 @@ fn mcp_request_response_shapes_are_versioned() {
     assert!(mcp::TOOLS.contains(&"tesselate.v1.reviews.rounds.list"));
     assert!(mcp::TOOLS.contains(&"tesselate.v1.tasks.disposition"));
     assert!(mcp::TOOLS.contains(&"tesselate.v1.artifacts.locate"));
+    assert!(mcp::TOOLS.contains(&"tesselate.v1.human.request"));
+    assert!(mcp::TOOLS.contains(&"tesselate.v1.human.list"));
+    assert!(mcp::TOOLS.contains(&"tesselate.v1.human.resolve"));
     assert!(mcp::TOOLS.contains(&"tesselate.v1.workspaces.commits.capture"));
     let request = mcp::MutationRequest {
         schema_version: mcp::PROTOCOL_VERSION,
@@ -81,6 +84,30 @@ fn mcp_request_response_shapes_are_versioned() {
     assert_eq!(
         serde_json::to_value(success).unwrap()["outcome"]["status"],
         "success"
+    );
+}
+
+#[test]
+fn human_decision_requests_have_stable_versioned_fields() {
+    let project_id = ProjectId::new();
+    let run_id = RunId::new();
+    let request = HumanRequest {
+        project_id,
+        run_id: Some(run_id),
+        task_id: None,
+        question: "Approve completion?".into(),
+        context: "All checks passed.".into(),
+        choices: vec!["approve".into(), "reject".into()],
+        expires_at: None,
+        on_expiry: None,
+    };
+    assert_eq!(
+        serde_json::to_value(request).unwrap(),
+        json!({"project_id":project_id,"run_id":run_id,"task_id":null,"question":"Approve completion?","context":"All checks passed.","choices":["approve","reject"],"expires_at":null,"on_expiry":null})
+    );
+    assert_eq!(
+        serde_json::to_value(HumanExpiryAction::Escalate).unwrap(),
+        json!("escalate")
     );
 }
 

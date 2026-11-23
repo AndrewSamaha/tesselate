@@ -283,8 +283,35 @@ pub struct Review {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct HumanDecision {
     pub id: HumanRequestId,
+    pub project_id: ProjectId,
+    pub run_id: Option<RunId>,
     pub task_id: Option<TaskId>,
+    /// Internal stable identity for a transition gate; absent for operator-created requests.
+    pub gate_key: Option<String>,
+    pub question: String,
+    pub context: String,
+    pub choices: Vec<String>,
+    pub requested_by: ActorId,
+    pub created_at: DateTime<Utc>,
+    pub expires_at: Option<DateTime<Utc>>,
+    pub on_expiry: Option<HumanExpiryAction>,
     pub status: HumanStatus,
+    pub resolution: Option<HumanResolution>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HumanExpiryAction {
+    Expire,
+    Escalate,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HumanResolution {
+    pub choice: String,
+    pub actor_id: ActorId,
+    pub reason: String,
+    pub resolved_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -343,9 +370,14 @@ pub struct ListReviewRounds {
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct HumanRequest {
+    pub project_id: ProjectId,
+    pub run_id: Option<RunId>,
     pub task_id: Option<TaskId>,
     pub question: String,
+    pub context: String,
     pub choices: Vec<String>,
+    pub expires_at: Option<DateTime<Utc>>,
+    pub on_expiry: Option<HumanExpiryAction>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ListHumanRequests {
