@@ -479,19 +479,27 @@ pub trait CredentialIssuer: Send + Sync {
         &self,
         bootstrap_secret: &str,
         actor_name: &str,
+        key: IdempotencyKey,
     ) -> CoreResult<IssuedCredential>;
     fn issue_agent(
         &self,
         supervisor: &SessionContext,
         actor_name: &str,
         role: AgentRole,
+        key: IdempotencyKey,
     ) -> CoreResult<IssuedCredential>;
     fn issue_cli(
         &self,
         supervisor: &SessionContext,
         actor_name: &str,
+        key: IdempotencyKey,
     ) -> CoreResult<IssuedCredential>;
-    fn revoke(&self, supervisor: &SessionContext, session: SessionId) -> CoreResult<()>;
+    fn revoke(
+        &self,
+        supervisor: &SessionContext,
+        session: SessionId,
+        key: IdempotencyKey,
+    ) -> CoreResult<()>;
 }
 /// Resolves a bearer credential to a coordinator-validated context. The result cannot be
 /// deserialized from client input or constructed outside this crate.
@@ -503,11 +511,24 @@ pub enum AgentRole {
     Coder,
     Reviewer,
 }
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct IssuedCredential {
     pub session_id: SessionId,
     pub actor_id: ActorId,
-    pub secret: String,
+    /// Present only on the first successful return. Retries never recover plaintext credentials.
+    pub secret: Option<String>,
+    pub replayed: bool,
+}
+impl std::fmt::Debug for IssuedCredential {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("IssuedCredential")
+            .field("session_id", &self.session_id)
+            .field("actor_id", &self.actor_id)
+            .field("secret", &self.secret.as_ref().map(|_| "[REDACTED]"))
+            .field("replayed", &self.replayed)
+            .finish()
+    }
 }
 #[cfg(test)]
 mod authentication_contract_tests {
