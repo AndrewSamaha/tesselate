@@ -44,7 +44,7 @@ pub struct Database {
     connection: Arc<Mutex<Connection>>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Hash, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum EntityKind {
     Project,
@@ -101,17 +101,17 @@ pub struct EntityScope {
 /// Insert when `expected_revision` is `None`; update only the matching revision otherwise.
 /// The revision check and write occur inside the event/idempotency transaction.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct StateChange<T = Value> {
+pub struct StateChange {
     pub kind: EntityKind,
     pub id: String,
     pub scope: EntityScope,
-    pub payload: T,
+    pub payload: Value,
     pub expected_revision: Option<i64>,
-    pub dependencies: Vec<TaskId>,
+    pub dependencies: Option<Vec<TaskId>>,
 }
 
-impl<T: Serialize + Clone> StateChange<T> {
-    pub fn insert(
+impl StateChange {
+    pub fn insert<T: Serialize>(
         kind: EntityKind,
         id: impl Into<String>,
         scope: EntityScope,
@@ -121,13 +121,13 @@ impl<T: Serialize + Clone> StateChange<T> {
             kind,
             id: id.into(),
             scope,
-            payload: value.clone(),
+            payload: serde_json::to_value(value)?,
             expected_revision: None,
-            dependencies: Vec::new(),
+            dependencies: None,
         })
     }
 
-    pub fn update(
+    pub fn update<T: Serialize>(
         kind: EntityKind,
         id: impl Into<String>,
         scope: EntityScope,
@@ -138,14 +138,14 @@ impl<T: Serialize + Clone> StateChange<T> {
             kind,
             id: id.into(),
             scope,
-            payload: value.clone(),
+            payload: serde_json::to_value(value)?,
             expected_revision: Some(expected_revision),
-            dependencies: Vec::new(),
+            dependencies: None,
         })
     }
 
     pub fn with_dependencies(mut self, dependencies: Vec<TaskId>) -> Self {
-        self.dependencies = dependencies;
+        self.dependencies = Some(dependencies);
         self
     }
 }
@@ -188,13 +188,13 @@ impl NewEvent {
 }
 
 #[derive(Debug)]
-pub struct MutationInput<'a, Q, R, S = Value> {
+pub struct MutationInput<'a, Q, R> {
     pub context: &'a SessionContext,
     pub operation: &'a str,
     pub idempotency_key: &'a IdempotencyKey,
     pub request: &'a Q,
     pub result: &'a R,
-    pub change: StateChange<S>,
+    pub changes: Vec<StateChange>,
     pub event: NewEvent,
 }
 
@@ -217,17 +217,16 @@ impl Database {
             .map_err(|_| PersistenceError::Poisoned)
     }
 
-    pub fn commit_mutation<Q, R, S>(
+    pub fn commit_mutation<Q, R>(
         &self,
-        input: MutationInput<'_, Q, R, S>,
+        input: MutationInput<'_, Q, R>,
     ) -> Result<Mutation<R>, PersistenceError>
     where
         Q: Serialize,
         R: Serialize + DeserializeOwned,
-        S: Serialize,
     {
         validate_mutation(&input)?;
-        let request_json = serde_json::to_string(input.request)?;
+        let request_json = canonical_json(input.request)?;
         let result_json = serde_json::to_string(input.result)?;
         let session_id = input.context.session_id().0.to_string();
         let key = input.idempotency_key.0.as_str();
@@ -253,17 +252,20 @@ impl Database {
             });
         }
 
-        apply_change(&transaction, &input.change)?;
+        for change in &input.changes {
+            check_precondition(&transaction, change)?;
+        }
+        for change in &input.changes {
+            apply_change(&transaction, change)?;
+        }
         let event_id = input.event.event_id;
         append_event(&transaction, &input.event)?;
-        transaction.execute(
-            "INSERT INTO entity_events(entity_kind,entity_id,event_id) VALUES (?1,?2,?3)",
-            params![
-                input.change.kind.table(),
-                input.change.id,
-                event_id.0.to_string()
-            ],
-        )?;
+        for change in &input.changes {
+            transaction.execute(
+                "INSERT INTO entity_events(entity_kind,entity_id,event_id) VALUES (?1,?2,?3)",
+                params![change.kind.table(), change.id, event_id.0.to_string()],
+            )?;
+        }
         transaction.execute(
             "INSERT INTO idempotency_records(session_id, operation, idempotency_key, request_json, result_json, event_id) VALUES (?1,?2,?3,?4,?5,?6)",
             params![session_id, operation, key, request_json, result_json, event_id.0.to_string()],
@@ -299,7 +301,6 @@ impl Database {
             |row| row.get::<_, String>(0),
         )?;
         let mut encoded = rows.collect::<Result<Vec<_>, _>>()?;
-        let has_more = encoded.len() > limit as usize;
         encoded.truncate(limit as usize);
         let items = encoded
             .into_iter()
@@ -308,14 +309,10 @@ impl Database {
                     .map_err(|e| PersistenceError::InvalidEvent(e.to_string()))
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let next_cursor = if has_more {
-            items
-                .last()
-                .map(|event| issue_cursor(&connection, event.sequence))
-                .transpose()?
-        } else {
-            None
-        };
+        let next_cursor = items
+            .last()
+            .map(|event| issue_cursor(&connection, event.sequence))
+            .transpose()?;
         Ok(Page { items, next_cursor })
     }
 
@@ -340,20 +337,16 @@ impl Database {
             |row| Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?)),
         )?;
         let encoded = rows.collect::<Result<Vec<_>, _>>()?;
-        let has_more = encoded.len() > limit as usize;
         let items = encoded
             .iter()
             .take(limit as usize)
             .map(|(json, _)| serde_json::from_str(json).map_err(PersistenceError::from))
             .collect::<Result<Vec<_>, _>>()?;
-        let next_cursor = if has_more {
-            encoded
-                .get(limit as usize - 1)
-                .map(|(_, sequence)| issue_cursor(&connection, *sequence))
-                .transpose()?
-        } else {
-            None
-        };
+        let next_cursor = encoded
+            .get(items.len().wrapping_sub(1))
+            .filter(|_| !items.is_empty())
+            .map(|(_, sequence)| issue_cursor(&connection, *sequence))
+            .transpose()?;
         Ok(Page { items, next_cursor })
     }
 
@@ -391,6 +384,19 @@ impl Database {
             .transpose()
     }
 
+    pub fn task_dependencies(&self, task_id: TaskId) -> Result<Vec<TaskId>, PersistenceError> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare("SELECT depends_on_task_id FROM task_dependencies WHERE task_id=?1 ORDER BY depends_on_task_id")?;
+        let rows = statement.query_map([task_id.0.to_string()], |row| row.get::<_, String>(0))?;
+        rows.map(|row| {
+            let id = row?;
+            Uuid::parse_str(&id)
+                .map(TaskId)
+                .map_err(|error| PersistenceError::Invalid(id + ": " + &error.to_string()))
+        })
+        .collect()
+    }
+
     pub fn list_entities<T: DeserializeOwned>(
         &self,
         kind: EntityKind,
@@ -416,31 +422,24 @@ impl Database {
             |row| Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?)),
         )?;
         let encoded = rows.collect::<Result<Vec<_>, _>>()?;
-        let has_more = encoded.len() > page.limit as usize;
         let items = encoded
             .iter()
             .take(page.limit as usize)
             .map(|(json, _)| serde_json::from_str(json).map_err(PersistenceError::from))
             .collect::<Result<Vec<_>, _>>()?;
-        let next_cursor = if has_more {
-            encoded
-                .get(page.limit as usize - 1)
-                .map(|(_, sequence)| issue_cursor(&connection, *sequence))
-                .transpose()?
-        } else {
-            None
-        };
+        let next_cursor = encoded
+            .get(items.len().wrapping_sub(1))
+            .filter(|_| !items.is_empty())
+            .map(|(_, sequence)| issue_cursor(&connection, *sequence))
+            .transpose()?;
         Ok(Page { items, next_cursor })
     }
 }
 
-fn validate_mutation<Q, R, S>(input: &MutationInput<'_, Q, R, S>) -> Result<(), PersistenceError> {
-    if input.operation.is_empty()
-        || input.idempotency_key.0.is_empty()
-        || input.change.id.is_empty()
-    {
+fn validate_mutation<Q, R>(input: &MutationInput<'_, Q, R>) -> Result<(), PersistenceError> {
+    if input.operation.is_empty() || input.idempotency_key.0.is_empty() {
         return Err(PersistenceError::Invalid(
-            "operation, idempotency key, and entity ID are required".into(),
+            "operation and idempotency key are required".into(),
         ));
     }
     if input.event.actor.id != input.context.actor_id()
@@ -450,22 +449,70 @@ fn validate_mutation<Q, R, S>(input: &MutationInput<'_, Q, R, S>) -> Result<(), 
             "event actor must match the authenticated context".into(),
         ));
     }
-    if input
-        .change
-        .dependencies
-        .iter()
-        .any(|id| id.0.to_string() == input.change.id)
-    {
+    if input.changes.is_empty() {
         return Err(PersistenceError::Invalid(
-            "task cannot depend on itself".into(),
+            "mutation must contain at least one state change".into(),
         ));
+    }
+    let mut seen = std::collections::HashSet::new();
+    for change in &input.changes {
+        if change.id.is_empty() || !seen.insert((change.kind, change.id.as_str())) {
+            return Err(PersistenceError::Invalid(
+                "state changes must have unique nonempty entity IDs".into(),
+            ));
+        }
+        if change.dependencies.as_ref().is_some_and(|dependencies| {
+            change.kind != EntityKind::Task
+                || dependencies.iter().any(|id| id.0.to_string() == change.id)
+        }) {
+            return Err(PersistenceError::Invalid(
+                "dependency replacement is only valid for tasks and cannot be self-referential"
+                    .into(),
+            ));
+        }
     }
     Ok(())
 }
 
-fn apply_change<T: Serialize>(
+fn canonical_json<T: Serialize>(value: &T) -> Result<String, PersistenceError> {
+    fn normalize(value: Value) -> Value {
+        match value {
+            Value::Array(values) => Value::Array(values.into_iter().map(normalize).collect()),
+            Value::Object(object) => {
+                let mut entries = object.into_iter().collect::<Vec<_>>();
+                entries.sort_by(|left, right| left.0.cmp(&right.0));
+                let mut normalized = serde_json::Map::new();
+                for (key, value) in entries {
+                    normalized.insert(key, normalize(value));
+                }
+                Value::Object(normalized)
+            }
+            other => other,
+        }
+    }
+    Ok(serde_json::to_string(&normalize(serde_json::to_value(
+        value,
+    )?))?)
+}
+
+fn check_precondition(
     transaction: &Transaction<'_>,
-    change: &StateChange<T>,
+    change: &StateChange,
+) -> Result<(), PersistenceError> {
+    let sql = format!("SELECT revision FROM {} WHERE id=?1", change.kind.table());
+    let actual: Option<i64> = transaction
+        .query_row(&sql, [&change.id], |row| row.get(0))
+        .optional()?;
+    match (change.expected_revision, actual) {
+        (None, None) => Ok(()),
+        (Some(expected), Some(actual)) if expected == actual => Ok(()),
+        _ => Err(PersistenceError::StateConflict(change.id.clone())),
+    }
+}
+
+fn apply_change(
+    transaction: &Transaction<'_>,
+    change: &StateChange,
 ) -> Result<(), PersistenceError> {
     let table = change.kind.table();
     if let Some(expected_revision) = change.expected_revision {
@@ -499,21 +546,17 @@ fn apply_change<T: Serialize>(
             ],
         )?;
     }
-    if change.kind == EntityKind::Task {
+    if let Some(dependencies) = &change.dependencies {
         transaction.execute(
             "DELETE FROM task_dependencies WHERE task_id=?1",
             [&change.id],
         )?;
-        for dependency in &change.dependencies {
+        for dependency in dependencies {
             transaction.execute(
                 "INSERT INTO task_dependencies(task_id, depends_on_task_id) VALUES (?1,?2)",
                 params![change.id, dependency.0.to_string()],
             )?;
         }
-    } else if !change.dependencies.is_empty() {
-        return Err(PersistenceError::Invalid(
-            "dependencies are only valid for tasks".into(),
-        ));
     }
     Ok(())
 }

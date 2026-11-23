@@ -1,7 +1,7 @@
 use super::*;
-use crate::core::{ActorId, ProjectId, SessionId};
+use crate::core::{Actor, ActorId, ProjectId, SessionId};
 use serde_json::json;
-use std::{fs, path::PathBuf};
+use std::{collections::HashMap, fs, path::PathBuf};
 
 struct TempDb(PathBuf);
 impl TempDb {
@@ -51,7 +51,7 @@ fn insert<T: Serialize + Clone>(
         idempotency_key: &IdempotencyKey(Uuid::new_v4().to_string()),
         request,
         result,
-        change,
+        changes: vec![change],
         event: event(ctx, "test.inserted", None),
     })
 }
@@ -81,11 +81,23 @@ fn state_event_and_idempotency_are_atomic_and_replay_stably() {
     let request = json!({"name":"alpha"});
     let result = json!({"id":project});
     let key = IdempotencyKey("same-call".into());
+    let actor = Actor {
+        id: ActorId::new(),
+        display_name: "coder".into(),
+        role: Role::Coder,
+    };
     let change = StateChange::insert(
         EntityKind::Project,
         project.0.to_string(),
         EntityScope::default(),
         &request,
+    )
+    .unwrap();
+    let actor_change = StateChange::insert(
+        EntityKind::Actor,
+        actor.id.0.to_string(),
+        EntityScope::default(),
+        &actor,
     )
     .unwrap();
     let input = || MutationInput {
@@ -94,7 +106,7 @@ fn state_event_and_idempotency_are_atomic_and_replay_stably() {
         idempotency_key: &key,
         request: &request,
         result: &result,
-        change: change.clone(),
+        changes: vec![change.clone(), actor_change.clone()],
         event: event(&ctx, "project.created", Some(project)),
     };
     let first = db.commit_mutation(input()).unwrap();
@@ -106,6 +118,14 @@ fn state_event_and_idempotency_are_atomic_and_replay_stably() {
     assert_eq!(first.value, replay.value);
     assert_eq!(first.event_id, replay.event_id);
     assert_eq!(reopened.event_count().unwrap(), 1);
+    assert!(reopened
+        .load::<Value>(EntityKind::Project, &project.0.to_string())
+        .unwrap()
+        .is_some());
+    assert!(reopened
+        .load::<Actor>(EntityKind::Actor, &actor.id.0.to_string())
+        .unwrap()
+        .is_some());
     let external = Connection::open(&temp.0).unwrap();
     assert!(external
         .execute("UPDATE events SET event_type='rewritten'", [])
@@ -144,7 +164,7 @@ fn failed_state_precondition_rolls_back_event_and_idempotency_record() {
         idempotency_key: &IdempotencyKey("wrong-revision".into()),
         request: &request,
         result: &result,
-        change,
+        changes: vec![change],
         event: event(&ctx, "task.updated", None),
     });
     assert!(matches!(outcome, Err(PersistenceError::StateConflict(_))));
@@ -153,6 +173,109 @@ fn failed_state_precondition_rolls_back_event_and_idempotency_record() {
         .load::<Value>(EntityKind::Task, &task_id.0.to_string())
         .unwrap()
         .is_none());
+}
+
+#[test]
+fn failed_write_rolls_back_every_change_in_the_batch() {
+    let temp = TempDb::new();
+    let db = Database::open(&temp.0).unwrap();
+    let ctx = context();
+    let project = ProjectId::new();
+    let run = crate::core::RunId::new();
+    let project_value = json!({"name":"must rollback"});
+    let run_value = json!({"id":run});
+    let first = StateChange::insert(
+        EntityKind::Project,
+        project.0.to_string(),
+        EntityScope::default(),
+        &project_value,
+    )
+    .unwrap();
+    let second = StateChange::insert(
+        EntityKind::Run,
+        run.0.to_string(),
+        EntityScope {
+            project_id: Some(ProjectId::new().0.to_string()),
+            ..Default::default()
+        },
+        &run_value,
+    )
+    .unwrap();
+    let outcome = db.commit_mutation(MutationInput {
+        context: &ctx,
+        operation: "projects.create_with_run",
+        idempotency_key: &IdempotencyKey("batch-rollback".into()),
+        request: &json!({"project":"p","run":"r"}),
+        result: &json!({"project":project,"run":run}),
+        changes: vec![first, second],
+        event: event(&ctx, "project.created", Some(project)),
+    });
+    assert!(matches!(outcome, Err(PersistenceError::Sqlite(_))));
+    assert!(db
+        .load::<Value>(EntityKind::Project, &project.0.to_string())
+        .unwrap()
+        .is_none());
+    assert_eq!(db.event_count().unwrap(), 0);
+}
+
+#[test]
+fn idempotency_request_comparison_normalizes_object_key_order() {
+    let temp = TempDb::new();
+    let db = Database::open(&temp.0).unwrap();
+    let ctx = context();
+    let project = ProjectId::new();
+    let first_request = HashMap::from([("a".to_string(), json!(1)), ("b".to_string(), json!(2))]);
+    let reordered_request =
+        HashMap::from([("b".to_string(), json!(2)), ("a".to_string(), json!(1))]);
+    let conflicting_request =
+        HashMap::from([("a".to_string(), json!(3)), ("b".to_string(), json!(2))]);
+    let result = json!({"created":true});
+    let change = StateChange::insert(
+        EntityKind::Project,
+        project.0.to_string(),
+        EntityScope::default(),
+        &result,
+    )
+    .unwrap();
+    let key = IdempotencyKey("canonical-request".into());
+    let first = db
+        .commit_mutation(MutationInput {
+            context: &ctx,
+            operation: "projects.create",
+            idempotency_key: &key,
+            request: &first_request,
+            result: &result,
+            changes: vec![change.clone()],
+            event: event(&ctx, "project.created", Some(project)),
+        })
+        .unwrap();
+    let replay = db
+        .commit_mutation(MutationInput {
+            context: &ctx,
+            operation: "projects.create",
+            idempotency_key: &key,
+            request: &reordered_request,
+            result: &json!({"different-result-is-ignored-on-replay":true}),
+            changes: vec![change.clone()],
+            event: event(&ctx, "project.created", Some(project)),
+        })
+        .unwrap();
+    assert!(replay.replayed);
+    assert_eq!(replay.event_id, first.event_id);
+    let conflict = db.commit_mutation(MutationInput {
+        context: &ctx,
+        operation: "projects.create",
+        idempotency_key: &key,
+        request: &conflicting_request,
+        result: &result,
+        changes: vec![change],
+        event: event(&ctx, "project.created", Some(project)),
+    });
+    assert!(matches!(
+        conflict,
+        Err(PersistenceError::IdempotencyConflict)
+    ));
+    assert_eq!(db.event_count().unwrap(), 1);
 }
 
 #[test]
@@ -189,7 +312,7 @@ fn dependencies_and_event_cursor_are_consistent() {
         idempotency_key: &IdempotencyKey("run1".into()),
         request: &json!({"run_id":run_id}),
         result: &json!({"run_id":run_id}),
-        change: run_change,
+        changes: vec![run_change],
         event: event(&ctx, "run.created", Some(project)),
     })
     .unwrap();
@@ -218,7 +341,7 @@ fn dependencies_and_event_cursor_are_consistent() {
             idempotency_key: &IdempotencyKey(key.into()),
             request: &json!({"id":id}),
             result: &json!({"id":id}),
-            change,
+            changes: vec![change],
             event: event(&ctx, "task.created", Some(project)),
         })
         .unwrap();
@@ -252,6 +375,11 @@ fn dependencies_and_event_cursor_are_consistent() {
         .items
         .windows(2)
         .all(|events| events[0].sequence < events[1].sequence));
+    let bookmark = EventCursor(
+        next.next_cursor
+            .clone()
+            .expect("nonempty final pages are resumable"),
+    );
     let task_scope = EntityScope {
         project_id: Some(project.0.to_string()),
         run_id: Some(run_id.0.to_string()),
@@ -280,6 +408,79 @@ fn dependencies_and_event_cursor_are_consistent() {
         )
         .unwrap();
     assert_eq!(remaining.items.len(), 1);
+    assert_eq!(db.task_dependencies(second_task).unwrap(), vec![first_task]);
+    let updated_task = json!({"id":second_task,"status":"coding"});
+    let progress = StateChange::update(
+        EntityKind::Task,
+        second_task.0.to_string(),
+        task_scope.clone(),
+        1,
+        &updated_task,
+    )
+    .unwrap();
+    db.commit_mutation(MutationInput {
+        context: &ctx,
+        operation: "tasks.progress",
+        idempotency_key: &IdempotencyKey("task-progress".into()),
+        request: &updated_task,
+        result: &updated_task,
+        changes: vec![progress],
+        event: event(&ctx, "task.progress", Some(project)),
+    })
+    .unwrap();
+    assert_eq!(db.task_dependencies(second_task).unwrap(), vec![first_task]);
+    let cleared = StateChange::update(
+        EntityKind::Task,
+        second_task.0.to_string(),
+        task_scope,
+        2,
+        &updated_task,
+    )
+    .unwrap()
+    .with_dependencies(vec![]);
+    db.commit_mutation(MutationInput {
+        context: &ctx,
+        operation: "tasks.dependencies.replace",
+        idempotency_key: &IdempotencyKey("task-dependencies-clear".into()),
+        request: &json!({"dependencies": []}),
+        result: &updated_task,
+        changes: vec![cleared],
+        event: event(&ctx, "task.dependencies_replaced", Some(project)),
+    })
+    .unwrap();
+    assert!(db.task_dependencies(second_task).unwrap().is_empty());
+    let updated_project = json!({"name":"p-updated"});
+    let project_change = StateChange::update(
+        EntityKind::Project,
+        project.0.to_string(),
+        EntityScope::default(),
+        1,
+        &updated_project,
+    )
+    .unwrap();
+    db.commit_mutation(MutationInput {
+        context: &ctx,
+        operation: "projects.update",
+        idempotency_key: &IdempotencyKey("project-update-after-bookmark".into()),
+        request: &updated_project,
+        result: &updated_project,
+        changes: vec![project_change],
+        event: event(&ctx, "project.updated", Some(project)),
+    })
+    .unwrap();
+    let appended = db
+        .events_after(
+            EventScope {
+                project_id: Some(project),
+                run_id: None,
+                task_id: None,
+            },
+            Some(&bookmark),
+            10,
+        )
+        .unwrap();
+    assert_eq!(appended.items.len(), 3);
+    assert_eq!(appended.items.last().unwrap().event_type, "project.updated");
     assert!(db
         .events_after(
             EventScope {
@@ -346,7 +547,7 @@ fn message_reads_use_persistent_sequence_cursors() {
             idempotency_key: &IdempotencyKey(body.into()),
             request: &message,
             result: &message,
-            change,
+            changes: vec![change],
             event: draft,
         })
         .unwrap();
@@ -360,7 +561,47 @@ fn message_reads_use_persistent_sequence_cursors() {
         .messages_after(project, None, Some(&next), 1)
         .unwrap();
     assert_eq!(second.items[0].body, "second");
-    assert!(second.next_cursor.is_none());
+    let final_cursor = EventCursor(
+        second
+            .next_cursor
+            .expect("nonempty final page is resumable"),
+    );
+    let draft = event(&ctx, "message.sent", Some(project));
+    let message = Message {
+        id: crate::core::MessageId::new(),
+        project_id: project,
+        run_id: None,
+        task_id: None,
+        sender: ctx.actor_id(),
+        body: "later".into(),
+        event_id: draft.event_id,
+    };
+    let change = StateChange::insert(
+        EntityKind::Message,
+        message.id.0.to_string(),
+        EntityScope {
+            project_id: Some(project.0.to_string()),
+            ..Default::default()
+        },
+        &message,
+    )
+    .unwrap();
+    reopened
+        .commit_mutation(MutationInput {
+            context: &ctx,
+            operation: "messages.send",
+            idempotency_key: &IdempotencyKey("later-message".into()),
+            request: &message,
+            result: &message,
+            changes: vec![change],
+            event: draft,
+        })
+        .unwrap();
+    let later = reopened
+        .messages_after(project, None, Some(&final_cursor), 1)
+        .unwrap();
+    assert_eq!(later.items.len(), 1);
+    assert_eq!(later.items[0].body, "later");
 }
 
 #[test]
@@ -407,7 +648,7 @@ fn durable_domain_records_survive_reopen() {
         idempotency_key: &IdempotencyKey("durable-run".into()),
         request: &json!("run"),
         result: &json!({"run":run}),
-        change: run_change,
+        changes: vec![run_change],
         event: event(&ctx, "run.created", Some(project)),
     })
     .unwrap();
@@ -431,7 +672,7 @@ fn durable_domain_records_survive_reopen() {
         idempotency_key: &IdempotencyKey("durable-task".into()),
         request: &json!("task"),
         result: &json!({"task":task}),
-        change: task_change,
+        changes: vec![task_change],
         event: event(&ctx, "task.assigned", Some(project)),
     })
     .unwrap();
@@ -565,7 +806,7 @@ fn insert_state(db: &Database, ctx: &SessionContext, change: StateChange, value:
         idempotency_key: &IdempotencyKey(format!("persist-{id}")),
         request: &request,
         result: value,
-        change,
+        changes: vec![change],
         event: event(ctx, "test.persisted", None),
     })
     .unwrap();
@@ -595,7 +836,7 @@ fn concurrent_mutations_serialize_without_losing_events() {
                 idempotency_key: &IdempotencyKey(format!("parallel-{index}")),
                 request: &value,
                 result: &value,
-                change,
+                changes: vec![change],
                 event: event(&ctx, "project.created", Some(id)),
             })
             .unwrap();
