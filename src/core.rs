@@ -115,6 +115,13 @@ pub struct Project {
     pub name: String,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Repository {
+    pub id: RepositoryId,
+    pub project_id: ProjectId,
+    pub name: String,
+    pub canonical_path: String,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Run {
     pub id: RunId,
     pub project_id: ProjectId,
@@ -136,6 +143,19 @@ pub struct Actor {
     pub id: ActorId,
     pub display_name: String,
     pub role: Role,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Agent {
+    pub actor_id: ActorId,
+    pub display_name: String,
+    pub role: Role,
+    pub status: AgentStatus,
+}
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentStatus {
+    Active,
+    Disconnected,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Message {
@@ -287,10 +307,31 @@ pub struct SubmitTask {
     pub summary: String,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct CompleteRun {
     pub run_id: RunId,
-    pub reviewed_commit_ids: Vec<String>,
     pub outstanding_integration_steps: Vec<String>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct FinalTaskDisposition {
+    pub task_id: TaskId,
+    pub outcome: FinalTaskOutcome,
+    pub reason: String,
+}
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FinalTaskOutcome {
+    Completed,
+    Blocked,
+    Failed,
+    Cancelled,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArtifactRef {
+    pub run_id: RunId,
+    pub kind: String,
+    pub path: String,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AvailableWork {

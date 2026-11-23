@@ -31,6 +31,10 @@ fn event_envelope_is_versioned_and_stable() {
 
 #[test]
 fn mcp_request_response_shapes_are_versioned() {
+    assert!(mcp::TOOLS.contains(&"tesselate.v1.repositories.list"));
+    assert!(mcp::TOOLS.contains(&"tesselate.v1.agents.list"));
+    assert!(mcp::TOOLS.contains(&"tesselate.v1.tasks.disposition"));
+    assert!(mcp::TOOLS.contains(&"tesselate.v1.artifacts.locate"));
     let request = mcp::MutationRequest {
         schema_version: mcp::PROTOCOL_VERSION,
         request_id: "r1".into(),
@@ -76,6 +80,26 @@ fn mcp_request_response_shapes_are_versioned() {
         serde_json::to_value(success).unwrap()["outcome"]["status"],
         "success"
     );
+}
+
+#[test]
+fn run_completion_does_not_accept_caller_claimed_reviewed_commits() {
+    let run_id = RunId::new();
+    let request = CompleteRun {
+        run_id,
+        outstanding_integration_steps: vec!["merge after review".into()],
+    };
+    let value = serde_json::to_value(request).unwrap();
+    assert_eq!(
+        value,
+        json!({"run_id":run_id,"outstanding_integration_steps":["merge after review"]})
+    );
+    assert!(serde_json::from_value::<CompleteRun>(json!({
+        "run_id": run_id,
+        "reviewed_commit_ids": ["unreviewed-sha"],
+        "outstanding_integration_steps": []
+    }))
+    .is_err());
 }
 
 #[test]

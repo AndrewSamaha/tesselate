@@ -9,6 +9,18 @@ use crate::core::*;
 
 pub trait Coordination: Send + Sync {
     fn list_projects(&self, ctx: &SessionContext, page: PageRequest) -> CoreResult<Page<Project>>;
+    fn list_repositories(
+        &self,
+        ctx: &SessionContext,
+        project: ProjectId,
+        page: PageRequest,
+    ) -> CoreResult<Page<Repository>>;
+    fn list_agents(
+        &self,
+        ctx: &SessionContext,
+        project: ProjectId,
+        page: PageRequest,
+    ) -> CoreResult<Page<Agent>>;
     fn list_runs(
         &self,
         ctx: &SessionContext,
@@ -73,6 +85,12 @@ pub trait Coordination: Send + Sync {
         &self,
         ctx: &SessionContext,
         request: SubmitTask,
+        key: IdempotencyKey,
+    ) -> CoreResult<Mutation<Task>>;
+    fn record_task_disposition(
+        &self,
+        ctx: &SessionContext,
+        request: FinalTaskDisposition,
         key: IdempotencyKey,
     ) -> CoreResult<Mutation<Task>>;
     fn complete_run(
@@ -151,4 +169,10 @@ pub trait Coordination: Send + Sync {
         scope: EventScope,
         page: PageRequest,
     ) -> CoreResult<Page<Event>>;
+    fn locate_artifacts(
+        &self,
+        ctx: &SessionContext,
+        run: RunId,
+        page: PageRequest,
+    ) -> CoreResult<Page<ArtifactRef>>;
 }

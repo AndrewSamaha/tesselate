@@ -7,6 +7,8 @@ pub const PROTOCOL_VERSION: u16 = 1;
 pub const TOOL_NAMESPACE: &str = "tesselate.v1";
 pub const TOOLS: &[&str] = &[
     "tesselate.v1.projects.list",
+    "tesselate.v1.repositories.list",
+    "tesselate.v1.agents.list",
     "tesselate.v1.runs.list",
     "tesselate.v1.runs.create",
     "tesselate.v1.work.available",
@@ -15,6 +17,7 @@ pub const TOOLS: &[&str] = &[
     "tesselate.v1.tasks.assign",
     "tesselate.v1.tasks.progress",
     "tesselate.v1.tasks.submit",
+    "tesselate.v1.tasks.disposition",
     "tesselate.v1.runs.complete",
     "tesselate.v1.messages.send",
     "tesselate.v1.messages.read",
@@ -29,6 +32,7 @@ pub const TOOLS: &[&str] = &[
     "tesselate.v1.workspaces.inspect",
     "tesselate.v1.workspaces.cleanup",
     "tesselate.v1.timeline.read",
+    "tesselate.v1.artifacts.locate",
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
