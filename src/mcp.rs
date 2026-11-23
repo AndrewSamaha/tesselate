@@ -5,6 +5,20 @@ use serde::{Deserialize, Serialize};
 
 pub const PROTOCOL_VERSION: u16 = 1;
 pub const TOOL_NAMESPACE: &str = "tesselate.v1";
+pub const TOOLS: &[&str] = &[
+    "tesselate.v1.projects.list",
+    "tesselate.v1.runs.list",
+    "tesselate.v1.tasks.list",
+    "tesselate.v1.tasks.create",
+    "tesselate.v1.tasks.assign",
+    "tesselate.v1.tasks.progress",
+    "tesselate.v1.messages.send",
+    "tesselate.v1.workspaces.request",
+    "tesselate.v1.reviews.request",
+    "tesselate.v1.reviews.submit",
+    "tesselate.v1.human.request",
+    "tesselate.v1.timeline.read",
+];
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", content = "value", rename_all = "snake_case")]
