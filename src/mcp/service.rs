@@ -692,7 +692,7 @@ fn array_schema(items: Value) -> Value {
 fn page_schema() -> Value {
     object_schema(
         json!({"limit":{"type":"integer","minimum":1},"after":nullable(string_schema())}),
-        &["limit", "after"],
+        &["limit"],
     )
 }
 
@@ -783,11 +783,11 @@ fn params_schema(tool: &str) -> Value {
         ),
         "tesselate.v1.messages.send" => object_schema(
             json!({"project_id":project_id,"run_id":nullable(id_schema()),"task_id":nullable(task_id),"body":string_schema()}),
-            &["project_id", "run_id", "task_id", "body"],
+            &["project_id", "body"],
         ),
         "tesselate.v1.messages.read" => object_schema(
             json!({"project_id":project_id,"task_id":nullable(task_id),"page":page_schema()}),
-            &["project_id", "task_id", "page"],
+            &["project_id", "page"],
         ),
         "tesselate.v1.workspaces.request" => object_schema(
             json!({"task_id":task_id,"repository_id":id_schema(),"base_commit":string_schema()}),
@@ -814,16 +814,7 @@ fn params_schema(tool: &str) -> Value {
         ),
         "tesselate.v1.human.request" => object_schema(
             json!({"project_id":project_id,"run_id":nullable(id_schema()),"task_id":nullable(task_id),"question":string_schema(),"context":string_schema(),"choices":array_schema(string_schema()),"expires_at":nullable(json!({"type":"string","format":"date-time"})),"on_expiry":nullable(json!({"type":"string","enum":["expire","escalate"]}))}),
-            &[
-                "project_id",
-                "run_id",
-                "task_id",
-                "question",
-                "context",
-                "choices",
-                "expires_at",
-                "on_expiry",
-            ],
+            &["project_id", "question", "context", "choices"],
         ),
         "tesselate.v1.human.list" => object_schema(
             json!({"project_id":project_id,"page":page_schema()}),
@@ -843,7 +834,7 @@ fn params_schema(tool: &str) -> Value {
         "tesselate.v1.timeline.read" => object_schema(
             json!({"scope":object_schema(
                 json!({"project_id":nullable(project_id),"run_id":nullable(id_schema()),"task_id":nullable(task_id)}),
-                &["project_id", "run_id", "task_id"],
+                &[],
             ),"page":page_schema()}),
             &["scope", "page"],
         ),
@@ -967,9 +958,62 @@ mod tests {
             .unwrap_err()
             .contains("unexpected"));
         extra_nested_field["page"] = json!({"limit":20});
+        assert!(validate_params(&extra_nested_field, &read_schema).is_ok());
+        extra_nested_field["page"] = json!({});
         assert!(validate_params(&extra_nested_field, &read_schema)
             .unwrap_err()
-            .contains("after"));
+            .contains("limit"));
+    }
+
+    #[test]
+    fn optional_params_are_omittable_nullable_and_match_serde_decoding() {
+        let page = json!({"limit":20});
+        validate_params(&page, &page_schema()).unwrap();
+        assert_eq!(decode::<PageRequest>(page).unwrap().after, None);
+
+        let project_id = crate::core::ProjectId::new();
+        let send = json!({"project_id":project_id,"body":"hello","run_id":null});
+        validate_params(&send, &params_schema("tesselate.v1.messages.send")).unwrap();
+        let decoded: SendMessage = decode(send).unwrap();
+        assert_eq!(decoded.run_id, None);
+        assert_eq!(decoded.task_id, None);
+
+        let read = json!({"project_id":project_id,"page":{"limit":10}});
+        validate_params(&read, &params_schema("tesselate.v1.messages.read")).unwrap();
+        let decoded: ReadMessages = decode(read).unwrap();
+        assert_eq!(decoded.task_id, None);
+        assert_eq!(decoded.page.after, None);
+
+        let request = json!({"project_id":project_id,"question":"approve?","context":"run","choices":["yes","no"]});
+        validate_params(&request, &params_schema("tesselate.v1.human.request")).unwrap();
+        let decoded: HumanRequest = decode(request).unwrap();
+        assert_eq!(decoded.run_id, None);
+        assert_eq!(decoded.task_id, None);
+        assert_eq!(decoded.expires_at, None);
+        assert_eq!(decoded.on_expiry, None);
+
+        #[derive(Deserialize)]
+        struct TimelineRequest {
+            scope: EventScope,
+            page: PageRequest,
+        }
+        let timeline = json!({"scope":{},"page":{"limit":10}});
+        validate_params(&timeline, &params_schema("tesselate.v1.timeline.read")).unwrap();
+        let decoded: TimelineRequest = decode(timeline).unwrap();
+        assert_eq!(decoded.scope.project_id, None);
+        assert_eq!(decoded.scope.run_id, None);
+        assert_eq!(decoded.scope.task_id, None);
+        assert_eq!(decoded.page.after, None);
+
+        assert!(validate_params(
+            &json!({"project_id":project_id}),
+            &params_schema("tesselate.v1.messages.send")
+        )
+        .unwrap_err()
+        .contains("body"));
+        assert!(validate_params(&json!({}), &page_schema())
+            .unwrap_err()
+            .contains("limit"));
     }
 
     #[test]
