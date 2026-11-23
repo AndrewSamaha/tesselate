@@ -805,9 +805,28 @@ async fn stdio_tool_schema_lists_every_versioned_tool() {
     let mut client = StdioClient::start(&socket, &credential);
     let response =
         client.request(json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}));
+    let tools = response["result"]["tools"].as_array().unwrap();
+    assert_eq!(tools.len(), tesselate::mcp::TOOLS.len());
+    let create_task = tools
+        .iter()
+        .find(|tool| tool["name"] == "tesselate.v1.tasks.create")
+        .unwrap();
     assert_eq!(
-        response["result"]["tools"].as_array().unwrap().len(),
-        tesselate::mcp::TOOLS.len()
+        create_task["inputSchema"]["properties"]["params"]["required"],
+        json!(["run_id", "title", "goal"])
+    );
+    assert_eq!(
+        create_task["inputSchema"]["properties"]["params"]["additionalProperties"],
+        false
+    );
+    let list_runs = tools
+        .iter()
+        .find(|tool| tool["name"] == "tesselate.v1.runs.list")
+        .unwrap();
+    assert_eq!(
+        list_runs["inputSchema"]["properties"]["params"]["properties"]["page"]["properties"]
+            ["after"]["anyOf"][1]["type"],
+        "null"
     );
     server.abort();
     let _ = server.await;

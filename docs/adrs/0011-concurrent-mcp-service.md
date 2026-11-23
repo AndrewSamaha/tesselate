@@ -10,9 +10,11 @@ Each harness starts the small `tesselate-mcp` process. It serves the versioned F
 
 Caller-initiated mutations require an idempotency key at both the tool schema and coordinator boundary. `available_work` and human-request listing remain discovery operations; their deterministic expiry materialization is internal lifecycle work using F04/F07's existing durable event and idempotency behavior, so repeated polling does not duplicate a transition event.
 
+Every tool publishes a parameter-specific JSON Schema, including nested page, scope, commit-reference, finding, and disposition objects. Required fields mirror the decoded F00 request structs; every object rejects extra properties. The coordinator checks required and unknown fields against the same schema before authentication/dispatch, and typed serde decoding checks value types. Artifact discovery remains `tesselate.v1.artifacts.locate` through `Coordination::locate_artifacts`; the F09 composition delegates its lookup to F10 `RunArtifactExporter::locate_run` and applies the bounded page contract while retaining core authorization.
+
 ## Composition boundary
 
-The repository currently defines the full `Coordination` trait and feature managers but has no concrete implementation that composes F01 project providers with F02–F07 services. F08 deliberately accepts injected `Arc<dyn Coordination>` and `Arc<dyn SessionAuthenticator>` instead of implementing or duplicating feature policy. F09 owns executable startup and constructing that concrete composition. F10 artifact discovery uses the existing `Coordination::locate_artifacts` contract when its exporter is merged. This boundary permits transport and authentication behavior to be tested against a real shared F02 database while keeping the feature owners' policy authoritative.
+The repository currently defines the full `Coordination` trait and feature managers but has no concrete implementation that composes F01 project providers with F02–F07 services. F08 deliberately accepts injected `Arc<dyn Coordination>` and `Arc<dyn SessionAuthenticator>` instead of implementing or duplicating feature policy. F09 owns executable startup and constructing that concrete composition, including mapping authorized `locate_artifacts` calls to F10 `RunArtifactExporter::locate_run`. This boundary permits transport and authentication behavior to be tested against a real shared F02 database while keeping the feature owners' policy authoritative.
 
 ## Consequences
 

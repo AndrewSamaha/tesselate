@@ -204,6 +204,9 @@ impl Dispatcher {
                 CoreError::Invalid("tool params must be an object".into()),
             );
         }
+        if let Err(message) = validate_params(&arguments.params, &params_schema(&request.tool)) {
+            return error_response(PROTOCOL_VERSION, request_id, CoreError::Invalid(message));
+        }
         let context = match self.authenticator.authenticate(&request.bearer_credential) {
             Ok(context) => context,
             Err(error) => return error_response(PROTOCOL_VERSION, request_id, error),
@@ -646,7 +649,7 @@ fn tool_definitions() -> Vec<Tool> {
                 json!({
                     "schema_version":{"type":"integer","const":PROTOCOL_VERSION},
                     "request_id":{"type":"string","minLength":1},
-                    "params":{"type":"object"},
+                    "params":params_schema(name),
                     "idempotency_key":{"type":"string","minLength":1}
                 }),
             );
@@ -661,6 +664,233 @@ fn tool_definitions() -> Vec<Tool> {
         .collect()
 }
 
+fn object_schema(properties: Value, required: &[&str]) -> Value {
+    json!({
+        "type":"object",
+        "properties":properties,
+        "required":required,
+        "additionalProperties":false
+    })
+}
+
+fn string_schema() -> Value {
+    json!({"type":"string"})
+}
+
+fn id_schema() -> Value {
+    json!({"type":"string","format":"uuid"})
+}
+
+fn nullable(schema: Value) -> Value {
+    json!({"anyOf":[schema,{"type":"null"}]})
+}
+
+fn array_schema(items: Value) -> Value {
+    json!({"type":"array","items":items})
+}
+
+fn page_schema() -> Value {
+    object_schema(
+        json!({"limit":{"type":"integer","minimum":1},"after":nullable(string_schema())}),
+        &["limit", "after"],
+    )
+}
+
+fn commit_ref_schema() -> Value {
+    object_schema(
+        json!({"repository_id":id_schema(),"commit_id":string_schema()}),
+        &["repository_id", "commit_id"],
+    )
+}
+
+fn project_page_schema() -> Value {
+    object_schema(
+        json!({"project_id":id_schema(),"page":page_schema()}),
+        &["project_id", "page"],
+    )
+}
+
+fn run_page_schema() -> Value {
+    object_schema(
+        json!({"run_id":id_schema(),"page":page_schema()}),
+        &["run_id", "page"],
+    )
+}
+
+fn params_schema(tool: &str) -> Value {
+    let task_id = id_schema();
+    let project_id = id_schema();
+    let workspace_id = id_schema();
+    let findings = object_schema(
+        json!({
+            "id":id_schema(),
+            "severity":{"type":"string","enum":["low","medium","high","critical"]},
+            "location":string_schema(),
+            "evidence":string_schema(),
+            "proposed_correction":string_schema()
+        }),
+        &[
+            "id",
+            "severity",
+            "location",
+            "evidence",
+            "proposed_correction",
+        ],
+    );
+    match tool {
+        "tesselate.v1.projects.list" => page_schema(),
+        "tesselate.v1.repositories.list"
+        | "tesselate.v1.agents.list"
+        | "tesselate.v1.runs.list"
+        | "tesselate.v1.work.available" => project_page_schema(),
+        "tesselate.v1.runs.create" => object_schema(
+            json!({"project_id":project_id,"goal":string_schema()}),
+            &["project_id", "goal"],
+        ),
+        "tesselate.v1.tasks.list" => run_page_schema(),
+        "tesselate.v1.tasks.create" => object_schema(
+            json!({"run_id":id_schema(),"title":string_schema(),"goal":string_schema()}),
+            &["run_id", "title", "goal"],
+        ),
+        "tesselate.v1.tasks.create_with_dependencies" => object_schema(
+            json!({"run_id":id_schema(),"title":string_schema(),"goal":string_schema(),"dependencies":array_schema(task_id)}),
+            &["run_id", "title", "goal", "dependencies"],
+        ),
+        "tesselate.v1.tasks.assign" => object_schema(
+            json!({"task_id":task_id,"assignee":id_schema()}),
+            &["task_id", "assignee"],
+        ),
+        "tesselate.v1.tasks.claim" => object_schema(json!({"task_id":task_id}), &["task_id"]),
+        "tesselate.v1.tasks.release" => object_schema(
+            json!({"task_id":task_id,"reason":string_schema()}),
+            &["task_id", "reason"],
+        ),
+        "tesselate.v1.tasks.progress" => object_schema(
+            json!({"task_id":task_id,"progress":string_schema()}),
+            &["task_id", "progress"],
+        ),
+        "tesselate.v1.tasks.submit" => object_schema(
+            json!({"task_id":task_id,"commits":array_schema(commit_ref_schema()),"summary":string_schema()}),
+            &["task_id", "commits", "summary"],
+        ),
+        "tesselate.v1.tasks.disposition" => object_schema(
+            json!({"task_id":task_id,"outcome":{"type":"string","enum":["completed","blocked","failed","cancelled"]},"reason":string_schema()}),
+            &["task_id", "outcome", "reason"],
+        ),
+        "tesselate.v1.runs.complete" => object_schema(
+            json!({"run_id":id_schema(),"outstanding_integration_steps":array_schema(string_schema())}),
+            &["run_id", "outstanding_integration_steps"],
+        ),
+        "tesselate.v1.messages.send" => object_schema(
+            json!({"project_id":project_id,"run_id":nullable(id_schema()),"task_id":nullable(task_id),"body":string_schema()}),
+            &["project_id", "run_id", "task_id", "body"],
+        ),
+        "tesselate.v1.messages.read" => object_schema(
+            json!({"project_id":project_id,"task_id":nullable(task_id),"page":page_schema()}),
+            &["project_id", "task_id", "page"],
+        ),
+        "tesselate.v1.workspaces.request" => object_schema(
+            json!({"task_id":task_id,"repository_id":id_schema(),"base_commit":string_schema()}),
+            &["task_id", "repository_id", "base_commit"],
+        ),
+        "tesselate.v1.reviews.request" => object_schema(
+            json!({"task_id":task_id,"commit_refs":array_schema(commit_ref_schema()),"previous_finding_ids":array_schema(id_schema())}),
+            &["task_id", "commit_refs", "previous_finding_ids"],
+        ),
+        "tesselate.v1.reviews.submit" => object_schema(
+            json!({"round_id":id_schema(),"passed":{"type":"boolean"},"summary":string_schema(),"findings":array_schema(findings)}),
+            &["round_id", "passed", "summary", "findings"],
+        ),
+        "tesselate.v1.reviews.list" | "tesselate.v1.reviews.rounds.list" => object_schema(
+            json!({"task_id":task_id,"page":page_schema()}),
+            &["task_id", "page"],
+        ),
+        "tesselate.v1.reviews.disposition" => object_schema(
+            json!({"task_id":task_id,"dispositions":array_schema(object_schema(
+                json!({"finding_id":id_schema(),"disposition":{"type":"string","enum":["fixed","accepted","deferred"]},"reason":string_schema()}),
+                &["finding_id", "disposition", "reason"],
+            ))}),
+            &["task_id", "dispositions"],
+        ),
+        "tesselate.v1.human.request" => object_schema(
+            json!({"project_id":project_id,"run_id":nullable(id_schema()),"task_id":nullable(task_id),"question":string_schema(),"context":string_schema(),"choices":array_schema(string_schema()),"expires_at":nullable(json!({"type":"string","format":"date-time"})),"on_expiry":nullable(json!({"type":"string","enum":["expire","escalate"]}))}),
+            &[
+                "project_id",
+                "run_id",
+                "task_id",
+                "question",
+                "context",
+                "choices",
+                "expires_at",
+                "on_expiry",
+            ],
+        ),
+        "tesselate.v1.human.list" => object_schema(
+            json!({"project_id":project_id,"page":page_schema()}),
+            &["project_id", "page"],
+        ),
+        "tesselate.v1.human.resolve" => object_schema(
+            json!({"request_id":id_schema(),"choice":string_schema(),"reason":string_schema()}),
+            &["request_id", "choice", "reason"],
+        ),
+        "tesselate.v1.workspaces.inspect" | "tesselate.v1.workspaces.cleanup" => {
+            object_schema(json!({"workspace_id":workspace_id}), &["workspace_id"])
+        }
+        "tesselate.v1.workspaces.commits.capture" => object_schema(
+            json!({"workspace_id":workspace_id,"expected_head":string_schema()}),
+            &["workspace_id", "expected_head"],
+        ),
+        "tesselate.v1.timeline.read" => object_schema(
+            json!({"scope":object_schema(
+                json!({"project_id":nullable(project_id),"run_id":nullable(id_schema()),"task_id":nullable(task_id)}),
+                &["project_id", "run_id", "task_id"],
+            ),"page":page_schema()}),
+            &["scope", "page"],
+        ),
+        "tesselate.v1.artifacts.locate" => run_page_schema(),
+        _ => unreachable!("every public MCP tool must define its params schema"),
+    }
+}
+
+fn validate_params(params: &Value, schema: &Value) -> Result<(), String> {
+    if let Some(any_of) = schema.get("anyOf").and_then(Value::as_array) {
+        if params.is_null() {
+            return if any_of.iter().any(|branch| branch["type"] == "null") {
+                Ok(())
+            } else {
+                Err("params has an invalid null value".into())
+            };
+        }
+        if let Some(branch) = any_of.iter().find(|branch| branch["type"] != "null") {
+            return validate_params(params, branch);
+        }
+    }
+    if let Some(object) = params.as_object() {
+        let properties = schema
+            .get("properties")
+            .and_then(Value::as_object)
+            .ok_or_else(|| "params has an invalid object shape".to_owned())?;
+        if let Some(required) = schema.get("required").and_then(Value::as_array) {
+            for name in required.iter().filter_map(Value::as_str) {
+                if !object.contains_key(name) {
+                    return Err(format!("missing required params field `{name}`"));
+                }
+            }
+        }
+        if let Some(name) = object.keys().find(|name| !properties.contains_key(*name)) {
+            return Err(format!("unknown params field `{name}`"));
+        }
+        for (name, value) in object {
+            validate_params(value, &properties[name])?;
+        }
+    } else if let (Some(values), Some(items)) = (params.as_array(), schema.get("items")) {
+        for value in values {
+            validate_params(value, items)?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -669,6 +899,17 @@ mod tests {
     fn tool_definitions_match_the_versioned_contract_and_mark_mutations() {
         let tools = tool_definitions();
         assert_eq!(tools.len(), TOOLS.len());
+        for tool in &tools {
+            let params = &tool.input_schema["properties"]["params"];
+            assert_eq!(params["type"], "object", "{} params schema", tool.name);
+            assert_eq!(params["additionalProperties"], false, "{}", tool.name);
+            assert!(params["properties"].is_object(), "{}", tool.name);
+            assert!(
+                !params["required"].as_array().unwrap().is_empty(),
+                "{}",
+                tool.name
+            );
+        }
         let mutation = tools
             .iter()
             .find(|tool| tool.name == "tesselate.v1.tasks.create")
@@ -685,6 +926,50 @@ mod tests {
             .as_array()
             .unwrap()
             .contains(&json!("idempotency_key")));
+        assert_eq!(
+            mutation.input_schema["properties"]["params"]["required"],
+            json!(["run_id", "title", "goal"])
+        );
+        assert_eq!(
+            read.input_schema["properties"]["params"]["properties"]["page"]["properties"]["after"]
+                ["anyOf"][1]["type"],
+            "null"
+        );
+    }
+
+    #[test]
+    fn strict_params_reject_unknown_and_missing_fields_at_each_object_level() {
+        let task_create = params_schema("tesselate.v1.tasks.create");
+        let valid_task = json!({
+            "run_id":crate::core::RunId::new(),
+            "title":"title",
+            "goal":"goal"
+        });
+        validate_params(&valid_task, &task_create).unwrap();
+        let decoded: CreateTask = decode(valid_task.clone()).unwrap();
+        assert_eq!(decoded.title, "title");
+        let mut extra_mutation_field = valid_task.clone();
+        extra_mutation_field["unexpected"] = json!(true);
+        assert!(validate_params(&extra_mutation_field, &task_create)
+            .unwrap_err()
+            .contains("unexpected"));
+        let missing_mutation_field = json!({"run_id":crate::core::RunId::new(),"title":"title"});
+        assert!(validate_params(&missing_mutation_field, &task_create)
+            .unwrap_err()
+            .contains("goal"));
+
+        let read_schema = params_schema("tesselate.v1.runs.list");
+        let mut extra_nested_field = json!({
+            "project_id":crate::core::ProjectId::new(),
+            "page":{"limit":20,"after":null,"unexpected":false}
+        });
+        assert!(validate_params(&extra_nested_field, &read_schema)
+            .unwrap_err()
+            .contains("unexpected"));
+        extra_nested_field["page"] = json!({"limit":20});
+        assert!(validate_params(&extra_nested_field, &read_schema)
+            .unwrap_err()
+            .contains("after"));
     }
 
     #[test]
