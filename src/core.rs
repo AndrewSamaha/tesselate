@@ -133,11 +133,42 @@ pub struct Run {
     pub outcome: Option<RunOutcome>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct WorkflowLimits {
     pub max_duration_hours: u64,
     pub max_concurrent_assignments: u32,
     pub max_task_retries: u32,
     pub max_review_rounds: u32,
+}
+
+/// Canonical project settings after TOML and local paths have been validated.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ValidatedProjectConfig {
+    pub name: String,
+    pub repositories: Vec<ConfiguredRepository>,
+    pub artifact_dir: String,
+    pub workflow_limits: WorkflowLimits,
+    pub review_policy: ReviewPolicy,
+    /// `None` means no human gates are configured; `Some(false)` is explicit policy.
+    pub human_gates: Option<HumanGatePolicy>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConfiguredRepository {
+    pub id: String,
+    pub canonical_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewPolicy {
+    pub min_independent_reviewers: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct HumanGatePolicy {
+    pub completion_approval: bool,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RunOutcome {
