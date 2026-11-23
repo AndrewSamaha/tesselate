@@ -465,12 +465,8 @@ fn failed_atomic_replacement_restores_the_previous_artifact() {
             {
                 rename_calls += 1;
                 return Err(io::Error::new(
-                    if rename_calls == 1 {
-                        io::ErrorKind::AlreadyExists
-                    } else {
-                        io::ErrorKind::PermissionDenied
-                    },
-                    "injected replacement failure",
+                    io::ErrorKind::AlreadyExists,
+                    "replacement unsupported",
                 ));
             }
             fs::rename(from, to)
@@ -478,6 +474,10 @@ fn failed_atomic_replacement_restores_the_previous_artifact() {
         |parent| sync_parent_directory(parent),
     );
     assert!(result.is_err());
+    assert_eq!(
+        rename_calls, 1,
+        "replacement is refused without a delete-and-retry fallback"
+    );
     assert_eq!(fs::read_to_string(destination).unwrap(), "old artifact");
 }
 

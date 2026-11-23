@@ -774,22 +774,9 @@ fn replace_file(
         Err(error) => return Err(error),
     };
 
-    let replaced = match rename(temporary, destination) {
-        Ok(()) => Ok(()),
-        Err(error) if had_previous && error.kind() == io::ErrorKind::AlreadyExists => {
-            match fs::remove_file(destination) {
-                Ok(()) => match rename(temporary, destination) {
-                    Ok(()) => Ok(()),
-                    Err(replacement_error) => {
-                        restore_backup(destination, &backup)?;
-                        Err(replacement_error)
-                    }
-                },
-                Err(remove_error) => Err(remove_error),
-            }
-        }
-        Err(error) => Err(error),
-    };
+    // `rename` atomically replaces an existing regular file on Unix. Where it cannot, fail
+    // without deleting the destination; the backup also allows rollback after a sync failure.
+    let replaced = rename(temporary, destination);
 
     if let Err(error) = replaced {
         if had_previous && fs::symlink_metadata(destination).is_err() {
