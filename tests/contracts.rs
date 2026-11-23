@@ -33,6 +33,7 @@ fn event_envelope_is_versioned_and_stable() {
 fn mcp_request_response_shapes_are_versioned() {
     assert!(mcp::TOOLS.contains(&"tesselate.v1.repositories.list"));
     assert!(mcp::TOOLS.contains(&"tesselate.v1.agents.list"));
+    assert!(mcp::TOOLS.contains(&"tesselate.v1.reviews.rounds.list"));
     assert!(mcp::TOOLS.contains(&"tesselate.v1.tasks.disposition"));
     assert!(mcp::TOOLS.contains(&"tesselate.v1.artifacts.locate"));
     let request = mcp::MutationRequest {
@@ -96,10 +97,26 @@ fn run_completion_does_not_accept_caller_claimed_reviewed_commits() {
     );
     assert!(serde_json::from_value::<CompleteRun>(json!({
         "run_id": run_id,
-        "reviewed_commit_ids": ["unreviewed-sha"],
+        "reviewed_commits": [{"repository_id":RepositoryId::new(),"commit_id":"unreviewed-sha"}],
         "outstanding_integration_steps": []
     }))
     .is_err());
+}
+
+#[test]
+fn pending_review_round_query_has_a_stable_versioned_shape() {
+    let task_id = TaskId::new();
+    let request = ListReviewRounds {
+        task_id,
+        page: PageRequest {
+            limit: 20,
+            after: None,
+        },
+    };
+    assert_eq!(
+        serde_json::to_value(request).unwrap(),
+        json!({"task_id": task_id, "page": {"limit": 20, "after": null}})
+    );
 }
 
 #[test]
@@ -122,7 +139,7 @@ fn run_request_and_snapshot_contract_include_goal_and_limits() {
             max_review_rounds: 3,
         },
         status: RunStatus::Stopped,
-        reviewed_commit_ids: vec![],
+        reviewed_commits: vec![],
         outstanding_integration_steps: vec![],
         outcome: Some(RunOutcome {
             reason: "duration limit reached".into(),

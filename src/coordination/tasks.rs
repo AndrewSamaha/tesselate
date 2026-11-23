@@ -92,8 +92,8 @@ pub trait ProjectWorkflowPolicy: Send + Sync {
 
 /// F06 decides whether a submitted task or run has satisfied review policy and derives reviewed SHAs.
 pub trait ReviewCompletionGate: Send + Sync {
-    fn ensure_task_complete(&self, task_id: TaskId) -> CoreResult<()>;
-    fn reviewed_commits_for_run(&self, run_id: RunId) -> CoreResult<Vec<String>>;
+    fn ensure_task_complete(&self, task_id: TaskId) -> CoreResult<Vec<StatePrecondition>>;
+    fn reviewed_commits_for_run(&self, run_id: RunId) -> CoreResult<Vec<CommitRef>>;
 }
 
 /// F07 owns policy-governed human pauses; this hook runs before the task engine commits a transition.
@@ -189,7 +189,7 @@ impl TaskEngine {
             started_at: Utc::now(),
             limits,
             status: RunStatus::Active,
-            reviewed_commit_ids: Vec::new(),
+            reviewed_commits: Vec::new(),
             outstanding_integration_steps: Vec::new(),
             outcome: None,
         };
@@ -440,7 +440,7 @@ impl TaskEngine {
             owner: None,
             progress: None,
             attempts: 0,
-            commit_ids: Vec::new(),
+            submitted_commits: Vec::new(),
             result: None,
         };
         let record = TaskRecord {
@@ -901,7 +901,7 @@ impl TaskEngine {
             return Ok(prior);
         }
         require_role(ctx, Role::Coder)?;
-        if request.commit_ids.is_empty() {
+        if request.commits.is_empty() {
             return Err(CoreError::Invalid(
                 "submission must include at least one commit ID".into(),
             ));
@@ -922,7 +922,7 @@ impl TaskEngine {
             TransitionIdentity::TaskSubmission,
         )?;
         record.task.status = TaskStatus::Submitted;
-        record.task.commit_ids = request.commit_ids.clone();
+        record.task.submitted_commits = request.commits.clone();
         record.task.result = Some(request.summary.clone());
         let mut changes = vec![
             self.bump_run(&mut run, run_revision)?,
@@ -948,64 +948,50 @@ impl TaskEngine {
             Some(run.id),
             Some(request.task_id),
             "task.submitted",
-            json!({"commit_ids":request.commit_ids,"summary":request.summary}),
+            json!({"commits":request.commits,"summary":request.summary}),
         );
         self.commit_task(ctx, OP, &key, &request, &record.task, changes, event)
     }
 
-    /// F06 calls this narrow lifecycle hook after creating/requesting a review round.
+    /// F06 uses this prepare hook to commit review records and a legal task transition atomically.
     #[allow(dead_code)] // F06 integration uses this hook once its review coordinator is wired.
-    pub(crate) fn transition_for_review(
+    pub(crate) fn prepare_review_transition(
         &self,
         ctx: &SessionContext,
-        request: ReviewTaskTransition,
-        key: IdempotencyKey,
-    ) -> CoreResult<Mutation<Task>> {
-        const OP: &str = "tasks.review_transition";
-        if let Some(prior) = self.prior_task(ctx, OP, &key, &request)? {
-            return Ok(prior);
-        }
+        task_id: TaskId,
+        status: TaskStatus,
+        reason: &str,
+    ) -> CoreResult<(Task, Vec<StateChange>)> {
         if !matches!(ctx.role(), Role::Supervisor | Role::Reviewer) {
             return Err(CoreError::Forbidden);
         }
-        if !matches!(
-            request.status,
-            TaskStatus::InReview | TaskStatus::RevisionRequired
-        ) {
+        if !matches!(status, TaskStatus::InReview | TaskStatus::RevisionRequired) {
             return Err(CoreError::Invalid(
                 "review hook accepts only in_review or revision_required".into(),
             ));
         }
-        let (mut run, run_revision) = self.load_task_run(request.task_id)?;
+        let (mut run, run_revision) = self.load_task_run(task_id)?;
         self.ensure_run_active(ctx, &mut run, run_revision)?;
-        let (mut record, task_revision) = self.load_task(request.task_id)?;
-        if !transition_allowed(record.task.status, request.status) {
+        let (mut record, task_revision) = self.load_task(task_id)?;
+        if !transition_allowed(record.task.status, status) {
             return Err(CoreError::Invalid("illegal task transition".into()));
         }
         self.ensure_transition(
             ctx,
             run.project_id,
             run.id,
-            Some(request.task_id),
+            Some(task_id),
             Some(LifecycleState::Task(record.task.status)),
-            Some(LifecycleState::Task(request.status)),
+            Some(LifecycleState::Task(status)),
             TransitionIdentity::ReviewStatus,
         )?;
-        record.task.status = request.status;
-        record.task.result = Some(request.reason.clone());
+        record.task.status = status;
+        record.task.result = Some(reason.to_owned());
         let changes = vec![
             self.bump_run(&mut run, run_revision)?,
             self.task_update(&record, task_revision, &run)?,
         ];
-        let event = event_for(
-            ctx,
-            Some(run.project_id),
-            Some(run.id),
-            Some(request.task_id),
-            "task.review_status",
-            json!({"status":request.status,"reason":request.reason}),
-        );
-        self.commit_task(ctx, OP, &key, &request, &record.task, changes, event)
+        Ok((record.task, changes))
     }
 
     pub fn record_task_disposition(
@@ -1031,9 +1017,11 @@ impl TaskEngine {
         if !transition_allowed(record.task.status, target) {
             return Err(CoreError::Invalid("illegal final task disposition".into()));
         }
-        if target == TaskStatus::Completed {
-            self.reviews.ensure_task_complete(request.task_id)?;
-        }
+        let review_guards = if target == TaskStatus::Completed {
+            self.reviews.ensure_task_complete(request.task_id)?
+        } else {
+            Vec::new()
+        };
         self.ensure_transition(
             ctx,
             run.project_id,
@@ -1075,7 +1063,17 @@ impl TaskEngine {
             "task.disposition",
             json!({"outcome":request.outcome,"reason":request.reason}),
         );
-        self.commit_task(ctx, OP, &key, &request, &record.task, changes, event)
+        self.commit_task_with_preconditions(
+            ctx,
+            OP,
+            &key,
+            &request,
+            &record.task,
+            changes,
+            event,
+            review_guards,
+            None,
+        )
     }
 
     pub fn complete_run(
@@ -1109,7 +1107,7 @@ impl TaskEngine {
             Some(LifecycleState::Run(RunStatus::Completed)),
             TransitionIdentity::RunCompletion,
         )?;
-        run.reviewed_commit_ids = self.reviews.reviewed_commits_for_run(run.id)?;
+        run.reviewed_commits = self.reviews.reviewed_commits_for_run(run.id)?;
         run.outstanding_integration_steps = request.outstanding_integration_steps.clone();
         run.status = RunStatus::Completed;
         run.outcome = None;
@@ -1120,7 +1118,7 @@ impl TaskEngine {
             Some(run.id),
             None,
             "run.completed",
-            json!({"reviewed_commit_ids":run.reviewed_commit_ids,"outstanding_integration_steps":run.outstanding_integration_steps}),
+            json!({"reviewed_commits":run.reviewed_commits,"outstanding_integration_steps":run.outstanding_integration_steps}),
         );
         self.commit_run(ctx, OP, &key, &request, &run, changes, event)
     }

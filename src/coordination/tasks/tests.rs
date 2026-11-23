@@ -30,10 +30,10 @@ impl ProjectWorkflowPolicy for Policy {
 }
 struct Reviews;
 impl ReviewCompletionGate for Reviews {
-    fn ensure_task_complete(&self, _: TaskId) -> CoreResult<()> {
-        Ok(())
+    fn ensure_task_complete(&self, _: TaskId) -> CoreResult<Vec<StatePrecondition>> {
+        Ok(Vec::new())
     }
-    fn reviewed_commits_for_run(&self, _: RunId) -> CoreResult<Vec<String>> {
+    fn reviewed_commits_for_run(&self, _: RunId) -> CoreResult<Vec<CommitRef>> {
         Ok(Vec::new())
     }
 }
@@ -158,6 +158,33 @@ fn engine_with_human(db: Database, human: Arc<dyn HumanTransitionGate>) -> TaskE
         Arc::new(Reviews),
         human,
         Arc::new(Leases),
+    )
+}
+fn transition_for_review(
+    engine: &TaskEngine,
+    ctx: &SessionContext,
+    request: ReviewTaskTransition,
+    key: IdempotencyKey,
+) -> CoreResult<Mutation<Task>> {
+    let (task, changes) =
+        engine.prepare_review_transition(ctx, request.task_id, request.status, &request.reason)?;
+    let run = engine.load_run(task.run_id)?.0;
+    let event = event_for(
+        ctx,
+        Some(run.project_id),
+        Some(run.id),
+        Some(task.id),
+        "task.review_status",
+        serde_json::json!({"status":request.status,"reason":request.reason}),
+    );
+    engine.commit_task(
+        ctx,
+        "tasks.review_transition",
+        &key,
+        &request,
+        &task,
+        changes,
+        event,
     )
 }
 fn seed_project(db: &Database, ctx: &SessionContext) -> ProjectId {
@@ -321,34 +348,37 @@ fn create_run_replays_and_dependency_unblocks_atomically() {
             &coder_ctx,
             SubmitTask {
                 task_id: prerequisite.id,
-                commit_ids: vec!["abc123".into()],
+                commits: vec![CommitRef {
+                    repository_id: RepositoryId::new(),
+                    commit_id: "abc123".into(),
+                }],
                 summary: "done".into(),
             },
             IdempotencyKey("submit".into()),
         )
         .unwrap();
-    engine
-        .transition_for_review(
-            &ctx,
-            ReviewTaskTransition {
-                task_id: prerequisite.id,
-                status: TaskStatus::InReview,
-                reason: "review requested".into(),
-            },
-            IdempotencyKey("review-state".into()),
-        )
-        .unwrap();
-    engine
-        .transition_for_review(
-            &ctx,
-            ReviewTaskTransition {
-                task_id: prerequisite.id,
-                status: TaskStatus::RevisionRequired,
-                reason: "revise".into(),
-            },
-            IdempotencyKey("revision-required".into()),
-        )
-        .unwrap();
+    transition_for_review(
+        &engine,
+        &ctx,
+        ReviewTaskTransition {
+            task_id: prerequisite.id,
+            status: TaskStatus::InReview,
+            reason: "review requested".into(),
+        },
+        IdempotencyKey("review-state".into()),
+    )
+    .unwrap();
+    transition_for_review(
+        &engine,
+        &ctx,
+        ReviewTaskTransition {
+            task_id: prerequisite.id,
+            status: TaskStatus::RevisionRequired,
+            reason: "revise".into(),
+        },
+        IdempotencyKey("revision-required".into()),
+    )
+    .unwrap();
     engine
         .assign_task(
             &ctx,
@@ -373,23 +403,26 @@ fn create_run_replays_and_dependency_unblocks_atomically() {
             &coder_ctx,
             SubmitTask {
                 task_id: prerequisite.id,
-                commit_ids: vec!["abc124".into()],
+                commits: vec![CommitRef {
+                    repository_id: RepositoryId::new(),
+                    commit_id: "abc124".into(),
+                }],
                 summary: "revised".into(),
             },
             IdempotencyKey("revision-submit".into()),
         )
         .unwrap();
-    engine
-        .transition_for_review(
-            &ctx,
-            ReviewTaskTransition {
-                task_id: prerequisite.id,
-                status: TaskStatus::InReview,
-                reason: "ready for review".into(),
-            },
-            IdempotencyKey("review-state-2".into()),
-        )
-        .unwrap();
+    transition_for_review(
+        &engine,
+        &ctx,
+        ReviewTaskTransition {
+            task_id: prerequisite.id,
+            status: TaskStatus::InReview,
+            reason: "ready for review".into(),
+        },
+        IdempotencyKey("review-state-2".into()),
+    )
+    .unwrap();
 
     engine
         .record_task_disposition(

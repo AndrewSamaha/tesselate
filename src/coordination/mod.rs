@@ -129,6 +129,11 @@ pub trait Coordination: Send + Sync {
         key: IdempotencyKey,
     ) -> CoreResult<Mutation<Review>>;
     fn list_reviews(&self, ctx: &SessionContext, request: ListReviews) -> CoreResult<Page<Review>>;
+    fn list_review_rounds(
+        &self,
+        ctx: &SessionContext,
+        request: ListReviewRounds,
+    ) -> CoreResult<Page<ReviewRound>>;
     fn disposition_findings(
         &self,
         ctx: &SessionContext,
