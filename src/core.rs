@@ -128,7 +128,7 @@ pub struct Run {
     pub started_at: DateTime<Utc>,
     pub limits: WorkflowLimits,
     pub status: RunStatus,
-    pub reviewed_commit_ids: Vec<String>,
+    pub reviewed_commits: Vec<CommitRef>,
     pub outstanding_integration_steps: Vec<String>,
     pub outcome: Option<RunOutcome>,
 }
@@ -154,7 +154,7 @@ pub struct Task {
     pub owner: Option<ActorId>,
     pub progress: Option<String>,
     pub attempts: u32,
-    pub commit_ids: Vec<String>,
+    pub submitted_commits: Vec<CommitRef>,
     pub result: Option<String>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -196,12 +196,18 @@ pub struct Workspace {
     pub path: String,
     pub owner: ActorId,
 }
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct CommitRef {
+    pub repository_id: RepositoryId,
+    pub commit_id: String,
+}
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ReviewRound {
     pub id: ReviewRoundId,
     pub task_id: TaskId,
     pub round: u32,
-    pub commit_ids: Vec<String>,
+    pub commit_refs: Vec<CommitRef>,
+    pub previous_finding_ids: Vec<FindingId>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ReviewFinding {
@@ -290,10 +296,16 @@ pub struct WorkspaceRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ReviewRequest {
     pub task_id: TaskId,
-    pub commit_ids: Vec<String>,
+    pub commit_refs: Vec<CommitRef>,
+    pub previous_finding_ids: Vec<FindingId>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ListReviews {
+    pub task_id: TaskId,
+    pub page: PageRequest,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ListReviewRounds {
     pub task_id: TaskId,
     pub page: PageRequest,
 }
@@ -323,7 +335,7 @@ pub struct CreateTaskWithDependencies {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SubmitTask {
     pub task_id: TaskId,
-    pub commit_ids: Vec<String>,
+    pub commits: Vec<CommitRef>,
     pub summary: String,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

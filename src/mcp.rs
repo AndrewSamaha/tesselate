@@ -25,6 +25,7 @@ pub const TOOLS: &[&str] = &[
     "tesselate.v1.reviews.request",
     "tesselate.v1.reviews.submit",
     "tesselate.v1.reviews.list",
+    "tesselate.v1.reviews.rounds.list",
     "tesselate.v1.reviews.disposition",
     "tesselate.v1.human.request",
     "tesselate.v1.human.list",
