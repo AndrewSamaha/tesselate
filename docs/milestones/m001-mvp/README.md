@@ -1,6 +1,6 @@
 # M001: Local multi-agent MVP
 
-Source of truth: [product and technical spec](../../spec.md). This milestone turns its acceptance criteria into assignable work. A feature is complete only when its acceptance checks pass; completing all feature documents is not itself proof of the end-to-end workflow.
+Source of truth: [product and technical spec](../../spec.md). This milestone turns its acceptance criteria into assignable work. The [development workflow](WORKFLOW.md) defines assignment, review, lead evaluation, and merging. A feature is complete when its acceptance checks pass on `main`; completing all feature documents is not itself proof of the end-to-end workflow.
 
 ## Delivery map
 
@@ -19,7 +19,7 @@ Source of truth: [product and technical spec](../../spec.md). This milestone tur
 | F10 | [Artifact export](f10-artifacts.md) | `artifacts` | F00, F02 | M |
 | F11 | [End-to-end demonstration](f11-e2e.md) | integration tests and fixtures | thin test after F00; full test after F03–F10 | L |
 
-Sizes are relative planning aids, not time estimates. Each feature has one owning agent. Agents may develop in separate worktrees and integrate through reviewed commits.
+Sizes are relative planning aids, not time estimates. Each feature has one coding owner. Agents work on separate feature branches and worktrees; the lead merges accepted features into `main` under the [development workflow](WORKFLOW.md).
 
 ## Parallel sequence
 
@@ -41,4 +41,4 @@ The critical path is F00 → F02 → F04 → F06 → F11. Add agents to independ
 
 ## Milestone exit
 
-F11 must demonstrate every acceptance criterion in [spec §11](../../spec.md#11-mvp-acceptance-criteria), including two repositories, concurrent coding agents, two independent reviewers, a revision round, restart recovery, autonomous completion, a limit outcome, a human gate, portable exports, and dirty-worktree cleanup refusal. Record the commands and observed results in the F11 test documentation. A completed run identifies reviewed commits and remaining integration steps; it does not merge them.
+F11 must demonstrate every acceptance criterion in [spec §11](../../spec.md#11-mvp-acceptance-criteria), including two repositories, concurrent coding agents, two independent reviewers, a revision round, restart recovery, autonomous completion, a limit outcome, a human gate, portable exports, and dirty-worktree cleanup refusal. Record the commands and observed results in the F11 test documentation. A **Tesselate run** identifies reviewed commits and remaining integration steps; the product does not merge them. The **M001 development workflow** does merge accepted Tesselate feature branches into this repository's `main`.
