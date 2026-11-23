@@ -312,8 +312,8 @@ fn fixture(repo_count: usize) -> Fixture {
     }
 }
 
-fn prepared_intent(f: &Fixture) -> (Run, AssignmentRecord, i64, GitOperationIntent, i64) {
-    let (run, assignment, assignment_revision) = f
+fn prepared_intent(f: &Fixture) -> (Run, i64, AssignmentRecord, i64, GitOperationIntent, i64) {
+    let (run, run_revision, assignment, assignment_revision) = f
         .manager
         .authorized_assignment(&f.coder, f.task_id)
         .unwrap();
@@ -341,11 +341,18 @@ fn prepared_intent(f: &Fixture) -> (Run, AssignmentRecord, i64, GitOperationInte
         operation: "test.git-intent.prepare",
         idempotency_key: &IdempotencyKey("test-prepared-intent".into()),
         request: &intent,
-        preconditions: vec![StatePrecondition {
-            kind: EntityKind::Assignment,
-            id: assignment.id.clone(),
-            expected_revision: assignment_revision,
-        }],
+        preconditions: vec![
+            StatePrecondition {
+                kind: EntityKind::Assignment,
+                id: assignment.id.clone(),
+                expected_revision: assignment_revision,
+            },
+            StatePrecondition {
+                kind: EntityKind::Run,
+                id: run.id.0.to_string(),
+                expected_revision: run_revision,
+            },
+        ],
         result: &intent,
         changes: vec![StateChange::insert(
             EntityKind::GitOperation,
@@ -364,12 +371,20 @@ fn prepared_intent(f: &Fixture) -> (Run, AssignmentRecord, i64, GitOperationInte
     })
     .unwrap();
     let revision = f.manager.load_intent(&intent).unwrap().1;
-    (run, assignment, assignment_revision, intent, revision)
+    (
+        run,
+        run_revision,
+        assignment,
+        assignment_revision,
+        intent,
+        revision,
+    )
 }
 
 fn start_git_mutation(
     f: &Fixture,
     run: &Run,
+    run_revision: i64,
     assignment: &AssignmentRecord,
     assignment_revision: i64,
     intent: &mut GitOperationIntent,
@@ -385,22 +400,84 @@ fn start_git_mutation(
             revision,
             "workspace.mutation_started",
             json!({"intent_id":intent.id}),
-            vec![StateChange::update(
-                EntityKind::Assignment,
-                assignment.id.clone(),
-                assignment_scope(assignment),
-                assignment_revision,
-                assignment,
-            )
-            .unwrap()],
+            vec![
+                StateChange::update(
+                    EntityKind::Assignment,
+                    assignment.id.clone(),
+                    assignment_scope(assignment),
+                    assignment_revision,
+                    assignment,
+                )
+                .unwrap(),
+                StateChange::update(
+                    EntityKind::Run,
+                    run.id.0.to_string(),
+                    EntityScope {
+                        project_id: Some(run.project_id.0.to_string()),
+                        run_id: Some(run.id.0.to_string()),
+                        ..Default::default()
+                    },
+                    run_revision,
+                    run,
+                )
+                .unwrap(),
+            ],
         )
         .unwrap()
+}
+
+fn expire_run(f: &Fixture) {
+    let (mut run, revision) =
+        f.db.load::<Run>(EntityKind::Run, &f.run_id.0.to_string())
+            .unwrap()
+            .unwrap();
+    run.started_at = Utc::now() - chrono::Duration::hours(run.limits.max_duration_hours as i64 + 1);
+    f.db.commit_mutation(MutationInput {
+        context: &f.supervisor,
+        operation: "test.expire_run",
+        idempotency_key: &IdempotencyKey("test-expire-run".into()),
+        request: &run,
+        preconditions: vec![],
+        result: &run,
+        changes: vec![StateChange::update(
+            EntityKind::Run,
+            run.id.0.to_string(),
+            EntityScope {
+                project_id: Some(run.project_id.0.to_string()),
+                run_id: Some(run.id.0.to_string()),
+                ..Default::default()
+            },
+            revision,
+            &run,
+        )
+        .unwrap()],
+        event: f.manager.event(
+            &f.supervisor,
+            &run,
+            f.task_id,
+            "test.run_expired",
+            json!({}),
+        ),
+    })
+    .unwrap();
+}
+
+fn discover_work(f: &Fixture, db: Database) -> CoreResult<Page<Task>> {
+    task_engine(db).available_work(
+        &f.supervisor,
+        f.project_id,
+        PageRequest {
+            limit: 50,
+            after: None,
+        },
+    )
 }
 
 #[test]
 fn release_before_git_start_fences_stale_prepared_intent() {
     let f = fixture(1);
-    let (_run, assignment, assignment_revision, mut intent, intent_revision) = prepared_intent(&f);
+    let (_run, run_revision, assignment, assignment_revision, mut intent, intent_revision) =
+        prepared_intent(&f);
     let workspace_request = WorkspaceRequest {
         task_id: f.task_id,
         repository_id: intent.repository_id,
@@ -422,6 +499,7 @@ fn release_before_git_start_fences_stale_prepared_intent() {
             &f.coder,
             &mut intent,
             intent_revision,
+            run_revision,
             &assignment,
             assignment_revision,
             &workspace_request,
@@ -439,7 +517,8 @@ fn release_before_git_start_fences_stale_prepared_intent() {
 #[test]
 fn reassignment_before_git_start_fences_stale_prepared_intent() {
     let f = fixture(1);
-    let (_run, assignment, assignment_revision, mut intent, intent_revision) = prepared_intent(&f);
+    let (_run, run_revision, assignment, assignment_revision, mut intent, intent_revision) =
+        prepared_intent(&f);
     let workspace_request = WorkspaceRequest {
         task_id: f.task_id,
         repository_id: intent.repository_id,
@@ -461,6 +540,7 @@ fn reassignment_before_git_start_fences_stale_prepared_intent() {
             &f.coder,
             &mut intent,
             intent_revision,
+            run_revision,
             &assignment,
             assignment_revision,
             &workspace_request,
@@ -474,10 +554,12 @@ fn reassignment_before_git_start_fences_stale_prepared_intent() {
 #[test]
 fn release_waits_for_git_intent_and_can_retry_after_reconciliation() {
     let f = fixture(1);
-    let (run, assignment, assignment_revision, mut intent, intent_revision) = prepared_intent(&f);
+    let (run, run_revision, assignment, assignment_revision, mut intent, intent_revision) =
+        prepared_intent(&f);
     let (mut mutating, mutating_revision) = start_git_mutation(
         &f,
         &run,
+        run_revision,
         &assignment,
         assignment_revision,
         &mut intent,
@@ -504,6 +586,7 @@ fn release_waits_for_git_intent_and_can_retry_after_reconciliation() {
             &f.coder,
             &mut mutating,
             mutating_revision,
+            run_revision + 1,
             &assignment,
             assignment_revision + 1,
             &workspace_request,
@@ -529,10 +612,12 @@ fn release_waits_for_git_intent_and_can_retry_after_reconciliation() {
 #[test]
 fn reassignment_waits_for_git_intent_and_can_retry_after_reconciliation() {
     let f = fixture(1);
-    let (run, assignment, assignment_revision, mut intent, intent_revision) = prepared_intent(&f);
+    let (run, run_revision, assignment, assignment_revision, mut intent, intent_revision) =
+        prepared_intent(&f);
     let (mut mutating, mutating_revision) = start_git_mutation(
         &f,
         &run,
+        run_revision,
         &assignment,
         assignment_revision,
         &mut intent,
@@ -559,6 +644,7 @@ fn reassignment_waits_for_git_intent_and_can_retry_after_reconciliation() {
             &f.coder,
             &mut mutating,
             mutating_revision,
+            run_revision + 1,
             &assignment,
             assignment_revision + 1,
             &workspace_request,
@@ -575,6 +661,92 @@ fn reassignment_waits_for_git_intent_and_can_retry_after_reconciliation() {
             IdempotencyKey("reassign-after-git".into()),
         )
         .unwrap();
+}
+
+#[test]
+fn stopped_run_with_prepared_intent_never_starts_git_mutation() {
+    let f = fixture(1);
+    let (_, _, _, _, intent, _) = prepared_intent(&f);
+    let request = WorkspaceRequest {
+        task_id: f.task_id,
+        repository_id: intent.repository_id,
+        base_commit: intent.base_commit.clone(),
+    };
+    expire_run(&f);
+    discover_work(&f, f.db.clone()).unwrap();
+    let stopped =
+        f.db.load::<Run>(EntityKind::Run, &f.run_id.0.to_string())
+            .unwrap()
+            .unwrap()
+            .0;
+    assert_eq!(stopped.status, RunStatus::Stopped);
+    let error = f
+        .manager
+        .request_workspace(
+            &f.coder,
+            request,
+            IdempotencyKey("create-after-run-stop".into()),
+        )
+        .unwrap_err();
+    assert!(matches!(error, CoreError::Recoverable(_)));
+    assert_eq!(
+        f.manager.load_intent(&intent).unwrap().0.checkpoint,
+        GitCheckpoint::Prepared
+    );
+    assert!(!PathBuf::from(&intent.worktree_path).exists());
+}
+
+#[test]
+fn run_stop_waits_for_inflight_intent_and_restart_reconciles_before_stop() {
+    let f = fixture(1);
+    let (run, run_revision, assignment, assignment_revision, mut intent, intent_revision) =
+        prepared_intent(&f);
+    let (intent, _) = start_git_mutation(
+        &f,
+        &run,
+        run_revision,
+        &assignment,
+        assignment_revision,
+        &mut intent,
+        intent_revision,
+    );
+    expire_run(&f);
+    assert!(matches!(
+        discover_work(&f, f.db.clone()),
+        Err(CoreError::Recoverable(_))
+    ));
+    let still_active =
+        f.db.load::<Run>(EntityKind::Run, &f.run_id.0.to_string())
+            .unwrap()
+            .unwrap()
+            .0;
+    assert_eq!(still_active.status, RunStatus::Active);
+
+    let reopened = Database::open(&f.db_path).unwrap();
+    let manager = GitWorkspaceManager::new(reopened.clone(), &f.manager.root).unwrap();
+    let request = WorkspaceRequest {
+        task_id: f.task_id,
+        repository_id: intent.repository_id,
+        base_commit: intent.base_commit.clone(),
+    };
+    manager
+        .request_workspace(
+            &f.coder,
+            request,
+            IdempotencyKey("reconcile-after-run-expiry-restart".into()),
+        )
+        .unwrap();
+    discover_work(&f, reopened.clone()).unwrap();
+    let stopped = reopened
+        .load::<Run>(EntityKind::Run, &f.run_id.0.to_string())
+        .unwrap()
+        .unwrap()
+        .0;
+    assert_eq!(stopped.status, RunStatus::Stopped);
+    assert_eq!(
+        manager.load_intent(&intent).unwrap().0.checkpoint,
+        GitCheckpoint::Recorded
+    );
 }
 
 fn insert<T: serde::Serialize + DeserializeOwned>(

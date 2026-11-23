@@ -1152,6 +1152,7 @@ impl TaskEngine {
         revision: i64,
         reason: &str,
     ) -> CoreResult<()> {
+        self.ensure_no_workspace_mutation_for_run(run)?;
         let mut stopped = run.clone();
         stopped.status = RunStatus::Stopped;
         stopped.outcome = Some(RunOutcome {
@@ -1295,6 +1296,43 @@ impl TaskEngine {
             return Err(CoreError::Recoverable(
                 "assignment has an in-flight Git workspace operation; retry after reconciliation"
                     .into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn ensure_no_workspace_mutation_for_run(&self, run: &Run) -> CoreResult<()> {
+        let assignment_ids = self
+            .all_entities::<AssignmentRecord>(
+                EntityKind::Assignment,
+                EntityScope {
+                    run_id: Some(run.id.0.to_string()),
+                    ..Default::default()
+                },
+            )?
+            .into_iter()
+            .filter(|assignment| assignment.status == AssignmentStatus::Active)
+            .map(|assignment| assignment.id)
+            .collect::<std::collections::HashSet<_>>();
+        if assignment_ids.is_empty() {
+            return Ok(());
+        }
+        let intents = self.all_entities::<GitOperationIntent>(
+            EntityKind::GitOperation,
+            EntityScope {
+                project_id: Some(run.project_id.0.to_string()),
+                ..Default::default()
+            },
+        )?;
+        if intents.iter().any(|intent| {
+            assignment_ids.contains(&intent.assignment_key)
+                && matches!(
+                    intent.checkpoint,
+                    GitCheckpoint::MutationStarted | GitCheckpoint::GitApplied
+                )
+        }) {
+            return Err(CoreError::Recoverable(
+                "run has an in-flight Git workspace operation; retry after reconciliation".into(),
             ));
         }
         Ok(())

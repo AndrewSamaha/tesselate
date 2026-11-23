@@ -60,7 +60,7 @@ impl GitWorkspaceManager {
         {
             return Ok(prior);
         }
-        let (run, assignment, assignment_revision) =
+        let (run, run_revision, assignment, assignment_revision) =
             self.authorized_assignment(ctx, request.task_id)?;
         let (repository, _) = self
             .db
@@ -161,6 +161,7 @@ impl GitWorkspaceManager {
                 ctx,
                 &mut intent,
                 revision,
+                run_revision,
                 &assignment,
                 assignment_revision,
                 &request,
@@ -195,11 +196,18 @@ impl GitWorkspaceManager {
                     operation: "git.intents.prepare",
                     idempotency_key: &IdempotencyKey(format!("git-intent-{}-prepared", id.0)),
                     request: &intent,
-                    preconditions: vec![StatePrecondition {
-                        kind: EntityKind::Assignment,
-                        id: assignment.id.clone(),
-                        expected_revision: assignment_revision,
-                    }],
+                    preconditions: vec![
+                        StatePrecondition {
+                            kind: EntityKind::Assignment,
+                            id: assignment.id.clone(),
+                            expected_revision: assignment_revision,
+                        },
+                        StatePrecondition {
+                            kind: EntityKind::Run,
+                            id: run.id.0.to_string(),
+                            expected_revision: run_revision,
+                        },
+                    ],
                     result: &intent,
                     changes: vec![StateChange::insert(
                         EntityKind::GitOperation,
@@ -230,6 +238,7 @@ impl GitWorkspaceManager {
                 ctx,
                 &mut persisted,
                 revision,
+                run_revision,
                 &assignment,
                 assignment_revision,
                 &request,
@@ -552,12 +561,18 @@ impl GitWorkspaceManager {
         ctx: &SessionContext,
         intent: &mut GitOperationIntent,
         mut revision: i64,
+        run_revision: i64,
         assignment: &AssignmentRecord,
         assignment_revision: i64,
         request: &WorkspaceRequest,
         key: &IdempotencyKey,
     ) -> CoreResult<Mutation<Workspace>> {
         let run = self.task_run(request.task_id)?;
+        if run.status != RunStatus::Active {
+            return Err(CoreError::Recoverable(
+                "run is not active; workspace creation/reconciliation is refused".into(),
+            ));
+        }
         if intent.checkpoint == GitCheckpoint::Prepared {
             intent.checkpoint = GitCheckpoint::MutationStarted;
             let (updated, new_revision) = self.save_intent_step(
@@ -568,14 +583,28 @@ impl GitWorkspaceManager {
                 revision,
                 "workspace.mutation_started",
                 json!({"intent_id":intent.id}),
-                vec![StateChange::update(
-                    EntityKind::Assignment,
-                    assignment.id.clone(),
-                    assignment_scope(assignment),
-                    assignment_revision,
-                    assignment,
-                )
-                .map_err(storage_error)?],
+                vec![
+                    StateChange::update(
+                        EntityKind::Assignment,
+                        assignment.id.clone(),
+                        assignment_scope(assignment),
+                        assignment_revision,
+                        assignment,
+                    )
+                    .map_err(storage_error)?,
+                    StateChange::update(
+                        EntityKind::Run,
+                        run.id.0.to_string(),
+                        EntityScope {
+                            project_id: Some(run.project_id.0.to_string()),
+                            run_id: Some(run.id.0.to_string()),
+                            ..Default::default()
+                        },
+                        run_revision,
+                        &run,
+                    )
+                    .map_err(storage_error)?,
+                ],
             )?;
             *intent = updated;
             revision = new_revision;
@@ -914,7 +943,7 @@ impl GitWorkspaceManager {
         &self,
         ctx: &SessionContext,
         task_id: TaskId,
-    ) -> CoreResult<(Run, AssignmentRecord, i64)> {
+    ) -> CoreResult<(Run, i64, AssignmentRecord, i64)> {
         if !matches!(ctx.role(), Role::Coder | Role::Supervisor) {
             return Err(CoreError::Forbidden);
         }
@@ -928,11 +957,16 @@ impl GitWorkspaceManager {
                 "task has no active workspace-eligible assignment".into(),
             ));
         }
-        let (run, _) = self
+        let (run, run_revision) = self
             .db
             .load::<Run>(EntityKind::Run, &task.task.run_id.0.to_string())
             .map_err(storage_error)?
             .ok_or(CoreError::NotFound)?;
+        if run.status != RunStatus::Active {
+            return Err(CoreError::Recoverable(
+                "run is not active; workspace creation is refused".into(),
+            ));
+        }
         let scope = EntityScope {
             run_id: Some(run.id.0.to_string()),
             task_id: Some(task_id.0.to_string()),
@@ -983,7 +1017,7 @@ impl GitWorkspaceManager {
                 "task assignment changed while selecting a workspace".into(),
             ));
         }
-        Ok((run, current, revision))
+        Ok((run, run_revision, current, revision))
     }
 
     fn authorize_workspace_read(
