@@ -1,5 +1,8 @@
 use super::*;
-use crate::coordination::tasks::{AssignmentRecord, AssignmentStatus, TaskRecord};
+use crate::coordination::tasks::{
+    AssignmentLeaseStatus, AssignmentRecord, AssignmentStatus, HumanTransitionGate, LeaseFence,
+    ProjectWorkflowPolicy, ReviewCompletionGate, TaskEngine, TaskRecord, TransitionContext,
+};
 use chrono::Utc;
 use serde::de::DeserializeOwned;
 use std::{
@@ -9,6 +12,81 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 use uuid::Uuid;
+
+struct TestPolicy;
+impl ProjectWorkflowPolicy for TestPolicy {
+    fn workflow_limits(&self, _: ProjectId) -> CoreResult<WorkflowLimits> {
+        Ok(WorkflowLimits {
+            max_duration_hours: 24,
+            max_concurrent_assignments: 4,
+            max_task_retries: 3,
+            max_review_rounds: 4,
+        })
+    }
+}
+struct TestReviews;
+impl ReviewCompletionGate for TestReviews {
+    fn ensure_task_complete(&self, _: TaskId) -> CoreResult<Vec<StatePrecondition>> {
+        Ok(vec![])
+    }
+    fn reviewed_commits_for_run(&self, _: RunId) -> CoreResult<Vec<CommitRef>> {
+        Ok(vec![])
+    }
+}
+struct TestHuman;
+impl HumanTransitionGate for TestHuman {
+    fn ensure_allowed(&self, _: &SessionContext, _: TransitionContext) -> CoreResult<()> {
+        Ok(())
+    }
+}
+struct TestLeases(Database);
+impl AssignmentLeaseStatus for TestLeases {
+    fn expired_lease_fence(&self, task_id: TaskId, owner: ActorId) -> CoreResult<LeaseFence> {
+        let assignments = self
+            .0
+            .list_entities::<AssignmentRecord>(
+                EntityKind::Assignment,
+                &EntityScope {
+                    task_id: Some(task_id.0.to_string()),
+                    owner_id: Some(owner.0.to_string()),
+                    ..Default::default()
+                },
+                PageRequest {
+                    limit: 50,
+                    after: None,
+                },
+            )
+            .map_err(|error| CoreError::Internal(error.to_string()))?;
+        let assignment = assignments
+            .items
+            .into_iter()
+            .find(|assignment| assignment.status == AssignmentStatus::Active)
+            .ok_or(CoreError::NotFound)?;
+        let (_, revision) = self
+            .0
+            .load::<AssignmentRecord>(EntityKind::Assignment, &assignment.id)
+            .map_err(|error| CoreError::Internal(error.to_string()))?
+            .ok_or(CoreError::NotFound)?;
+        Ok(LeaseFence {
+            task_id,
+            owner_id: owner,
+            condition: StatePrecondition {
+                kind: EntityKind::Assignment,
+                id: assignment.id,
+                expected_revision: revision,
+            },
+        })
+    }
+}
+fn task_engine(db: Database) -> TaskEngine {
+    TaskEngine::new(
+        db.clone(),
+        std::sync::Arc::new(TestPolicy),
+        std::sync::Arc::new(TestReviews),
+        std::sync::Arc::new(TestHuman),
+        std::sync::Arc::new(TestLeases(db)),
+    )
+}
 
 struct TempDir(PathBuf);
 impl TempDir {
@@ -232,6 +310,271 @@ fn fixture(repo_count: usize) -> Fixture {
         assignment_id,
         repos,
     }
+}
+
+fn prepared_intent(f: &Fixture) -> (Run, AssignmentRecord, i64, GitOperationIntent, i64) {
+    let (run, assignment, assignment_revision) = f
+        .manager
+        .authorized_assignment(&f.coder, f.task_id)
+        .unwrap();
+    let (repository, base_commit) = &f.repos[0];
+    let intent = GitOperationIntent {
+        id: intent_id(&assignment.id, repository.id),
+        assignment_key: assignment.id.clone(),
+        repository_id: repository.id,
+        canonical_repository_path: repository.canonical_path.clone(),
+        base_commit: base_commit.clone(),
+        branch: format!("tesselate/{}/{}", assignment.id, repository.id.0),
+        worktree_path: f
+            .manager
+            .workspace_path(&assignment.id, repository.id)
+            .to_string_lossy()
+            .into_owned(),
+        owner: assignment.assignee,
+        checkpoint: GitCheckpoint::Prepared,
+        observed: None,
+        result: None,
+        recovery_reason: None,
+    };
+    f.db.commit_mutation(MutationInput {
+        context: &f.supervisor,
+        operation: "test.git-intent.prepare",
+        idempotency_key: &IdempotencyKey("test-prepared-intent".into()),
+        request: &intent,
+        preconditions: vec![StatePrecondition {
+            kind: EntityKind::Assignment,
+            id: assignment.id.clone(),
+            expected_revision: assignment_revision,
+        }],
+        result: &intent,
+        changes: vec![StateChange::insert(
+            EntityKind::GitOperation,
+            intent.id.0.to_string(),
+            intent_scope(run.project_id, &intent),
+            &intent,
+        )
+        .unwrap()],
+        event: f.manager.event(
+            &f.supervisor,
+            &run,
+            f.task_id,
+            "test.git-intent.prepared",
+            json!({"intent_id":intent.id}),
+        ),
+    })
+    .unwrap();
+    let revision = f.manager.load_intent(&intent).unwrap().1;
+    (run, assignment, assignment_revision, intent, revision)
+}
+
+fn start_git_mutation(
+    f: &Fixture,
+    run: &Run,
+    assignment: &AssignmentRecord,
+    assignment_revision: i64,
+    intent: &mut GitOperationIntent,
+    revision: i64,
+) -> (GitOperationIntent, i64) {
+    intent.checkpoint = GitCheckpoint::MutationStarted;
+    f.manager
+        .save_intent_step(
+            &f.coder,
+            run,
+            f.task_id,
+            intent.clone(),
+            revision,
+            "workspace.mutation_started",
+            json!({"intent_id":intent.id}),
+            vec![StateChange::update(
+                EntityKind::Assignment,
+                assignment.id.clone(),
+                assignment_scope(assignment),
+                assignment_revision,
+                assignment,
+            )
+            .unwrap()],
+        )
+        .unwrap()
+}
+
+#[test]
+fn release_before_git_start_fences_stale_prepared_intent() {
+    let f = fixture(1);
+    let (_run, assignment, assignment_revision, mut intent, intent_revision) = prepared_intent(&f);
+    let workspace_request = WorkspaceRequest {
+        task_id: f.task_id,
+        repository_id: intent.repository_id,
+        base_commit: intent.base_commit.clone(),
+    };
+    task_engine(f.db.clone())
+        .release_task(
+            &f.supervisor,
+            ReleaseTask {
+                task_id: f.task_id,
+                reason: "release before Git begins".into(),
+            },
+            IdempotencyKey("release-before-git".into()),
+        )
+        .unwrap();
+    let error = f
+        .manager
+        .reconcile_create(
+            &f.coder,
+            &mut intent,
+            intent_revision,
+            &assignment,
+            assignment_revision,
+            &workspace_request,
+            &IdempotencyKey("create-after-release".into()),
+        )
+        .unwrap_err();
+    assert!(matches!(error, CoreError::Recoverable(_)));
+    assert_eq!(
+        f.manager.load_intent(&intent).unwrap().0.checkpoint,
+        GitCheckpoint::Prepared
+    );
+    assert!(!PathBuf::from(&intent.worktree_path).exists());
+}
+
+#[test]
+fn reassignment_before_git_start_fences_stale_prepared_intent() {
+    let f = fixture(1);
+    let (_run, assignment, assignment_revision, mut intent, intent_revision) = prepared_intent(&f);
+    let workspace_request = WorkspaceRequest {
+        task_id: f.task_id,
+        repository_id: intent.repository_id,
+        base_commit: intent.base_commit.clone(),
+    };
+    task_engine(f.db.clone())
+        .assign_task(
+            &f.supervisor,
+            AssignTask {
+                task_id: f.task_id,
+                assignee: f.coder_id,
+            },
+            IdempotencyKey("reassign-before-git".into()),
+        )
+        .unwrap();
+    let error = f
+        .manager
+        .reconcile_create(
+            &f.coder,
+            &mut intent,
+            intent_revision,
+            &assignment,
+            assignment_revision,
+            &workspace_request,
+            &IdempotencyKey("create-after-reassignment".into()),
+        )
+        .unwrap_err();
+    assert!(matches!(error, CoreError::Recoverable(_)));
+    assert!(!PathBuf::from(&intent.worktree_path).exists());
+}
+
+#[test]
+fn release_waits_for_git_intent_and_can_retry_after_reconciliation() {
+    let f = fixture(1);
+    let (run, assignment, assignment_revision, mut intent, intent_revision) = prepared_intent(&f);
+    let (mut mutating, mutating_revision) = start_git_mutation(
+        &f,
+        &run,
+        &assignment,
+        assignment_revision,
+        &mut intent,
+        intent_revision,
+    );
+    assert!(matches!(
+        task_engine(f.db.clone()).release_task(
+            &f.supervisor,
+            ReleaseTask {
+                task_id: f.task_id,
+                reason: "must wait".into(),
+            },
+            IdempotencyKey("release-during-git".into()),
+        ),
+        Err(CoreError::Recoverable(_))
+    ));
+    let workspace_request = WorkspaceRequest {
+        task_id: f.task_id,
+        repository_id: mutating.repository_id,
+        base_commit: mutating.base_commit.clone(),
+    };
+    f.manager
+        .reconcile_create(
+            &f.coder,
+            &mut mutating,
+            mutating_revision,
+            &assignment,
+            assignment_revision + 1,
+            &workspace_request,
+            &IdempotencyKey("finish-git-after-interruption".into()),
+        )
+        .unwrap();
+    task_engine(f.db.clone())
+        .release_task(
+            &f.supervisor,
+            ReleaseTask {
+                task_id: f.task_id,
+                reason: "release after Git recorded".into(),
+            },
+            IdempotencyKey("release-after-git".into()),
+        )
+        .unwrap();
+    assert_eq!(
+        f.manager.load_intent(&mutating).unwrap().0.checkpoint,
+        GitCheckpoint::Recorded
+    );
+}
+
+#[test]
+fn reassignment_waits_for_git_intent_and_can_retry_after_reconciliation() {
+    let f = fixture(1);
+    let (run, assignment, assignment_revision, mut intent, intent_revision) = prepared_intent(&f);
+    let (mut mutating, mutating_revision) = start_git_mutation(
+        &f,
+        &run,
+        &assignment,
+        assignment_revision,
+        &mut intent,
+        intent_revision,
+    );
+    assert!(matches!(
+        task_engine(f.db.clone()).assign_task(
+            &f.supervisor,
+            AssignTask {
+                task_id: f.task_id,
+                assignee: f.coder_id,
+            },
+            IdempotencyKey("reassign-during-git".into()),
+        ),
+        Err(CoreError::Recoverable(_))
+    ));
+    let workspace_request = WorkspaceRequest {
+        task_id: f.task_id,
+        repository_id: mutating.repository_id,
+        base_commit: mutating.base_commit.clone(),
+    };
+    f.manager
+        .reconcile_create(
+            &f.coder,
+            &mut mutating,
+            mutating_revision,
+            &assignment,
+            assignment_revision + 1,
+            &workspace_request,
+            &IdempotencyKey("finish-git-before-reassignment".into()),
+        )
+        .unwrap();
+    task_engine(f.db.clone())
+        .assign_task(
+            &f.supervisor,
+            AssignTask {
+                task_id: f.task_id,
+                assignee: f.coder_id,
+            },
+            IdempotencyKey("reassign-after-git".into()),
+        )
+        .unwrap();
 }
 
 fn insert<T: serde::Serialize + DeserializeOwned>(
@@ -664,6 +1007,7 @@ fn cleanup_removal_before_checkpoint_reconciles_without_recreating_workspace() {
             revision,
             "workspace.cleanup_started",
             json!({}),
+            vec![],
         )
         .unwrap();
     let repo_path = PathBuf::from(&repository.canonical_path);

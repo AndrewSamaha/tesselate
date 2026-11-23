@@ -8,6 +8,7 @@ use crate::{
     core::*,
     persistence::{
         Database, EntityKind, EntityScope, MutationInput, NewEvent, PersistenceError, StateChange,
+        StatePrecondition,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -59,7 +60,8 @@ impl GitWorkspaceManager {
         {
             return Ok(prior);
         }
-        let (run, assignment) = self.authorized_assignment(ctx, request.task_id)?;
+        let (run, assignment, assignment_revision) =
+            self.authorized_assignment(ctx, request.task_id)?;
         let (repository, _) = self
             .db
             .load::<Repository>(EntityKind::Repository, &request.repository_id.0.to_string())
@@ -155,12 +157,20 @@ impl GitWorkspaceManager {
                     "workspace cleanup is incomplete; inspect before retrying creation".into(),
                 ));
             }
-            self.reconcile_create(ctx, &mut intent, revision, &request, &key)
+            self.reconcile_create(
+                ctx,
+                &mut intent,
+                revision,
+                &assignment,
+                assignment_revision,
+                &request,
+                &key,
+            )
         } else {
             let id = intent_id(&assignment.id, repository.id);
             let intent = GitOperationIntent {
                 id,
-                assignment_key: assignment.id,
+                assignment_key: assignment.id.clone(),
                 repository_id: repository.id,
                 canonical_repository_path: repo.to_string_lossy().into_owned(),
                 base_commit: base,
@@ -185,7 +195,11 @@ impl GitWorkspaceManager {
                     operation: "git.intents.prepare",
                     idempotency_key: &IdempotencyKey(format!("git-intent-{}-prepared", id.0)),
                     request: &intent,
-                    preconditions: vec![],
+                    preconditions: vec![StatePrecondition {
+                        kind: EntityKind::Assignment,
+                        id: assignment.id.clone(),
+                        expected_revision: assignment_revision,
+                    }],
                     result: &intent,
                     changes: vec![StateChange::insert(
                         EntityKind::GitOperation,
@@ -212,7 +226,15 @@ impl GitWorkspaceManager {
                     "workspace.request_reused",
                 );
             }
-            self.reconcile_create(ctx, &mut persisted, revision, &request, &key)
+            self.reconcile_create(
+                ctx,
+                &mut persisted,
+                revision,
+                &assignment,
+                assignment_revision,
+                &request,
+                &key,
+            )
         }
     }
 
@@ -501,6 +523,7 @@ impl GitWorkspaceManager {
                 revision,
                 "workspace.cleanup_started",
                 json!({"workspace_id":workspace.id}),
+                vec![],
             )?;
             intent = started.0;
         }
@@ -529,6 +552,8 @@ impl GitWorkspaceManager {
         ctx: &SessionContext,
         intent: &mut GitOperationIntent,
         mut revision: i64,
+        assignment: &AssignmentRecord,
+        assignment_revision: i64,
         request: &WorkspaceRequest,
         key: &IdempotencyKey,
     ) -> CoreResult<Mutation<Workspace>> {
@@ -543,6 +568,14 @@ impl GitWorkspaceManager {
                 revision,
                 "workspace.mutation_started",
                 json!({"intent_id":intent.id}),
+                vec![StateChange::update(
+                    EntityKind::Assignment,
+                    assignment.id.clone(),
+                    assignment_scope(assignment),
+                    assignment_revision,
+                    assignment,
+                )
+                .map_err(storage_error)?],
             )?;
             *intent = updated;
             revision = new_revision;
@@ -576,6 +609,7 @@ impl GitWorkspaceManager {
                         revision,
                         "workspace.git_applied",
                         json!({"intent_id":intent.id,"head":observed.head_commit}),
+                        vec![],
                     )?;
                     *intent = updated;
                     revision = new_revision;
@@ -660,6 +694,7 @@ impl GitWorkspaceManager {
                     revision,
                     "workspace.git_applied",
                     json!({"intent_id":intent.id,"head":observed.head_commit}),
+                    vec![],
                 )?;
                 *intent = updated;
                 revision = new_revision;
@@ -799,6 +834,7 @@ impl GitWorkspaceManager {
         revision: i64,
         event_type: &str,
         payload: serde_json::Value,
+        mut additional_changes: Vec<StateChange>,
     ) -> CoreResult<(GitOperationIntent, i64)> {
         let key = IdempotencyKey(format!(
             "git-intent-{}-{}",
@@ -813,6 +849,7 @@ impl GitWorkspaceManager {
             &intent,
         )
         .map_err(storage_error)?;
+        additional_changes.insert(0, change);
         let result = self
             .db
             .commit_mutation(MutationInput {
@@ -822,7 +859,7 @@ impl GitWorkspaceManager {
                 request: &intent,
                 preconditions: vec![],
                 result: &intent,
-                changes: vec![change],
+                changes: additional_changes,
                 event: self.event(ctx, run, task_id, event_type, payload),
             })
             .map_err(storage_error)?;
@@ -877,7 +914,7 @@ impl GitWorkspaceManager {
         &self,
         ctx: &SessionContext,
         task_id: TaskId,
-    ) -> CoreResult<(Run, AssignmentRecord)> {
+    ) -> CoreResult<(Run, AssignmentRecord, i64)> {
         if !matches!(ctx.role(), Role::Coder | Role::Supervisor) {
             return Err(CoreError::Forbidden);
         }
@@ -936,7 +973,17 @@ impl GitWorkspaceManager {
         if ctx.role() == Role::Coder && ctx.actor_id() != assignment.assignee {
             return Err(CoreError::Forbidden);
         }
-        Ok((run, assignment))
+        let (current, revision) = self
+            .db
+            .load::<AssignmentRecord>(EntityKind::Assignment, &assignment.id)
+            .map_err(storage_error)?
+            .ok_or(CoreError::NotFound)?;
+        if current.status != AssignmentStatus::Active || current.assignee != assignment.assignee {
+            return Err(CoreError::Recoverable(
+                "task assignment changed while selecting a workspace".into(),
+            ));
+        }
+        Ok((run, current, revision))
     }
 
     fn authorize_workspace_read(
@@ -1433,6 +1480,15 @@ fn intent_id(assignment_id: &str, repository_id: RepositoryId) -> GitOperationId
     bytes[6] = (bytes[6] & 0x0f) | 0x50;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
     GitOperationId(Uuid::from_bytes(bytes))
+}
+
+fn assignment_scope(assignment: &AssignmentRecord) -> EntityScope {
+    EntityScope {
+        project_id: Some(assignment.project_id.0.to_string()),
+        run_id: Some(assignment.run_id.0.to_string()),
+        task_id: Some(assignment.task_id.0.to_string()),
+        owner_id: Some(assignment.assignee.0.to_string()),
+    }
 }
 
 fn intent_scope(project_id: ProjectId, intent: &GitOperationIntent) -> EntityScope {
