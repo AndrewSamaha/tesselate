@@ -16,7 +16,7 @@ use std::{
 use thiserror::Error;
 use uuid::Uuid;
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 const MAX_PAGE_SIZE: u32 = 500;
 
 #[derive(Debug, Error)]
@@ -54,6 +54,8 @@ pub enum EntityKind {
     Actor,
     Session,
     Assignment,
+    AssignmentLease,
+    Credential,
     Message,
     Workspace,
     WorkspaceCommit,
@@ -76,6 +78,8 @@ impl EntityKind {
             Self::Actor => "actors",
             Self::Session => "sessions",
             Self::Assignment => "assignments",
+            Self::AssignmentLease => "assignment_leases",
+            Self::Credential => "credentials",
             Self::Message => "messages",
             Self::Workspace => "workspaces",
             Self::WorkspaceCommit => "workspace_commits",
@@ -671,7 +675,8 @@ fn migrate(connection: &Connection) -> Result<(), PersistenceError> {
     if found == SCHEMA_VERSION {
         return Ok(());
     }
-    connection.execute_batch("BEGIN IMMEDIATE;
+    if found == 0 {
+        connection.execute_batch("BEGIN IMMEDIATE;
         CREATE TABLE IF NOT EXISTS schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
         CREATE TABLE projects(id TEXT PRIMARY KEY, project_id TEXT, run_id TEXT, task_id TEXT, owner_id TEXT, payload_json TEXT NOT NULL, revision INTEGER NOT NULL CHECK(revision>0));
         CREATE TABLE actors(id TEXT PRIMARY KEY, project_id TEXT, run_id TEXT, task_id TEXT, owner_id TEXT, payload_json TEXT NOT NULL, revision INTEGER NOT NULL CHECK(revision>0));
@@ -703,6 +708,16 @@ fn migrate(connection: &Connection) -> Result<(), PersistenceError> {
         INSERT INTO schema_migrations(version,applied_at) VALUES(1,CURRENT_TIMESTAMP);
         PRAGMA user_version=1;
         COMMIT;")?;
+    }
+    let current: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if current == 1 {
+        connection.execute_batch("BEGIN IMMEDIATE;
+        CREATE TABLE IF NOT EXISTS assignment_leases(id TEXT PRIMARY KEY,project_id TEXT REFERENCES projects(id),run_id TEXT REFERENCES runs(id),task_id TEXT REFERENCES tasks(id),owner_id TEXT REFERENCES actors(id),payload_json TEXT NOT NULL,revision INTEGER NOT NULL CHECK(revision>0));
+        CREATE TABLE IF NOT EXISTS credentials(id TEXT PRIMARY KEY,project_id TEXT,run_id TEXT,task_id TEXT,owner_id TEXT REFERENCES actors(id),payload_json TEXT NOT NULL,revision INTEGER NOT NULL CHECK(revision>0));
+        INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(2,CURRENT_TIMESTAMP);
+        PRAGMA user_version=2;
+        COMMIT;")?;
+    }
     Ok(())
 }
 
