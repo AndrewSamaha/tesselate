@@ -449,6 +449,7 @@ fn export_refuses_a_symlinked_run_directory() {
     assert!(fs::read_dir(outside).unwrap().next().is_none());
 }
 
+#[cfg(unix)]
 #[test]
 fn failed_atomic_replacement_preserves_the_previous_artifact() {
     let temp = TempDir::new();
@@ -478,6 +479,27 @@ fn failed_atomic_replacement_preserves_the_previous_artifact() {
         rename_calls, 1,
         "replacement is refused without a delete-and-retry fallback"
     );
+    assert_eq!(fs::read_to_string(destination).unwrap(), "old artifact");
+}
+
+#[cfg(not(unix))]
+#[test]
+fn unsupported_atomic_replacement_preserves_the_previous_artifact() {
+    let temp = TempDir::new();
+    let destination = temp.0.join("timeline.v1.md");
+    fs::write(&destination, "old artifact").unwrap();
+    let mut rename_calls = 0;
+    let result = write_atomic_with(
+        &destination,
+        b"new artifact",
+        |from: &Path, to: &Path| {
+            rename_calls += 1;
+            fs::rename(from, to)
+        },
+        |parent| sync_parent_directory(parent),
+    );
+    assert!(result.is_err());
+    assert_eq!(rename_calls, 0, "replacement is refused before rename");
     assert_eq!(fs::read_to_string(destination).unwrap(), "old artifact");
 }
 
