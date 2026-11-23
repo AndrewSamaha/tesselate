@@ -245,7 +245,10 @@ fn resolve_uncreated_path(base: &Path, configured: &Path) -> Result<PathBuf, Con
     }
     let mut ancestor = normalized.as_path();
     let mut suffix = Vec::new();
-    while !ancestor.exists() {
+    while matches!(
+        fs::symlink_metadata(ancestor),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+    ) {
         let name = ancestor.file_name().ok_or_else(|| {
             ConfigError::Invalid(format!(
                 "artifact_dir {} has no existing parent directory",
@@ -280,7 +283,10 @@ fn resolve_uncreated_path(base: &Path, configured: &Path) -> Result<PathBuf, Con
 
 fn ensure_writable_directory(destination: &Path) -> Result<(), ConfigError> {
     let mut ancestor = destination;
-    while !ancestor.exists() {
+    while matches!(
+        fs::symlink_metadata(ancestor),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+    ) {
         ancestor = ancestor.parent().ok_or_else(|| {
             ConfigError::Invalid(format!(
                 "artifact_dir {} has no writable parent directory",

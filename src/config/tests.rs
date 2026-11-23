@@ -203,3 +203,22 @@ fn rejects_artifact_destination_without_a_writable_existing_parent() {
         .to_string()
         .contains("not writable"));
 }
+
+#[cfg(unix)]
+#[test]
+fn rejects_dangling_artifact_symlinks() {
+    use std::os::unix::fs::symlink;
+
+    let temp = TempDir::new();
+    git_repo(&temp.0.join("repo"));
+    symlink(temp.0.join("missing-target"), temp.0.join("dangling")).unwrap();
+    let base = valid_config("[[repositories]]\nid = \"repo\"\npath = \"repo\"");
+
+    for artifact_dir in ["dangling", "dangling/artifacts"] {
+        let config = base.replace(
+            "artifact_dir = \".tesselate/artifacts\"",
+            &format!("artifact_dir = \"{artifact_dir}\""),
+        );
+        assert!(parse_project_config(&config, &temp.0).is_err());
+    }
+}
