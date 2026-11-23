@@ -5,6 +5,7 @@ use crate::{
     core::*,
     persistence::{
         Database, EntityKind, EntityScope, MutationInput, NewEvent, PersistenceError, StateChange,
+        StatePrecondition,
     },
 };
 use chrono::{Duration as ChronoDuration, Utc};
@@ -52,6 +53,38 @@ pub struct ReviewTaskTransition {
     pub reason: String,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TransitionIdentity {
+    RunCreation,
+    TaskCreation,
+    TaskClaim,
+    TaskAssignment,
+    TaskRelease,
+    TaskProgress,
+    TaskSubmission,
+    ReviewStatus,
+    FinalDisposition,
+    RunCompletion,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case", tag = "entity", content = "status")]
+pub enum LifecycleState {
+    Run(RunStatus),
+    Task(TaskStatus),
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TransitionContext {
+    pub project_id: ProjectId,
+    pub run_id: RunId,
+    pub task_id: Option<TaskId>,
+    pub from: Option<LifecycleState>,
+    pub to: Option<LifecycleState>,
+    pub identity: TransitionIdentity,
+}
+
 /// F01 supplies validated policy from project configuration; callers cannot put limits in CreateRun.
 pub trait ProjectWorkflowPolicy: Send + Sync {
     fn workflow_limits(&self, project_id: ProjectId) -> CoreResult<WorkflowLimits>;
@@ -65,18 +98,20 @@ pub trait ReviewCompletionGate: Send + Sync {
 
 /// F07 owns policy-governed human pauses; this hook runs before the task engine commits a transition.
 pub trait HumanTransitionGate: Send + Sync {
-    fn ensure_allowed(
-        &self,
-        ctx: &SessionContext,
-        task_id: Option<TaskId>,
-        from: Option<TaskStatus>,
-        to: Option<TaskStatus>,
-    ) -> CoreResult<()>;
+    fn ensure_allowed(&self, ctx: &SessionContext, transition: TransitionContext)
+        -> CoreResult<()>;
 }
 
-/// F05 supplies session lease state so F04 can recover work without implementing lease policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeaseFence {
+    pub task_id: TaskId,
+    pub owner_id: ActorId,
+    pub condition: StatePrecondition,
+}
+
+/// F05 supplies an expired lease's durable revision so renewals can fence a reassignment.
 pub trait AssignmentLeaseStatus: Send + Sync {
-    fn is_expired(&self, task_id: TaskId, owner: ActorId) -> CoreResult<bool>;
+    fn expired_lease_fence(&self, task_id: TaskId, owner: ActorId) -> CoreResult<LeaseFence>;
 }
 
 pub struct TaskEngine {
@@ -102,6 +137,29 @@ impl TaskEngine {
             human,
             leases,
         }
+    }
+
+    fn ensure_transition(
+        &self,
+        ctx: &SessionContext,
+        project_id: ProjectId,
+        run_id: RunId,
+        task_id: Option<TaskId>,
+        from: Option<LifecycleState>,
+        to: Option<LifecycleState>,
+        identity: TransitionIdentity,
+    ) -> CoreResult<()> {
+        self.human.ensure_allowed(
+            ctx,
+            TransitionContext {
+                project_id,
+                run_id,
+                task_id,
+                from,
+                to,
+                identity,
+            },
+        )
     }
 
     pub fn create_run(
@@ -135,6 +193,15 @@ impl TaskEngine {
             outstanding_integration_steps: Vec::new(),
             outcome: None,
         };
+        self.ensure_transition(
+            ctx,
+            run.project_id,
+            run.id,
+            None,
+            None,
+            Some(LifecycleState::Run(RunStatus::Active)),
+            TransitionIdentity::RunCreation,
+        )?;
         let change = StateChange::insert(
             EntityKind::Run,
             run.id.0.to_string(),
@@ -194,7 +261,61 @@ impl TaskEngine {
         project_id: ProjectId,
         page: PageRequest,
     ) -> CoreResult<Page<Task>> {
-        require_role(ctx, Role::Coder)?;
+        if !matches!(ctx.role(), Role::Coder | Role::Supervisor) {
+            return Err(CoreError::Forbidden);
+        }
+        self.db
+            .load::<Project>(EntityKind::Project, &project_id.0.to_string())
+            .map_err(storage_error)?
+            .ok_or(CoreError::NotFound)?;
+        let records = self
+            .db
+            .list_entities::<TaskRecord>(
+                EntityKind::Task,
+                &EntityScope {
+                    project_id: Some(project_id.0.to_string()),
+                    ..Default::default()
+                },
+                page,
+            )
+            .map_err(storage_error)?;
+        let mut runs = std::collections::HashMap::<RunId, Run>::new();
+        for run_record in self.all_entities::<Run>(
+            EntityKind::Run,
+            EntityScope {
+                project_id: Some(project_id.0.to_string()),
+                ..Default::default()
+            },
+        )? {
+            let (mut run, revision) = self.load_run(run_record.id)?;
+            if run.status == RunStatus::Active && duration_expired(&run) {
+                match self.stop_for_limit(ctx, &run, revision, "run duration limit reached") {
+                    Ok(()) => {
+                        run.status = RunStatus::Stopped;
+                        run.outcome = Some(RunOutcome {
+                            reason: "run duration limit reached".into(),
+                            remaining_task_ids: self
+                                .all_tasks(run.id)?
+                                .into_iter()
+                                .filter(|record| record.task.status != TaskStatus::Completed)
+                                .map(|record| record.task.id)
+                                .collect(),
+                        });
+                    }
+                    Err(CoreError::Recoverable(_)) => {
+                        let (latest, _) = self.load_run(run.id)?;
+                        if latest.status == RunStatus::Active && duration_expired(&latest) {
+                            return Err(CoreError::Recoverable(
+                                "run expiry changed concurrently; retry work discovery".into(),
+                            ));
+                        }
+                        run = latest;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            runs.insert(run.id, run);
+        }
         let all = self.all_entities::<TaskRecord>(
             EntityKind::Task,
             EntityScope {
@@ -209,29 +330,6 @@ impl TaskEngine {
                 TaskStatus::Assigned | TaskStatus::Coding
             ) {
                 *active_counts.entry(record.task.run_id).or_default() += 1;
-            }
-        }
-        let records = self
-            .db
-            .list_entities::<TaskRecord>(
-                EntityKind::Task,
-                &EntityScope {
-                    project_id: Some(project_id.0.to_string()),
-                    ..Default::default()
-                },
-                page,
-            )
-            .map_err(storage_error)?;
-        let mut runs = std::collections::HashMap::<RunId, Run>::new();
-        for record in &records.items {
-            if !runs.contains_key(&record.task.run_id) {
-                if let Some((run, _)) = self
-                    .db
-                    .load::<Run>(EntityKind::Run, &record.task.run_id.0.to_string())
-                    .map_err(storage_error)?
-                {
-                    runs.insert(run.id, run);
-                }
             }
         }
         let items = records
@@ -329,16 +427,6 @@ impl TaskEngine {
             }
             waiting |= prerequisite.task.status != TaskStatus::Completed;
         }
-        self.human.ensure_allowed(
-            ctx,
-            None,
-            Some(TaskStatus::Ready),
-            Some(if waiting {
-                TaskStatus::Blocked
-            } else {
-                TaskStatus::Ready
-            }),
-        )?;
         let task = Task {
             id: TaskId::new(),
             run_id: run.id,
@@ -361,6 +449,15 @@ impl TaskEngine {
             waiting_on_dependencies: waiting,
             final_disposition: None,
         };
+        self.ensure_transition(
+            ctx,
+            run.project_id,
+            run.id,
+            Some(task.id),
+            None,
+            Some(LifecycleState::Task(task.status)),
+            TransitionIdentity::TaskCreation,
+        )?;
         let task_change = StateChange::insert(
             EntityKind::Task,
             task.id.0.to_string(),
@@ -419,11 +516,14 @@ impl TaskEngine {
         self.ensure_run_active(ctx, &mut run, run_revision)?;
         let (mut record, task_revision) = self.load_task(request.task_id)?;
         if record.task.status == TaskStatus::Assigned && record.task.owner == Some(ctx.actor_id()) {
-            self.human.ensure_allowed(
+            self.ensure_transition(
                 ctx,
+                run.project_id,
+                run.id,
                 Some(request.task_id),
-                Some(TaskStatus::Assigned),
-                Some(TaskStatus::Coding),
+                Some(LifecycleState::Task(TaskStatus::Assigned)),
+                Some(LifecycleState::Task(TaskStatus::Coding)),
+                TransitionIdentity::TaskClaim,
             )?;
             record.task.status = TaskStatus::Coding;
             record.task.progress.get_or_insert_with(|| "claimed".into());
@@ -461,6 +561,7 @@ impl TaskEngine {
             run_revision,
             record,
             task_revision,
+            None,
         )
     }
 
@@ -493,6 +594,7 @@ impl TaskEngine {
                 run_revision,
                 record,
                 task_revision,
+                None,
             );
         }
         if record.task.status == TaskStatus::RevisionRequired {
@@ -507,6 +609,7 @@ impl TaskEngine {
                 run_revision,
                 record,
                 task_revision,
+                None,
             );
         }
         let old_owner = record
@@ -516,10 +619,15 @@ impl TaskEngine {
         if !matches!(
             record.task.status,
             TaskStatus::Assigned | TaskStatus::Coding
-        ) || !self.leases.is_expired(task_id, old_owner)?
-        {
+        ) {
             return Err(CoreError::Recoverable(
                 "task is already assigned to an active session".into(),
+            ));
+        }
+        let fence = self.leases.expired_lease_fence(task_id, old_owner)?;
+        if fence.task_id != task_id || fence.owner_id != old_owner {
+            return Err(CoreError::Internal(
+                "lease hook returned a fence for another assignment".into(),
             ));
         }
         self.assign_ready_task(
@@ -533,6 +641,7 @@ impl TaskEngine {
             run_revision,
             record,
             task_revision,
+            Some(fence),
         )
     }
 
@@ -549,6 +658,7 @@ impl TaskEngine {
         run_revision: i64,
         mut record: TaskRecord,
         task_revision: i64,
+        lease_fence: Option<LeaseFence>,
     ) -> CoreResult<Mutation<Task>> {
         let was_active = matches!(
             record.task.status,
@@ -582,8 +692,15 @@ impl TaskEngine {
         } else {
             (Some(record.task.status), None)
         };
-        self.human
-            .ensure_allowed(ctx, Some(task_id), from, Some(TaskStatus::Assigned))?;
+        self.ensure_transition(
+            ctx,
+            run.project_id,
+            run.id,
+            Some(task_id),
+            from.map(LifecycleState::Task),
+            Some(LifecycleState::Task(TaskStatus::Assigned)),
+            TransitionIdentity::TaskAssignment,
+        )?;
         record.task.status = TaskStatus::Assigned;
         record.task.owner = Some(assignee);
         record.task.attempts += 1;
@@ -636,7 +753,21 @@ impl TaskEngine {
             "task.assigned",
             json!({"assignee":assignee,"attempt":record.task.attempts,"workspace_request_required":true}),
         );
-        self.commit_task(ctx, operation, &key, request, &record.task, changes, event)
+        if let Some(fence) = lease_fence {
+            self.commit_task_with_preconditions(
+                ctx,
+                operation,
+                &key,
+                request,
+                &record.task,
+                changes,
+                event,
+                vec![fence.condition],
+                Some((fence.task_id, fence.owner_id)),
+            )
+        } else {
+            self.commit_task(ctx, operation, &key, request, &record.task, changes, event)
+        }
     }
 
     pub fn release_task(
@@ -667,11 +798,14 @@ impl TaskEngine {
         if !is_supervisor && record.task.owner != Some(ctx.actor_id()) {
             return Err(CoreError::Forbidden);
         }
-        self.human.ensure_allowed(
+        self.ensure_transition(
             ctx,
+            run.project_id,
+            run.id,
             Some(request.task_id),
-            Some(record.task.status),
-            Some(TaskStatus::Ready),
+            Some(LifecycleState::Task(record.task.status)),
+            Some(LifecycleState::Task(TaskStatus::Ready)),
+            TransitionIdentity::TaskRelease,
         )?;
         let (mut assignment, assignment_revision) = self
             .current_assignment(request.task_id)?
@@ -730,11 +864,14 @@ impl TaskEngine {
         {
             return Err(CoreError::Forbidden);
         }
-        self.human.ensure_allowed(
+        self.ensure_transition(
             ctx,
+            run.project_id,
+            run.id,
             Some(request.task_id),
-            Some(record.task.status),
-            Some(TaskStatus::Coding),
+            Some(LifecycleState::Task(record.task.status)),
+            Some(LifecycleState::Task(TaskStatus::Coding)),
+            TransitionIdentity::TaskProgress,
         )?;
         record.task.status = TaskStatus::Coding;
         record.task.progress = Some(request.progress.clone());
@@ -775,11 +912,14 @@ impl TaskEngine {
         if record.task.owner != Some(ctx.actor_id()) || record.task.status != TaskStatus::Coding {
             return Err(CoreError::Forbidden);
         }
-        self.human.ensure_allowed(
+        self.ensure_transition(
             ctx,
+            run.project_id,
+            run.id,
             Some(request.task_id),
-            Some(TaskStatus::Coding),
-            Some(TaskStatus::Submitted),
+            Some(LifecycleState::Task(TaskStatus::Coding)),
+            Some(LifecycleState::Task(TaskStatus::Submitted)),
+            TransitionIdentity::TaskSubmission,
         )?;
         record.task.status = TaskStatus::Submitted;
         record.task.commit_ids = request.commit_ids.clone();
@@ -842,11 +982,14 @@ impl TaskEngine {
         if !transition_allowed(record.task.status, request.status) {
             return Err(CoreError::Invalid("illegal task transition".into()));
         }
-        self.human.ensure_allowed(
+        self.ensure_transition(
             ctx,
+            run.project_id,
+            run.id,
             Some(request.task_id),
-            Some(record.task.status),
-            Some(request.status),
+            Some(LifecycleState::Task(record.task.status)),
+            Some(LifecycleState::Task(request.status)),
+            TransitionIdentity::ReviewStatus,
         )?;
         record.task.status = request.status;
         record.task.result = Some(request.reason.clone());
@@ -891,11 +1034,14 @@ impl TaskEngine {
         if target == TaskStatus::Completed {
             self.reviews.ensure_task_complete(request.task_id)?;
         }
-        self.human.ensure_allowed(
+        self.ensure_transition(
             ctx,
+            run.project_id,
+            run.id,
             Some(request.task_id),
-            Some(record.task.status),
-            Some(target),
+            Some(LifecycleState::Task(record.task.status)),
+            Some(LifecycleState::Task(target)),
+            TransitionIdentity::FinalDisposition,
         )?;
         record.task.status = target;
         record.task.result = Some(request.reason.clone());
@@ -954,7 +1100,15 @@ impl TaskEngine {
                 "all tasks must be completed before the run".into(),
             ));
         }
-        self.human.ensure_allowed(ctx, None, None, None)?;
+        self.ensure_transition(
+            ctx,
+            run.project_id,
+            run.id,
+            None,
+            Some(LifecycleState::Run(RunStatus::Active)),
+            Some(LifecycleState::Run(RunStatus::Completed)),
+            TransitionIdentity::RunCompletion,
+        )?;
         run.reviewed_commit_ids = self.reviews.reviewed_commits_for_run(run.id)?;
         run.outstanding_integration_steps = request.outstanding_integration_steps.clone();
         run.status = RunStatus::Completed;
@@ -1214,11 +1368,37 @@ impl TaskEngine {
         changes: Vec<StateChange>,
         event: NewEvent,
     ) -> CoreResult<Mutation<Task>> {
+        self.commit_task_with_preconditions(
+            ctx,
+            operation,
+            key,
+            request,
+            task,
+            changes,
+            event,
+            Vec::new(),
+            None,
+        )
+    }
+
+    fn commit_task_with_preconditions<Q: Serialize>(
+        &self,
+        ctx: &SessionContext,
+        operation: &str,
+        key: &IdempotencyKey,
+        request: &Q,
+        task: &Task,
+        changes: Vec<StateChange>,
+        event: NewEvent,
+        preconditions: Vec<StatePrecondition>,
+        lease_check: Option<(TaskId, ActorId)>,
+    ) -> CoreResult<Mutation<Task>> {
         match self.db.commit_mutation(MutationInput {
             context: ctx,
             operation,
             idempotency_key: key,
             request,
+            preconditions,
             result: task,
             changes,
             event,
@@ -1227,6 +1407,17 @@ impl TaskEngine {
             Err(PersistenceError::StateConflict(_)) => {
                 if let Some(prior) = self.prior_task(ctx, operation, key, request)? {
                     return Ok(prior);
+                }
+                if let Some((task_id, owner_id)) = lease_check {
+                    if self.leases.expired_lease_fence(task_id, owner_id).is_err() {
+                        return Err(CoreError::Recoverable(
+                            "lease renewed or became unavailable; refusing reassignment".into(),
+                        ));
+                    }
+                    return Err(CoreError::Recoverable(
+                        "lease is still expired but state changed concurrently; retry reassignment"
+                            .into(),
+                    ));
                 }
                 Err(CoreError::Recoverable(
                     "task or run changed concurrently; retry this operation".into(),
@@ -1251,6 +1442,7 @@ impl TaskEngine {
             operation,
             idempotency_key: key,
             request,
+            preconditions: Vec::new(),
             result: run,
             changes,
             event,

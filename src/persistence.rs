@@ -110,6 +110,14 @@ pub struct StateChange {
     pub dependencies: Option<Vec<TaskId>>,
 }
 
+/// Compare-only durable state guard checked inside the mutation transaction.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StatePrecondition {
+    pub kind: EntityKind,
+    pub id: String,
+    pub expected_revision: i64,
+}
+
 impl StateChange {
     pub fn insert<T: Serialize>(
         kind: EntityKind,
@@ -193,6 +201,7 @@ pub struct MutationInput<'a, Q, R> {
     pub operation: &'a str,
     pub idempotency_key: &'a IdempotencyKey,
     pub request: &'a Q,
+    pub preconditions: Vec<StatePrecondition>,
     pub result: &'a R,
     pub changes: Vec<StateChange>,
     pub event: NewEvent,
@@ -285,6 +294,9 @@ impl Database {
             });
         }
 
+        for precondition in &input.preconditions {
+            check_state_precondition(&transaction, precondition)?;
+        }
         for change in &input.changes {
             check_precondition(&transaction, change)?;
         }
@@ -504,6 +516,17 @@ fn validate_mutation<Q, R>(input: &MutationInput<'_, Q, R>) -> Result<(), Persis
             ));
         }
     }
+    let mut guarded = std::collections::HashSet::new();
+    for precondition in &input.preconditions {
+        if precondition.id.is_empty()
+            || precondition.expected_revision < 0
+            || !guarded.insert((precondition.kind, precondition.id.as_str()))
+        {
+            return Err(PersistenceError::Invalid(
+                "state preconditions need unique entity IDs and nonnegative revisions".into(),
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -540,6 +563,24 @@ fn check_precondition(
         (None, None) => Ok(()),
         (Some(expected), Some(actual)) if expected == actual => Ok(()),
         _ => Err(PersistenceError::StateConflict(change.id.clone())),
+    }
+}
+
+fn check_state_precondition(
+    transaction: &Transaction<'_>,
+    precondition: &StatePrecondition,
+) -> Result<(), PersistenceError> {
+    let sql = format!(
+        "SELECT revision FROM {} WHERE id=?1",
+        precondition.kind.table()
+    );
+    let actual: Option<i64> = transaction
+        .query_row(&sql, [&precondition.id], |row| row.get(0))
+        .optional()?;
+    if actual == Some(precondition.expected_revision) {
+        Ok(())
+    } else {
+        Err(PersistenceError::StateConflict(precondition.id.clone()))
     }
 }
 

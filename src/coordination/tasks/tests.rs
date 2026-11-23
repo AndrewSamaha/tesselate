@@ -37,33 +37,126 @@ impl ReviewCompletionGate for Reviews {
         Ok(Vec::new())
     }
 }
-struct Human;
+#[derive(Default)]
+struct Human(std::sync::Mutex<Vec<TransitionContext>>);
 impl HumanTransitionGate for Human {
-    fn ensure_allowed(
-        &self,
-        _: &SessionContext,
-        _: Option<TaskId>,
-        _: Option<TaskStatus>,
-        _: Option<TaskStatus>,
-    ) -> CoreResult<()> {
+    fn ensure_allowed(&self, _: &SessionContext, transition: TransitionContext) -> CoreResult<()> {
+        self.0.lock().unwrap().push(transition);
         Ok(())
     }
 }
 struct Leases;
 impl AssignmentLeaseStatus for Leases {
-    fn is_expired(&self, _: TaskId, _: ActorId) -> CoreResult<bool> {
-        Ok(false)
+    fn expired_lease_fence(&self, _: TaskId, _: ActorId) -> CoreResult<LeaseFence> {
+        Err(CoreError::Recoverable("lease is active".into()))
+    }
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LeaseState {
+    task_id: TaskId,
+    owner_id: ActorId,
+    expired: bool,
+}
+struct DatabaseLeases {
+    db: Database,
+    entity_id: String,
+}
+impl AssignmentLeaseStatus for DatabaseLeases {
+    fn expired_lease_fence(&self, task_id: TaskId, owner: ActorId) -> CoreResult<LeaseFence> {
+        let (lease, revision) = self
+            .db
+            .load::<LeaseState>(EntityKind::Session, &self.entity_id)
+            .map_err(|error| CoreError::Internal(error.to_string()))?
+            .ok_or(CoreError::NotFound)?;
+        if lease.task_id != task_id || lease.owner_id != owner || !lease.expired {
+            return Err(CoreError::Recoverable(
+                "lease is active or no longer belongs to this task".into(),
+            ));
+        }
+        Ok(LeaseFence {
+            task_id,
+            owner_id: owner,
+            condition: StatePrecondition {
+                kind: EntityKind::Session,
+                id: self.entity_id.clone(),
+                expected_revision: revision,
+            },
+        })
+    }
+}
+struct RenewOnAssignment {
+    db: Database,
+    lease_id: String,
+    project_id: ProjectId,
+    run_id: RunId,
+    task_id: TaskId,
+}
+impl HumanTransitionGate for RenewOnAssignment {
+    fn ensure_allowed(
+        &self,
+        ctx: &SessionContext,
+        transition: TransitionContext,
+    ) -> CoreResult<()> {
+        if transition.identity == TransitionIdentity::TaskAssignment
+            && matches!(
+                transition.from,
+                Some(LifecycleState::Task(
+                    TaskStatus::Assigned | TaskStatus::Coding
+                ))
+            )
+        {
+            let (mut lease, revision) = self
+                .db
+                .load::<LeaseState>(EntityKind::Session, &self.lease_id)
+                .map_err(|error| CoreError::Internal(error.to_string()))?
+                .ok_or(CoreError::NotFound)?;
+            lease.expired = false;
+            let change = StateChange::update(
+                EntityKind::Session,
+                self.lease_id.clone(),
+                EntityScope::default(),
+                revision,
+                &lease,
+            )
+            .map_err(|error| CoreError::Internal(error.to_string()))?;
+            self.db
+                .commit_mutation(MutationInput {
+                    context: ctx,
+                    operation: "test.lease_renew",
+                    idempotency_key: &IdempotencyKey("renew-during-reassign".into()),
+                    request: &lease,
+                    preconditions: Vec::new(),
+                    result: &lease,
+                    changes: vec![change],
+                    event: NewEvent::from_context(
+                        ctx,
+                        "supervisor",
+                        EventScope {
+                            project_id: Some(self.project_id),
+                            run_id: Some(self.run_id),
+                            task_id: Some(self.task_id),
+                        },
+                        "lease.renewed",
+                        serde_json::json!({}),
+                    ),
+                })
+                .map_err(|error| CoreError::Internal(error.to_string()))?;
+        }
+        Ok(())
     }
 }
 fn context(role: Role) -> SessionContext {
     SessionContext::validated(SessionId::new(), ActorId::new(), role)
 }
 fn engine(db: Database) -> TaskEngine {
+    engine_with_human(db, Arc::new(Human::default()))
+}
+fn engine_with_human(db: Database, human: Arc<dyn HumanTransitionGate>) -> TaskEngine {
     TaskEngine::new(
         db,
         Arc::new(Policy),
         Arc::new(Reviews),
-        Arc::new(Human),
+        human,
         Arc::new(Leases),
     )
 }
@@ -84,6 +177,7 @@ fn seed_project(db: &Database, ctx: &SessionContext) -> ProjectId {
         operation: "test.project",
         idempotency_key: &IdempotencyKey(Uuid::new_v4().to_string()),
         request: &project,
+        preconditions: Vec::new(),
         result: &project,
         changes: vec![change],
         event: NewEvent::from_context(
@@ -120,6 +214,7 @@ fn seed_coder(db: &Database, ctx: &SessionContext) -> Actor {
         operation: "test.actor",
         idempotency_key: &IdempotencyKey(Uuid::new_v4().to_string()),
         request: &coder,
+        preconditions: Vec::new(),
         result: &coder,
         changes: vec![change],
         event: NewEvent::from_context(
@@ -443,6 +538,265 @@ fn concurrency_and_retry_limits_are_enforced() {
         .unwrap()
         .remaining_task_ids
         .contains(&fourth.id));
+}
+
+#[test]
+fn renewal_between_expiry_read_and_reassignment_commit_is_fenced() {
+    let temp = TempDb::new();
+    let db = Database::open(&temp.0).unwrap();
+    let supervisor = context(Role::Supervisor);
+    let project = seed_project(&db, &supervisor);
+    let base_engine = engine(db.clone());
+    let run = base_engine
+        .create_run(
+            &supervisor,
+            CreateRun {
+                project_id: project,
+                goal: "lease race".into(),
+            },
+            IdempotencyKey("run".into()),
+        )
+        .unwrap()
+        .value;
+    let first_coder = seed_coder(&db, &supervisor);
+    let second_coder = seed_coder(&db, &supervisor);
+    let task = base_engine
+        .create_task(
+            &supervisor,
+            CreateTask {
+                run_id: run.id,
+                title: "task".into(),
+                goal: "keep current owner".into(),
+            },
+            IdempotencyKey("task".into()),
+        )
+        .unwrap()
+        .value;
+    base_engine
+        .assign_task(
+            &supervisor,
+            AssignTask {
+                task_id: task.id,
+                assignee: first_coder.id,
+            },
+            IdempotencyKey("assign-first".into()),
+        )
+        .unwrap();
+
+    let lease_id = SessionId::new().0.to_string();
+    let lease = LeaseState {
+        task_id: task.id,
+        owner_id: first_coder.id,
+        expired: true,
+    };
+    let lease_change = StateChange::insert(
+        EntityKind::Session,
+        lease_id.clone(),
+        EntityScope::default(),
+        &lease,
+    )
+    .unwrap();
+    db.commit_mutation(MutationInput {
+        context: &supervisor,
+        operation: "test.lease",
+        idempotency_key: &IdempotencyKey("lease".into()),
+        request: &lease,
+        preconditions: Vec::new(),
+        result: &lease,
+        changes: vec![lease_change],
+        event: NewEvent::from_context(
+            &supervisor,
+            "supervisor",
+            EventScope {
+                project_id: Some(project),
+                run_id: Some(run.id),
+                task_id: Some(task.id),
+            },
+            "lease.expired",
+            serde_json::json!({}),
+        ),
+    })
+    .unwrap();
+
+    let racing_engine = TaskEngine::new(
+        db.clone(),
+        Arc::new(Policy),
+        Arc::new(Reviews),
+        Arc::new(RenewOnAssignment {
+            db: db.clone(),
+            lease_id: lease_id.clone(),
+            project_id: project,
+            run_id: run.id,
+            task_id: task.id,
+        }),
+        Arc::new(DatabaseLeases {
+            db: db.clone(),
+            entity_id: lease_id.clone(),
+        }),
+    );
+    let result = racing_engine.assign_task(
+        &supervisor,
+        AssignTask {
+            task_id: task.id,
+            assignee: second_coder.id,
+        },
+        IdempotencyKey("reassign".into()),
+    );
+    assert!(matches!(result, Err(CoreError::Recoverable(_))));
+    let current = db
+        .load::<TaskRecord>(EntityKind::Task, &task.id.0.to_string())
+        .unwrap()
+        .unwrap()
+        .0;
+    assert_eq!(current.task.status, TaskStatus::Assigned);
+    assert_eq!(current.task.owner, Some(first_coder.id));
+    assert!(
+        !db.load::<LeaseState>(EntityKind::Session, &lease_id)
+            .unwrap()
+            .unwrap()
+            .0
+            .expired
+    );
+}
+
+#[test]
+fn available_work_allows_supervisors_and_persists_expired_run_stop() {
+    let temp = TempDb::new();
+    let db = Database::open(&temp.0).unwrap();
+    let supervisor = context(Role::Supervisor);
+    let project = seed_project(&db, &supervisor);
+    let engine = engine(db.clone());
+    let run = engine
+        .create_run(
+            &supervisor,
+            CreateRun {
+                project_id: project,
+                goal: "expires".into(),
+            },
+            IdempotencyKey("run".into()),
+        )
+        .unwrap()
+        .value;
+    let task = engine
+        .create_task(
+            &supervisor,
+            CreateTask {
+                run_id: run.id,
+                title: "ready".into(),
+                goal: "ready".into(),
+            },
+            IdempotencyKey("task".into()),
+        )
+        .unwrap()
+        .value;
+    assert_eq!(
+        engine
+            .available_work(
+                &supervisor,
+                project,
+                PageRequest {
+                    limit: 50,
+                    after: None
+                }
+            )
+            .unwrap()
+            .items,
+        vec![task.clone()]
+    );
+
+    let (mut expired, revision) = db
+        .load::<Run>(EntityKind::Run, &run.id.0.to_string())
+        .unwrap()
+        .unwrap();
+    expired.started_at = Utc::now() - ChronoDuration::hours(25);
+    let change = StateChange::update(
+        EntityKind::Run,
+        run.id.0.to_string(),
+        scope_for_run(&expired),
+        revision,
+        &expired,
+    )
+    .unwrap();
+    db.commit_mutation(MutationInput {
+        context: &supervisor,
+        operation: "test.expire_run",
+        idempotency_key: &IdempotencyKey("expire".into()),
+        request: &expired,
+        preconditions: Vec::new(),
+        result: &expired,
+        changes: vec![change],
+        event: NewEvent::from_context(
+            &supervisor,
+            "supervisor",
+            EventScope {
+                project_id: Some(project),
+                run_id: Some(run.id),
+                task_id: None,
+            },
+            "run.aged",
+            serde_json::json!({}),
+        ),
+    })
+    .unwrap();
+    let work = engine
+        .available_work(
+            &supervisor,
+            project,
+            PageRequest {
+                limit: 50,
+                after: None,
+            },
+        )
+        .unwrap();
+    assert!(work.items.is_empty());
+    let stopped = db
+        .load::<Run>(EntityKind::Run, &run.id.0.to_string())
+        .unwrap()
+        .unwrap()
+        .0;
+    assert_eq!(stopped.status, RunStatus::Stopped);
+    let outcome = stopped.outcome.unwrap();
+    assert!(outcome.reason.contains("duration"));
+    assert_eq!(outcome.remaining_task_ids, vec![task.id]);
+}
+
+#[test]
+fn human_gate_receives_specific_run_completion_context() {
+    let temp = TempDb::new();
+    let db = Database::open(&temp.0).unwrap();
+    let supervisor = context(Role::Supervisor);
+    let project = seed_project(&db, &supervisor);
+    let human = Arc::new(Human::default());
+    let engine = engine_with_human(db, human.clone());
+    let run = engine
+        .create_run(
+            &supervisor,
+            CreateRun {
+                project_id: project,
+                goal: "complete".into(),
+            },
+            IdempotencyKey("run".into()),
+        )
+        .unwrap()
+        .value;
+    engine
+        .complete_run(
+            &supervisor,
+            CompleteRun {
+                run_id: run.id,
+                outstanding_integration_steps: vec![],
+            },
+            IdempotencyKey("complete".into()),
+        )
+        .unwrap();
+    assert!(human.0.lock().unwrap().contains(&TransitionContext {
+        project_id: project,
+        run_id: run.id,
+        task_id: None,
+        from: Some(LifecycleState::Run(RunStatus::Active)),
+        to: Some(LifecycleState::Run(RunStatus::Completed)),
+        identity: TransitionIdentity::RunCompletion,
+    }));
 }
 
 #[test]
