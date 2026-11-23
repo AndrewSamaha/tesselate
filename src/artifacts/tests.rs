@@ -449,6 +449,71 @@ fn export_refuses_a_symlinked_run_directory() {
     assert!(fs::read_dir(outside).unwrap().next().is_none());
 }
 
+#[test]
+fn failed_atomic_replacement_restores_the_previous_artifact() {
+    let temp = TempDir::new();
+    let destination = temp.0.join("timeline.v1.md");
+    fs::write(&destination, "old artifact").unwrap();
+    let mut rename_calls = 0;
+    let result = write_atomic_with(
+        &destination,
+        b"new artifact",
+        &mut |from: &Path, to: &Path| {
+            if from
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().ends_with(".tmp"))
+            {
+                rename_calls += 1;
+                return Err(io::Error::new(
+                    if rename_calls == 1 {
+                        io::ErrorKind::AlreadyExists
+                    } else {
+                        io::ErrorKind::PermissionDenied
+                    },
+                    "injected replacement failure",
+                ));
+            }
+            fs::rename(from, to)
+        },
+        |parent| sync_parent_directory(parent),
+    );
+    assert!(result.is_err());
+    assert_eq!(fs::read_to_string(destination).unwrap(), "old artifact");
+}
+
+#[test]
+fn directory_sync_failure_restores_the_previous_artifact() {
+    let temp = TempDir::new();
+    let destination = temp.0.join("timeline.v1.md");
+    fs::write(&destination, "old artifact").unwrap();
+    let mut sync_calls = 0;
+    let result = write_atomic_with(
+        &destination,
+        b"new artifact",
+        |from, to| fs::rename(from, to),
+        |_| {
+            sync_calls += 1;
+            if sync_calls == 1 {
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "injected directory sync failure",
+                ))
+            } else {
+                Ok(())
+            }
+        },
+    );
+    assert!(result.is_err());
+    assert_eq!(fs::read_to_string(destination).unwrap(), "old artifact");
+}
+
+#[cfg(unix)]
+#[test]
+fn syncing_the_parent_directory_works_on_the_supported_unix_host() {
+    let temp = TempDir::new();
+    sync_parent_directory(&temp.0).unwrap();
+}
+
 fn fixture_event(run_id: RunId, sequence: u64, event_type: &str, payload: Value) -> Event {
     Event {
         schema_version: 1,

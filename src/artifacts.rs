@@ -6,9 +6,11 @@ use crate::{
 };
 use serde::Serialize;
 use serde_json::{Map, Value};
+#[cfg(unix)]
+use std::fs::File;
 use std::{
     collections::HashSet,
-    fs::{self, File, OpenOptions},
+    fs::{self, OpenOptions},
     io::{self, Write},
     path::{Path, PathBuf},
 };
@@ -715,6 +717,20 @@ fn is_plain_directory(path: &Path) -> Result<bool, ArtifactError> {
 }
 
 fn write_atomic(destination: &Path, contents: &[u8]) -> Result<(), io::Error> {
+    write_atomic_with(
+        destination,
+        contents,
+        |from, to| fs::rename(from, to),
+        |parent| sync_parent_directory(parent),
+    )
+}
+
+fn write_atomic_with(
+    destination: &Path,
+    contents: &[u8],
+    mut rename: impl FnMut(&Path, &Path) -> Result<(), io::Error>,
+    mut sync_directory: impl FnMut(&Path) -> Result<(), io::Error>,
+) -> Result<(), io::Error> {
     let parent = destination.parent().ok_or_else(|| {
         io::Error::new(io::ErrorKind::InvalidInput, "artifact path has no parent")
     })?;
@@ -727,22 +743,98 @@ fn write_atomic(destination: &Path, contents: &[u8]) -> Result<(), io::Error> {
         file.write_all(contents)?;
         file.sync_all()?;
         drop(file);
-        match fs::rename(&temporary, destination) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists && destination.exists() => {
-                fs::remove_file(destination)?;
-                fs::rename(&temporary, destination).map_err(|_| error)
-            }
-            Err(error) => Err(error),
-        }
+        replace_file(
+            &temporary,
+            destination,
+            parent,
+            &mut rename,
+            &mut sync_directory,
+        )
     })();
     if result.is_err() {
         let _ = fs::remove_file(&temporary);
     }
-    if result.is_ok() {
-        File::open(parent)?.sync_all()?;
-    }
     result
+}
+
+fn replace_file(
+    temporary: &Path,
+    destination: &Path,
+    parent: &Path,
+    rename: &mut impl FnMut(&Path, &Path) -> Result<(), io::Error>,
+    sync_directory: &mut impl FnMut(&Path) -> Result<(), io::Error>,
+) -> Result<(), io::Error> {
+    let backup = parent.join(format!(".artifact-{}.bak", Uuid::new_v4()));
+    let had_previous = match fs::symlink_metadata(destination) {
+        Ok(_) => {
+            fs::hard_link(destination, &backup)?;
+            true
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error),
+    };
+
+    let replaced = match rename(temporary, destination) {
+        Ok(()) => Ok(()),
+        Err(error) if had_previous && error.kind() == io::ErrorKind::AlreadyExists => {
+            match fs::remove_file(destination) {
+                Ok(()) => match rename(temporary, destination) {
+                    Ok(()) => Ok(()),
+                    Err(replacement_error) => {
+                        restore_backup(destination, &backup)?;
+                        Err(replacement_error)
+                    }
+                },
+                Err(remove_error) => Err(remove_error),
+            }
+        }
+        Err(error) => Err(error),
+    };
+
+    if let Err(error) = replaced {
+        if had_previous && fs::symlink_metadata(destination).is_err() {
+            restore_backup(destination, &backup)?;
+        } else if had_previous {
+            let _ = fs::remove_file(&backup);
+        }
+        return Err(error);
+    }
+
+    if let Err(error) = sync_directory(parent) {
+        if had_previous {
+            restore_backup(destination, &backup)?;
+        } else {
+            let _ = fs::remove_file(destination);
+        }
+        let _ = sync_directory(parent);
+        return Err(error);
+    }
+
+    if had_previous {
+        // The replacement is already durable; failure here can only leave a hidden backup after
+        // a crash, not invalidate the artifact at its public path.
+        let _ = fs::remove_file(&backup);
+        let _ = sync_directory(parent);
+    }
+    Ok(())
+}
+
+fn restore_backup(destination: &Path, backup: &Path) -> Result<(), io::Error> {
+    if fs::symlink_metadata(destination).is_ok() {
+        fs::remove_file(destination)?;
+    }
+    fs::rename(backup, destination)
+}
+
+#[cfg(unix)]
+fn sync_parent_directory(parent: &Path) -> Result<(), io::Error> {
+    File::open(parent)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_parent_directory(_parent: &Path) -> Result<(), io::Error> {
+    // The MVP coordinator uses a Unix-domain socket; non-Unix directory durability is not promised.
+    Ok(())
 }
 
 #[cfg(test)]
