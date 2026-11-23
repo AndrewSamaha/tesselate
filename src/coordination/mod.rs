@@ -161,7 +161,13 @@ pub trait Coordination: Send + Sync {
         &self,
         ctx: &SessionContext,
         request: InspectWorkspace,
-    ) -> CoreResult<Workspace>;
+    ) -> CoreResult<WorkspaceInspection>;
+    fn capture_commit_refs(
+        &self,
+        ctx: &SessionContext,
+        request: CaptureWorkspaceCommits,
+        key: IdempotencyKey,
+    ) -> CoreResult<Mutation<Vec<CommitRef>>>;
     fn cleanup_workspace(
         &self,
         ctx: &SessionContext,

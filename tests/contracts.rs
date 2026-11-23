@@ -36,6 +36,7 @@ fn mcp_request_response_shapes_are_versioned() {
     assert!(mcp::TOOLS.contains(&"tesselate.v1.reviews.rounds.list"));
     assert!(mcp::TOOLS.contains(&"tesselate.v1.tasks.disposition"));
     assert!(mcp::TOOLS.contains(&"tesselate.v1.artifacts.locate"));
+    assert!(mcp::TOOLS.contains(&"tesselate.v1.workspaces.commits.capture"));
     let request = mcp::MutationRequest {
         schema_version: mcp::PROTOCOL_VERSION,
         request_id: "r1".into(),
@@ -80,6 +81,42 @@ fn mcp_request_response_shapes_are_versioned() {
     assert_eq!(
         serde_json::to_value(success).unwrap()["outcome"]["status"],
         "success"
+    );
+}
+
+#[test]
+fn workspace_inspection_and_commit_capture_shapes_are_stable() {
+    let workspace = Workspace {
+        id: WorkspaceId::new(),
+        assignment_id: "assignment-1".into(),
+        task_id: TaskId::new(),
+        repository_id: RepositoryId::new(),
+        base_commit: "base-sha".into(),
+        branch: "tesselate/a/r".into(),
+        path: "/tmp/worktree".into(),
+        owner: ActorId::new(),
+    };
+    let inspection = WorkspaceInspection {
+        head: CommitRef {
+            repository_id: workspace.repository_id,
+            commit_id: "head-sha".into(),
+        },
+        clean: false,
+        changed_paths: vec!["src/main.rs".into()],
+        workspace: workspace.clone(),
+    };
+    let value = serde_json::to_value(inspection).unwrap();
+    assert_eq!(value["workspace"]["assignment_id"], "assignment-1");
+    assert_eq!(value["head"]["commit_id"], "head-sha");
+    assert_eq!(value["clean"], false);
+    assert_eq!(value["changed_paths"][0], "src/main.rs");
+    let capture = CaptureWorkspaceCommits {
+        workspace_id: workspace.id,
+        expected_head: "head-sha".into(),
+    };
+    assert_eq!(
+        serde_json::to_value(capture).unwrap(),
+        json!({"workspace_id":workspace.id,"expected_head":"head-sha"})
     );
 }
 

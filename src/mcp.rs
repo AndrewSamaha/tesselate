@@ -31,6 +31,7 @@ pub const TOOLS: &[&str] = &[
     "tesselate.v1.human.list",
     "tesselate.v1.human.resolve",
     "tesselate.v1.workspaces.inspect",
+    "tesselate.v1.workspaces.commits.capture",
     "tesselate.v1.workspaces.cleanup",
     "tesselate.v1.timeline.read",
     "tesselate.v1.artifacts.locate",
