@@ -135,6 +135,7 @@ min_independent_reviewers = 2
 
 [human]
 completion_approval = false
+high_severity_deferral_approval = false
 ```
 
 ## 9. State and artifacts

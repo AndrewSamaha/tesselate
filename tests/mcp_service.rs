@@ -9,6 +9,8 @@ use std::{
     time::{Duration, Instant},
 };
 use tesselate::{
+    cli::prepare_state_dir,
+    coordination::application::Application,
     coordination::human::{HumanCoordinator, ProjectHumanGatePolicy},
     coordination::sessions::SessionManager,
     coordination::tasks::{AssignmentRecord, AssignmentStatus, TaskRecord},
@@ -291,6 +293,15 @@ struct StdioClient {
     input: ChildStdin,
     output: BufReader<ChildStdout>,
 }
+
+struct CoordinatorProcess(Child);
+impl Drop for CoordinatorProcess {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 impl StdioClient {
     fn start(socket: &str, bearer: &str) -> Self {
         let mut child = Command::new(env!("CARGO_BIN_EXE_tesselate-mcp"))
@@ -830,4 +841,452 @@ async fn stdio_tool_schema_lists_every_versioned_tool() {
     );
     server.abort();
     let _ = server.await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_startup_composes_application_for_shared_mcp_clients() {
+    let temp = TempDir::new();
+    let state_dir = prepare_state_dir(&temp.path().join("state")).unwrap();
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    for args in [
+        vec!["init", "--quiet"],
+        vec!["config", "user.email", "test@example.invalid"],
+        vec!["config", "user.name", "Test"],
+    ] {
+        assert!(Command::new("git")
+            .args(args)
+            .current_dir(&repo)
+            .status()
+            .unwrap()
+            .success());
+    }
+    fs::write(repo.join("README.md"), "initial\n").unwrap();
+    assert!(Command::new("git")
+        .args(["add", "README.md"])
+        .current_dir(&repo)
+        .status()
+        .unwrap()
+        .success());
+    assert!(Command::new("git")
+        .args(["commit", "--quiet", "-m", "initial"])
+        .current_dir(&repo)
+        .status()
+        .unwrap()
+        .success());
+
+    let config_path = temp.path().join("project.toml");
+    fs::write(
+        &config_path,
+        format!(
+            "name = \"mcp-cli-project\"\nartifact_dir = \"artifacts\"\n[[repositories]]\nid = \"main\"\npath = {:?}\n[workflow]\nmax_duration_hours = 24\nmax_concurrent_assignments = 2\nmax_task_retries = 2\nmax_review_rounds = 3\n[review]\nmin_independent_reviewers = 2\n[human]\ncompletion_approval = true\n",
+            repo.to_string_lossy()
+        ),
+    )
+    .unwrap();
+
+    let db = Database::open(state_dir.join("coordinator.sqlite3")).unwrap();
+    let app = Application::new(db, state_dir.join("worktrees")).unwrap();
+    let supervisor = app
+        .bootstrap_supervisor(
+            &app.prepare_bootstrap().unwrap(),
+            "supervisor",
+            IdempotencyKey("bootstrap-cli-mcp".into()),
+        )
+        .unwrap();
+    let supervisor_token = supervisor.secret.unwrap();
+    let supervisor_ctx = app.authenticate(&supervisor_token).unwrap();
+    let supervisor_file = temp.path().join("supervisor.token");
+    fs::write(&supervisor_file, &supervisor_token).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&supervisor_file, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let registered_output = Command::new(env!("CARGO_BIN_EXE_tesselate"))
+        .args([
+            "--state-dir",
+            state_dir.to_str().unwrap(),
+            "--credential-file",
+            supervisor_file.to_str().unwrap(),
+            "project",
+            "register",
+            "--config",
+            config_path.to_str().unwrap(),
+            "--idempotency-key",
+            "register-cli-mcp",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        registered_output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&registered_output.stderr)
+    );
+    assert!(registered_output.stderr.is_empty());
+    let registered: Value = serde_json::from_slice(&registered_output.stdout).unwrap();
+    let project: Project = serde_json::from_value(registered["value"].clone()).unwrap();
+    let coder = app
+        .issue_agent(
+            &supervisor_ctx,
+            "coder",
+            AgentRole::Coder,
+            IdempotencyKey("issue-coder-cli-mcp".into()),
+        )
+        .unwrap();
+    let coder_token = coder.secret.unwrap();
+
+    let server = CoordinatorProcess(
+        Command::new(env!("CARGO_BIN_EXE_tesselate"))
+            .args(["--state-dir", state_dir.to_str().unwrap(), "serve"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    assert_ready(&state_dir).await;
+    let socket = state_dir.join("coordinator.sock");
+    let socket = socket.to_string_lossy().into_owned();
+    let mut supervisor_client = StdioClient::start(&socket, &supervisor_token);
+    let mut coder_client = StdioClient::start(&socket, &coder_token);
+
+    let created = supervisor_client.tool(
+        "tesselate.v1.runs.create",
+        args(
+            json!({"project_id":project.id,"goal":"one shared coordinator"}),
+            Some("run-shared"),
+            "create-shared-run",
+        ),
+        2,
+    );
+    assert_eq!(
+        created["result"]["structuredContent"]["outcome"]["status"],
+        "success"
+    );
+    let run: Run = serde_json::from_value(
+        created["result"]["structuredContent"]["outcome"]["data"]["value"].clone(),
+    )
+    .unwrap();
+    let task_result = supervisor_client.tool(
+        "tesselate.v1.tasks.create",
+        args(
+            json!({"run_id":run.id,"title":"shared task","goal":"prove visibility"}),
+            Some("task-shared"),
+            "create-shared-task",
+        ),
+        3,
+    );
+    assert_eq!(
+        task_result["result"]["structuredContent"]["outcome"]["status"],
+        "success"
+    );
+    let task: Task = serde_json::from_value(
+        task_result["result"]["structuredContent"]["outcome"]["data"]["value"].clone(),
+    )
+    .unwrap();
+    let assigned = supervisor_client.tool(
+        "tesselate.v1.tasks.assign",
+        args(
+            json!({"task_id":task.id,"assignee":coder.actor_id}),
+            Some("assign-shared"),
+            "assign-shared-task",
+        ),
+        4,
+    );
+    assert_eq!(
+        assigned["result"]["structuredContent"]["outcome"]["status"],
+        "success"
+    );
+    let claimed = coder_client.tool(
+        "tesselate.v1.tasks.claim",
+        args(
+            json!({"task_id":task.id}),
+            Some("claim-shared"),
+            "claim-shared-task",
+        ),
+        2,
+    );
+    assert_eq!(
+        claimed["result"]["structuredContent"]["outcome"]["status"],
+        "success"
+    );
+    let repository = app
+        .list_repositories(
+            &supervisor_ctx,
+            project.id,
+            PageRequest {
+                limit: 10,
+                after: None,
+            },
+        )
+        .unwrap()
+        .items
+        .remove(0);
+    let base_commit = Command::new("git")
+        .args(["-C", &repository.canonical_path, "rev-parse", "HEAD"])
+        .output()
+        .unwrap();
+    assert!(base_commit.status.success());
+    let base_commit = String::from_utf8(base_commit.stdout).unwrap();
+    let workspace_result = coder_client.tool(
+        "tesselate.v1.workspaces.request",
+        args(
+            json!({"task_id":task.id,"repository_id":repository.id,"base_commit":base_commit.trim()}),
+            Some("workspace-shared"),
+            "request-shared-workspace",
+        ),
+        4,
+    );
+    assert_eq!(
+        workspace_result["result"]["structuredContent"]["outcome"]["status"],
+        "success"
+    );
+    let workspace: Workspace = serde_json::from_value(
+        workspace_result["result"]["structuredContent"]["outcome"]["data"]["value"].clone(),
+    )
+    .unwrap();
+    let workspace_inspected = Command::new(env!("CARGO_BIN_EXE_tesselate"))
+        .args([
+            "--state-dir",
+            state_dir.to_str().unwrap(),
+            "--credential-file",
+            supervisor_file.to_str().unwrap(),
+            "workspace",
+            "inspect",
+            "--workspace-id",
+            &workspace.id.0.to_string(),
+        ])
+        .output()
+        .unwrap();
+    assert!(workspace_inspected.status.success());
+    assert!(workspace_inspected.stderr.is_empty());
+    let workspace_inspection: WorkspaceInspection =
+        serde_json::from_slice(&workspace_inspected.stdout).unwrap();
+    assert_eq!(workspace_inspection.workspace.id, workspace.id);
+    fs::write(Path::new(&workspace.path).join("dirty.txt"), "dirty\n").unwrap();
+    let dirty_cleanup = Command::new(env!("CARGO_BIN_EXE_tesselate"))
+        .args([
+            "--state-dir",
+            state_dir.to_str().unwrap(),
+            "--credential-file",
+            supervisor_file.to_str().unwrap(),
+            "workspace",
+            "clean",
+            "--workspace-id",
+            &workspace.id.0.to_string(),
+            "--idempotency-key",
+            "cleanup-dirty",
+        ])
+        .output()
+        .unwrap();
+    assert!(!dirty_cleanup.status.success());
+    assert!(String::from_utf8_lossy(&dirty_cleanup.stderr).contains("uncommitted changes"));
+    assert!(dirty_cleanup.stdout.is_empty());
+    fs::remove_file(Path::new(&workspace.path).join("dirty.txt")).unwrap();
+    let cleanup = Command::new(env!("CARGO_BIN_EXE_tesselate"))
+        .args([
+            "--state-dir",
+            state_dir.to_str().unwrap(),
+            "--credential-file",
+            supervisor_file.to_str().unwrap(),
+            "workspace",
+            "clean",
+            "--workspace-id",
+            &workspace.id.0.to_string(),
+            "--idempotency-key",
+            "cleanup-clean",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        cleanup.status.success(),
+        "{}",
+        String::from_utf8_lossy(&cleanup.stderr)
+    );
+    assert!(cleanup.stderr.is_empty());
+    let _: Value = serde_json::from_slice(&cleanup.stdout).unwrap();
+
+    let visible = coder_client.tool(
+        "tesselate.v1.tasks.list",
+        args(
+            json!({"run_id":run.id,"page":{"limit":10}}),
+            None,
+            "read-shared-task",
+        ),
+        3,
+    );
+    let tasks = visible["result"]["structuredContent"]["outcome"]["data"]["items"]
+        .as_array()
+        .unwrap();
+    assert_eq!(tasks.len(), 1);
+    assert_eq!(tasks[0]["id"], json!(task.id));
+
+    let inspected = Command::new(env!("CARGO_BIN_EXE_tesselate"))
+        .args([
+            "--state-dir",
+            state_dir.to_str().unwrap(),
+            "--credential-file",
+            supervisor_file.to_str().unwrap(),
+            "inspect",
+            "runs",
+            "--project-id",
+            &project.id.0.to_string(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        inspected.status.success(),
+        "{}",
+        String::from_utf8_lossy(&inspected.stderr)
+    );
+    assert!(inspected.stderr.is_empty());
+    let runs: Value = serde_json::from_slice(&inspected.stdout).unwrap();
+    assert_eq!(runs["items"].as_array().unwrap().len(), 1);
+
+    let gated_run_response = supervisor_client.tool(
+        "tesselate.v1.runs.create",
+        args(
+            json!({"project_id":project.id,"goal":"gated completion"}),
+            Some("run-gated"),
+            "create-gated-run",
+        ),
+        5,
+    );
+    let gated_run: Run = serde_json::from_value(
+        gated_run_response["result"]["structuredContent"]["outcome"]["data"]["value"].clone(),
+    )
+    .unwrap();
+    let complete_params =
+        serde_json::to_string(&json!({"run_id":gated_run.id,"outstanding_integration_steps":[]}))
+            .unwrap();
+    let blocked_completion = Command::new(env!("CARGO_BIN_EXE_tesselate"))
+        .args([
+            "--state-dir",
+            state_dir.to_str().unwrap(),
+            "--credential-file",
+            supervisor_file.to_str().unwrap(),
+            "call",
+            "tesselate.v1.runs.complete",
+            "--params",
+            &complete_params,
+            "--idempotency-key",
+            "complete-gated",
+        ])
+        .output()
+        .unwrap();
+    assert!(!blocked_completion.status.success());
+    assert!(String::from_utf8_lossy(&blocked_completion.stderr).contains("pending"));
+    assert!(blocked_completion.stdout.is_empty());
+
+    let pending_output = Command::new(env!("CARGO_BIN_EXE_tesselate"))
+        .args([
+            "--state-dir",
+            state_dir.to_str().unwrap(),
+            "--credential-file",
+            supervisor_file.to_str().unwrap(),
+            "inspect",
+            "human",
+            "--project-id",
+            &project.id.0.to_string(),
+        ])
+        .output()
+        .unwrap();
+    assert!(pending_output.status.success());
+    assert!(pending_output.stderr.is_empty());
+    let pending: Page<HumanDecision> = serde_json::from_slice(&pending_output.stdout).unwrap();
+    let request = pending
+        .items
+        .iter()
+        .find(|decision| decision.run_id == Some(gated_run.id))
+        .unwrap();
+    let resolution = Command::new(env!("CARGO_BIN_EXE_tesselate"))
+        .args([
+            "--state-dir",
+            state_dir.to_str().unwrap(),
+            "--credential-file",
+            supervisor_file.to_str().unwrap(),
+            "human",
+            "resolve",
+            "--request-id",
+            &request.id.0.to_string(),
+            "--choice",
+            "approve",
+            "--reason",
+            "completion criteria reviewed",
+            "--idempotency-key",
+            "approve-gated",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        resolution.status.success(),
+        "{}",
+        String::from_utf8_lossy(&resolution.stderr)
+    );
+    assert!(resolution.stderr.is_empty());
+    let _: Value = serde_json::from_slice(&resolution.stdout).unwrap();
+
+    let completed = Command::new(env!("CARGO_BIN_EXE_tesselate"))
+        .args([
+            "--state-dir",
+            state_dir.to_str().unwrap(),
+            "--credential-file",
+            supervisor_file.to_str().unwrap(),
+            "call",
+            "tesselate.v1.runs.complete",
+            "--params",
+            &complete_params,
+            "--idempotency-key",
+            "complete-gated",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        completed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&completed.stderr)
+    );
+    assert!(completed.stderr.is_empty());
+    let completed: Value = serde_json::from_slice(&completed.stdout).unwrap();
+    assert_eq!(completed["value"]["status"], "completed");
+
+    let exported = Command::new(env!("CARGO_BIN_EXE_tesselate"))
+        .args([
+            "--state-dir",
+            state_dir.to_str().unwrap(),
+            "--credential-file",
+            supervisor_file.to_str().unwrap(),
+            "artifact",
+            "export",
+            "--run-id",
+            &gated_run.id.0.to_string(),
+        ])
+        .output()
+        .unwrap();
+    assert!(exported.status.success());
+    assert!(exported.stderr.is_empty());
+    let artifacts: Value = serde_json::from_slice(&exported.stdout).unwrap();
+    assert!(artifacts["event_count"].as_u64().unwrap() >= 2);
+    let artifact_refs = supervisor_client.tool(
+        "tesselate.v1.artifacts.locate",
+        args(
+            json!({"run_id":gated_run.id,"page":{"limit":10}}),
+            None,
+            "locate-gated-artifacts",
+        ),
+        6,
+    );
+    assert_eq!(
+        artifact_refs["result"]["structuredContent"]["outcome"]["status"],
+        "success"
+    );
+    assert!(
+        artifact_refs["result"]["structuredContent"]["outcome"]["data"]["items"]
+            .as_array()
+            .is_some_and(|items| !items.is_empty())
+    );
+
+    drop(coder_client);
+    drop(supervisor_client);
+    drop(server);
 }
