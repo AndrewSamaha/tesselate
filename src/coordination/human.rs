@@ -880,6 +880,7 @@ mod tests {
         let (temp, db, coordinator, project, run, supervisor, cli) =
             fixture(Some(HumanGatePolicy {
                 completion_approval: true,
+                high_severity_deferral_approval: false,
             }));
         let completion = transition(&run, TransitionIdentity::RunCompletion);
         assert!(matches!(
@@ -915,6 +916,7 @@ mod tests {
             db.clone(),
             Arc::new(Policy(Some(HumanGatePolicy {
                 completion_approval: true,
+                high_severity_deferral_approval: false,
             }))),
         );
         let page = coordinator
@@ -949,6 +951,7 @@ mod tests {
     fn rejected_completion_gate_reopens_after_corrective_task_change() {
         let (_temp, db, human, project, run, supervisor, cli) = fixture(Some(HumanGatePolicy {
             completion_approval: true,
+            high_severity_deferral_approval: false,
         }));
         let engine = super::super::tasks::TaskEngine::new(
             db.clone(),
@@ -985,6 +988,7 @@ mod tests {
             db.clone(),
             Arc::new(Policy(Some(HumanGatePolicy {
                 completion_approval: true,
+                high_severity_deferral_approval: false,
             }))),
         );
         human

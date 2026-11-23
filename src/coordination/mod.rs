@@ -1,5 +1,6 @@
 //! Transport-independent coordination operations.
 
+pub mod application;
 pub mod human;
 pub mod reviews;
 pub mod sessions;

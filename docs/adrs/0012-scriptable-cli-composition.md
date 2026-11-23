@@ -1,0 +1,7 @@
+# ADR-0012: Scriptable CLI composition and credentials
+
+The executable opens one F02 SQLite database below the owner-only state directory and constructs the feature composition in `coordination::application::Application`. It wires F03's Git manager, F04's task engine, F05's session/message manager, F06's review coordinator, F07's human gates, and F10's exporter. F01's validated project configuration is persisted with each registered project; the same record supplies the workflow, review, human-gate, and artifact policies used by the feature owners.
+
+The CLI is an adapter. It derives `SessionContext` only by authenticating a credential with F05, uses the existing feature operations for policy and authorization, and makes no independent transition decisions. JSON output is the only stdout format; diagnostics go to stderr. Credential issuance returns a newly issued secret once and also stores it in a `0600` file under a `0700` credentials directory on Unix. The bearer verifier remains in F05's durable credential record, and credential directories and files are rejected when they are symlinks or non-regular entries.
+
+F08 owns the concurrent MCP coordinator transport and its injected `Coordination`/`SessionAuthenticator` boundary (ADR-0011). F09 owns constructing `Application` and passing that same durable composition to F08 after F08 is integrated. F09 does not duplicate F08's socket, protocol, or authentication rules. Until that integration, the executable's direct command mode operates on the same durable database and feature services.

@@ -169,6 +169,8 @@ pub struct ReviewPolicy {
 #[serde(deny_unknown_fields)]
 pub struct HumanGatePolicy {
     pub completion_approval: bool,
+    #[serde(default)]
+    pub high_severity_deferral_approval: bool,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RunOutcome {
