@@ -280,6 +280,28 @@ fn revocation_expiry_and_restart_reconnect_are_durable() {
         .revoke(
             &f.supervisor,
             f.reviewer.session_id(),
+            IdempotencyKey("terminal-revoke".into()),
+        )
+        .unwrap();
+    f.manager
+        .revoke(
+            &f.supervisor,
+            f.reviewer.session_id(),
+            IdempotencyKey("terminal-revoke".into()),
+        )
+        .unwrap();
+    assert!(matches!(
+        f.manager.revoke(
+            &f.supervisor,
+            f.coder.session_id(),
+            IdempotencyKey("terminal-revoke".into()),
+        ),
+        Err(CoreError::IdempotencyConflict)
+    ));
+    f.manager
+        .revoke(
+            &f.supervisor,
+            f.reviewer.session_id(),
             IdempotencyKey("revoke-reviewer".into()),
         )
         .unwrap();
@@ -322,6 +344,20 @@ fn revocation_expiry_and_restart_reconnect_are_durable() {
             IdempotencyKey("expire-session".into()),
         )
         .unwrap();
+    short
+        .expire_session(
+            &short_admin,
+            explicitly_expired.session_id,
+            IdempotencyKey("terminal-expire".into()),
+        )
+        .unwrap();
+    short
+        .expire_session(
+            &short_admin,
+            explicitly_expired.session_id,
+            IdempotencyKey("terminal-expire".into()),
+        )
+        .unwrap();
     assert!(matches!(
         short.authenticate(&credential_secret(&explicitly_expired)),
         Err(CoreError::Unauthenticated)
@@ -334,6 +370,14 @@ fn revocation_expiry_and_restart_reconnect_are_durable() {
             IdempotencyKey("short-issue".into()),
         )
         .unwrap();
+    assert!(matches!(
+        short.expire_session(
+            &short_admin,
+            short_coder.session_id,
+            IdempotencyKey("terminal-expire".into()),
+        ),
+        Err(CoreError::IdempotencyConflict)
+    ));
     thread::sleep(StdDuration::from_millis(220));
     assert!(matches!(
         short.authenticate(&credential_secret(&short_coder)),

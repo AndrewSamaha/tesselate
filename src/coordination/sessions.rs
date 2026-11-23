@@ -318,10 +318,10 @@ impl SessionManager {
             return Ok(());
         }
         let (key, mut credential, revision) = self.find_session(session_id)?;
-        if credential.status != CredentialStatus::Active {
-            return Ok(());
+        let changed = credential.status == CredentialStatus::Active;
+        if changed {
+            credential.status = CredentialStatus::Expired;
         }
-        credential.status = CredentialStatus::Expired;
         let mut changes = vec![StateChange::update(
             EntityKind::Credential,
             key,
@@ -330,7 +330,11 @@ impl SessionManager {
             &credential,
         )
         .map_err(storage_error)?];
-        for (id, mut lease, lease_revision) in self.leases_for_session(session_id)? {
+        for (id, mut lease, lease_revision) in if changed {
+            self.leases_for_session(session_id)?
+        } else {
+            vec![]
+        } {
             lease.expires_at = Utc::now();
             lease.generation += 1;
             changes.push(
@@ -346,7 +350,11 @@ impl SessionManager {
         }
         let event = session_event(
             supervisor,
-            "session.expired",
+            if changed {
+                "session.expired"
+            } else {
+                "session.expire_noop"
+            },
             json!({"session_id":session_id}),
         );
         self.commit(
@@ -983,10 +991,10 @@ impl CredentialIssuer for SessionManager {
             return Ok(());
         }
         let (key, mut record, revision) = self.find_session(session)?;
-        if record.status == CredentialStatus::Revoked {
-            return Ok(());
+        let changed = record.status != CredentialStatus::Revoked;
+        if changed {
+            record.status = CredentialStatus::Revoked;
         }
-        record.status = CredentialStatus::Revoked;
         let mut changes = vec![StateChange::update(
             EntityKind::Credential,
             key,
@@ -995,7 +1003,11 @@ impl CredentialIssuer for SessionManager {
             &record,
         )
         .map_err(storage_error)?];
-        for (id, mut lease, lease_revision) in self.leases_for_credential_revocation(session)? {
+        for (id, mut lease, lease_revision) in if changed {
+            self.leases_for_credential_revocation(session)?
+        } else {
+            vec![]
+        } {
             lease.expires_at = Utc::now();
             lease.generation += 1;
             changes.push(
@@ -1011,7 +1023,11 @@ impl CredentialIssuer for SessionManager {
         }
         let event = session_event(
             supervisor,
-            "credential.revoked",
+            if changed {
+                "credential.revoked"
+            } else {
+                "credential.revoke_noop"
+            },
             json!({"session_id":session}),
         );
         self.commit(
