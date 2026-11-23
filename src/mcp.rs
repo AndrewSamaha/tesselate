@@ -14,7 +14,10 @@ pub const TOOLS: &[&str] = &[
     "tesselate.v1.work.available",
     "tesselate.v1.tasks.list",
     "tesselate.v1.tasks.create",
+    "tesselate.v1.tasks.create_with_dependencies",
     "tesselate.v1.tasks.assign",
+    "tesselate.v1.tasks.claim",
+    "tesselate.v1.tasks.release",
     "tesselate.v1.tasks.progress",
     "tesselate.v1.tasks.submit",
     "tesselate.v1.tasks.disposition",
@@ -36,6 +39,9 @@ pub const TOOLS: &[&str] = &[
     "tesselate.v1.timeline.read",
     "tesselate.v1.artifacts.locate",
 ];
+
+mod service;
+pub use service::{serve_coordinator, serve_stdio, McpGateway};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ReadRequest<T> {

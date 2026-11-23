@@ -35,6 +35,9 @@ fn mcp_request_response_shapes_are_versioned() {
     assert!(mcp::TOOLS.contains(&"tesselate.v1.agents.list"));
     assert!(mcp::TOOLS.contains(&"tesselate.v1.reviews.rounds.list"));
     assert!(mcp::TOOLS.contains(&"tesselate.v1.tasks.disposition"));
+    assert!(mcp::TOOLS.contains(&"tesselate.v1.tasks.claim"));
+    assert!(mcp::TOOLS.contains(&"tesselate.v1.tasks.release"));
+    assert!(mcp::TOOLS.contains(&"tesselate.v1.tasks.create_with_dependencies"));
     assert!(mcp::TOOLS.contains(&"tesselate.v1.artifacts.locate"));
     assert!(mcp::TOOLS.contains(&"tesselate.v1.human.request"));
     assert!(mcp::TOOLS.contains(&"tesselate.v1.human.list"));
