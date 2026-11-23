@@ -74,6 +74,38 @@ fn migration_configures_wal_foreign_keys_and_rejects_newer_schema() {
 }
 
 #[test]
+fn version_one_state_database_upgrades_to_lease_and_credential_tables() {
+    let temp = TempDb::new();
+    let connection = Connection::open(&temp.0).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
+        INSERT INTO schema_migrations(version,applied_at) VALUES(1,CURRENT_TIMESTAMP);
+        CREATE TABLE projects(id TEXT PRIMARY KEY);
+        CREATE TABLE actors(id TEXT PRIMARY KEY);
+        CREATE TABLE runs(id TEXT PRIMARY KEY);
+        CREATE TABLE tasks(id TEXT PRIMARY KEY);
+        PRAGMA user_version=1;",
+        )
+        .unwrap();
+    drop(connection);
+    let db = Database::open(&temp.0).unwrap();
+    let version = Connection::open(&temp.0)
+        .unwrap()
+        .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+        .unwrap();
+    assert_eq!(version, 2);
+    assert!(db
+        .load::<Value>(EntityKind::AssignmentLease, "missing")
+        .unwrap()
+        .is_none());
+    assert!(db
+        .load::<Value>(EntityKind::Credential, "missing")
+        .unwrap()
+        .is_none());
+}
+
+#[test]
 fn state_event_and_idempotency_are_atomic_and_replay_stably() {
     let temp = TempDb::new();
     let db = Database::open(&temp.0).unwrap();
