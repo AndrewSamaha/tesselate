@@ -607,18 +607,153 @@ min_independent_reviewers=2
         .map(|r| PathBuf::from(r["path"].as_str().unwrap()))
         .collect();
     let event_bytes = fs::read(&paths[0]).unwrap();
-    let line_count = event_bytes
+    let event_lines: Vec<Value> = event_bytes
         .split(|b| *b == b'\n')
         .filter(|line| !line.is_empty())
-        .count();
-    assert_eq!(line_count as u64, export1["event_count"].as_u64().unwrap());
+        .map(|line| serde_json::from_slice(line).unwrap())
+        .collect();
+    assert_eq!(
+        event_lines.len() as u64,
+        export1["event_count"].as_u64().unwrap()
+    );
     let record_bytes = fs::read(&paths[1]).unwrap();
-    assert!(record_bytes
+    let record_lines: Vec<Value> = record_bytes
         .split(|b| *b == b'\n')
         .filter(|line| !line.is_empty())
-        .all(|line| serde_json::from_slice::<Value>(line).is_ok()));
+        .map(|line| serde_json::from_slice(line).unwrap())
+        .collect();
+    assert_eq!(
+        record_lines.len() as u64,
+        export1["record_count"].as_u64().unwrap()
+    );
+    assert!(event_lines
+        .iter()
+        .all(|line| line["export_schema_version"] == 1));
+    assert!(record_lines
+        .iter()
+        .all(|line| line["export_schema_version"] == 1));
+
+    // Reconstruct the run graph only from the two exported JSONL files; this deliberately
+    // does not query the service, its database, or the in-memory application.
+    let record_values = |kind: &str| -> Vec<&Value> {
+        record_lines
+            .iter()
+            .filter(|line| line["record_type"] == kind)
+            .map(|line| &line["record"])
+            .collect()
+    };
+    let task_records = record_values("task");
+    for (task, commit) in [(&task_a, &ref_a2), (&task_b, &ref_b)] {
+        let record = task_records
+            .iter()
+            .find(|record| record["task"]["id"] == json!(task.id))
+            .expect("export contains the task");
+        assert_eq!(record["task"]["run_id"], json!(run.id));
+        assert!(record["task"]["submitted_commits"]
+            .as_array()
+            .unwrap()
+            .contains(&json!(commit)));
+    }
+    let exported_repositories = record_values("repository");
+    for repository_id in [repo_a_id, repo_b_id] {
+        assert!(exported_repositories
+            .iter()
+            .any(|record| record["id"] == json!(repository_id)));
+    }
+    let assignments = record_values("assignment");
+    assert!(assignments
+        .iter()
+        .any(|record| record["task_id"] == json!(task_a.id)
+            && record["assignee"] == json!(tesselate::ActorId(coder_a_id))));
+    assert!(assignments
+        .iter()
+        .any(|record| record["task_id"] == json!(task_b.id)
+            && record["assignee"] == json!(tesselate::ActorId(coder_b_id))));
+    let exported_messages = record_values("message");
+    assert!(exported_messages
+        .iter()
+        .any(|record| record["task_id"] == json!(task_a.id)
+            && record["body"]
+                .as_str()
+                .is_some_and(|body| body.contains("reviewer-a's finding"))));
+    let exported_commits = record_values("workspace_commit");
+    for commit in [&ref_a, &ref_b, &ref_a2] {
+        assert!(exported_commits
+            .iter()
+            .any(|record| record["commit"] == json!(commit)));
+    }
+    let rounds = record_values("review_round");
+    assert!(rounds
+        .iter()
+        .any(|record| record["task_id"] == json!(task_a.id)
+            && record["round"] == 2
+            && record["previous_finding_ids"] == json!([finding_id])));
+    let reviews = record_values("review");
+    assert!(reviews
+        .iter()
+        .any(|record| record["task_id"] == json!(task_a.id) && record["passed"] == false));
+    assert!(
+        reviews
+            .iter()
+            .filter(|record| record["task_id"] == json!(task_a.id) && record["passed"] == true)
+            .count()
+            >= 3
+    );
+    let findings = record_values("review_finding");
+    assert!(findings
+        .iter()
+        .any(|record| record["finding"]["id"] == json!(finding_id)
+            && record["finding"]["proposed_correction"]
+                .as_str()
+                .is_some_and(|text| text.contains("marker"))));
+    let dispositions = record_values("finding_disposition");
+    assert!(dispositions
+        .iter()
+        .any(
+            |record| record["disposition"]["finding_id"] == json!(finding_id)
+                && record["disposition"]["disposition"] == "fixed"
+        ));
+    let exported_run = record_values("run")
+        .into_iter()
+        .find(|record| record["id"] == json!(run.id))
+        .unwrap();
+    assert_eq!(exported_run["status"], "completed");
+    assert_eq!(
+        exported_run["reviewed_commits"].as_array().unwrap().len(),
+        2
+    );
+    assert!(exported_run["reviewed_commits"]
+        .as_array()
+        .unwrap()
+        .contains(&json!(ref_a2)));
+    assert!(exported_run["reviewed_commits"]
+        .as_array()
+        .unwrap()
+        .contains(&json!(ref_b)));
+    let event_types: Vec<&str> = event_lines
+        .iter()
+        .map(|line| line["event"]["event_type"].as_str().unwrap())
+        .collect();
+    for event_type in [
+        "task.assigned",
+        "message.sent",
+        "task.submitted",
+        "review.round_requested",
+        "review.submitted",
+        "review.findings_dispositioned",
+        "task.disposition",
+        "run.completed",
+    ] {
+        assert!(
+            event_types.contains(&event_type),
+            "export omits {event_type}"
+        );
+    }
     let markdown = fs::read_to_string(&paths[2]).unwrap();
-    assert!(markdown.contains("review") && markdown.contains("run.completed"));
+    assert!(markdown.contains("review.submitted") && markdown.contains("run.completed"));
+    assert!(markdown.contains(&run.id.0.to_string()));
+    assert!(markdown.contains(&task_a.id.0.to_string()));
+    assert!(markdown.contains(&ref_a2.commit_id) && markdown.contains(&ref_b.commit_id));
     let all_artifacts = [
         String::from_utf8_lossy(&event_bytes),
         String::from_utf8_lossy(&record_bytes),
@@ -789,6 +924,8 @@ completion_approval=true
     );
     let stopped: Vec<Run> = value(limit_page["items"].clone());
     let limited = stopped.into_iter().find(|r| r.id == limit_run.id).unwrap();
+    let remaining_task_ids = &limited.outcome.as_ref().unwrap().remaining_task_ids;
+    assert!(remaining_task_ids.contains(&limited_task.id));
     let limit_seen = limited.status == RunStatus::Stopped
         && limited
             .outcome
