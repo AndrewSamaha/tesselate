@@ -765,10 +765,22 @@ fn replace_file(
     sync_directory: &mut impl FnMut(&Path) -> Result<(), io::Error>,
 ) -> Result<(), io::Error> {
     let backup = parent.join(format!(".artifact-{}.bak", Uuid::new_v4()));
+    #[cfg(unix)]
     let had_previous = match fs::symlink_metadata(destination) {
         Ok(_) => {
             fs::hard_link(destination, &backup)?;
             true
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error),
+    };
+    #[cfg(not(unix))]
+    let had_previous = match fs::symlink_metadata(destination) {
+        Ok(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "platform rename cannot atomically replace an existing artifact",
+            ));
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => false,
         Err(error) => return Err(error),
@@ -779,9 +791,7 @@ fn replace_file(
     let replaced = rename(temporary, destination);
 
     if let Err(error) = replaced {
-        if had_previous && fs::symlink_metadata(destination).is_err() {
-            restore_backup(destination, &backup)?;
-        } else if had_previous {
+        if had_previous {
             let _ = fs::remove_file(&backup);
         }
         return Err(error);
@@ -789,7 +799,7 @@ fn replace_file(
 
     if let Err(error) = sync_directory(parent) {
         if had_previous {
-            restore_backup(destination, &backup)?;
+            fs::rename(&backup, destination)?;
         } else {
             let _ = fs::remove_file(destination);
         }
@@ -804,13 +814,6 @@ fn replace_file(
         let _ = sync_directory(parent);
     }
     Ok(())
-}
-
-fn restore_backup(destination: &Path, backup: &Path) -> Result<(), io::Error> {
-    if fs::symlink_metadata(destination).is_ok() {
-        fs::remove_file(destination)?;
-    }
-    fs::rename(backup, destination)
 }
 
 #[cfg(unix)]

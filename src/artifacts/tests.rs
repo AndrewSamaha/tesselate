@@ -450,7 +450,7 @@ fn export_refuses_a_symlinked_run_directory() {
 }
 
 #[test]
-fn failed_atomic_replacement_restores_the_previous_artifact() {
+fn failed_atomic_replacement_preserves_the_previous_artifact() {
     let temp = TempDir::new();
     let destination = temp.0.join("timeline.v1.md");
     fs::write(&destination, "old artifact").unwrap();
