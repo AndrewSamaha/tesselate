@@ -110,6 +110,14 @@ pub struct StateChange {
     pub dependencies: Option<Vec<TaskId>>,
 }
 
+/// Compare-only durable state guard checked inside the mutation transaction.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StatePrecondition {
+    pub kind: EntityKind,
+    pub id: String,
+    pub expected_revision: i64,
+}
+
 impl StateChange {
     pub fn insert<T: Serialize>(
         kind: EntityKind,
@@ -193,6 +201,7 @@ pub struct MutationInput<'a, Q, R> {
     pub operation: &'a str,
     pub idempotency_key: &'a IdempotencyKey,
     pub request: &'a Q,
+    pub preconditions: Vec<StatePrecondition>,
     pub result: &'a R,
     pub changes: Vec<StateChange>,
     pub event: NewEvent,
@@ -215,6 +224,39 @@ impl Database {
         self.connection
             .lock()
             .map_err(|_| PersistenceError::Poisoned)
+    }
+
+    /// Look up a committed result before applying domain validation to a retry.
+    /// `commit_mutation` remains the transactional arbiter when no row exists yet.
+    pub fn prior_mutation<Q, R>(
+        &self,
+        context: &SessionContext,
+        operation: &str,
+        key: &IdempotencyKey,
+        request: &Q,
+    ) -> Result<Option<Mutation<R>>, PersistenceError>
+    where
+        Q: Serialize,
+        R: DeserializeOwned,
+    {
+        let request_json = canonical_json(request)?;
+        let connection = self.connection()?;
+        let stored = connection.query_row(
+            "SELECT request_json,result_json,event_id FROM idempotency_records WHERE session_id=?1 AND operation=?2 AND idempotency_key=?3",
+            params![context.session_id().0.to_string(), operation, key.0],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)),
+        ).optional()?;
+        let Some((prior_request, result_json, event_id)) = stored else {
+            return Ok(None);
+        };
+        if prior_request != request_json {
+            return Err(PersistenceError::IdempotencyConflict);
+        }
+        Ok(Some(Mutation {
+            value: serde_json::from_str(&result_json)?,
+            event_id: parse_event_id(&event_id)?,
+            replayed: true,
+        }))
     }
 
     pub fn commit_mutation<Q, R>(
@@ -252,6 +294,9 @@ impl Database {
             });
         }
 
+        for precondition in &input.preconditions {
+            check_state_precondition(&transaction, precondition)?;
+        }
         for change in &input.changes {
             check_precondition(&transaction, change)?;
         }
@@ -471,6 +516,17 @@ fn validate_mutation<Q, R>(input: &MutationInput<'_, Q, R>) -> Result<(), Persis
             ));
         }
     }
+    let mut guarded = std::collections::HashSet::new();
+    for precondition in &input.preconditions {
+        if precondition.id.is_empty()
+            || precondition.expected_revision < 0
+            || !guarded.insert((precondition.kind, precondition.id.as_str()))
+        {
+            return Err(PersistenceError::Invalid(
+                "state preconditions need unique entity IDs and nonnegative revisions".into(),
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -507,6 +563,24 @@ fn check_precondition(
         (None, None) => Ok(()),
         (Some(expected), Some(actual)) if expected == actual => Ok(()),
         _ => Err(PersistenceError::StateConflict(change.id.clone())),
+    }
+}
+
+fn check_state_precondition(
+    transaction: &Transaction<'_>,
+    precondition: &StatePrecondition,
+) -> Result<(), PersistenceError> {
+    let sql = format!(
+        "SELECT revision FROM {} WHERE id=?1",
+        precondition.kind.table()
+    );
+    let actual: Option<i64> = transaction
+        .query_row(&sql, [&precondition.id], |row| row.get(0))
+        .optional()?;
+    if actual == Some(precondition.expected_revision) {
+        Ok(())
+    } else {
+        Err(PersistenceError::StateConflict(precondition.id.clone()))
     }
 }
 

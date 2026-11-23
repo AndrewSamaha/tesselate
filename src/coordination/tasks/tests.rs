@@ -1,0 +1,819 @@
+use super::*;
+use crate::core::{Actor, SessionId};
+use std::{fs, path::PathBuf};
+
+struct TempDb(PathBuf);
+impl TempDb {
+    fn new() -> Self {
+        let dir = std::env::temp_dir().join(format!("tesselate-f04-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        Self(dir.join("state.sqlite3"))
+    }
+}
+impl Drop for TempDb {
+    fn drop(&mut self) {
+        if let Some(parent) = self.0.parent() {
+            let _ = fs::remove_dir_all(parent);
+        }
+    }
+}
+struct Policy;
+impl ProjectWorkflowPolicy for Policy {
+    fn workflow_limits(&self, _: ProjectId) -> CoreResult<WorkflowLimits> {
+        Ok(WorkflowLimits {
+            max_duration_hours: 24,
+            max_concurrent_assignments: 2,
+            max_task_retries: 2,
+            max_review_rounds: 3,
+        })
+    }
+}
+struct Reviews;
+impl ReviewCompletionGate for Reviews {
+    fn ensure_task_complete(&self, _: TaskId) -> CoreResult<()> {
+        Ok(())
+    }
+    fn reviewed_commits_for_run(&self, _: RunId) -> CoreResult<Vec<String>> {
+        Ok(Vec::new())
+    }
+}
+#[derive(Default)]
+struct Human(std::sync::Mutex<Vec<TransitionContext>>);
+impl HumanTransitionGate for Human {
+    fn ensure_allowed(&self, _: &SessionContext, transition: TransitionContext) -> CoreResult<()> {
+        self.0.lock().unwrap().push(transition);
+        Ok(())
+    }
+}
+struct Leases;
+impl AssignmentLeaseStatus for Leases {
+    fn expired_lease_fence(&self, _: TaskId, _: ActorId) -> CoreResult<LeaseFence> {
+        Err(CoreError::Recoverable("lease is active".into()))
+    }
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LeaseState {
+    task_id: TaskId,
+    owner_id: ActorId,
+    expired: bool,
+}
+struct DatabaseLeases {
+    db: Database,
+    entity_id: String,
+}
+impl AssignmentLeaseStatus for DatabaseLeases {
+    fn expired_lease_fence(&self, task_id: TaskId, owner: ActorId) -> CoreResult<LeaseFence> {
+        let (lease, revision) = self
+            .db
+            .load::<LeaseState>(EntityKind::Session, &self.entity_id)
+            .map_err(|error| CoreError::Internal(error.to_string()))?
+            .ok_or(CoreError::NotFound)?;
+        if lease.task_id != task_id || lease.owner_id != owner || !lease.expired {
+            return Err(CoreError::Recoverable(
+                "lease is active or no longer belongs to this task".into(),
+            ));
+        }
+        Ok(LeaseFence {
+            task_id,
+            owner_id: owner,
+            condition: StatePrecondition {
+                kind: EntityKind::Session,
+                id: self.entity_id.clone(),
+                expected_revision: revision,
+            },
+        })
+    }
+}
+struct RenewOnAssignment {
+    db: Database,
+    lease_id: String,
+    project_id: ProjectId,
+    run_id: RunId,
+    task_id: TaskId,
+}
+impl HumanTransitionGate for RenewOnAssignment {
+    fn ensure_allowed(
+        &self,
+        ctx: &SessionContext,
+        transition: TransitionContext,
+    ) -> CoreResult<()> {
+        if transition.identity == TransitionIdentity::TaskAssignment
+            && matches!(
+                transition.from,
+                Some(LifecycleState::Task(
+                    TaskStatus::Assigned | TaskStatus::Coding
+                ))
+            )
+        {
+            let (mut lease, revision) = self
+                .db
+                .load::<LeaseState>(EntityKind::Session, &self.lease_id)
+                .map_err(|error| CoreError::Internal(error.to_string()))?
+                .ok_or(CoreError::NotFound)?;
+            lease.expired = false;
+            let change = StateChange::update(
+                EntityKind::Session,
+                self.lease_id.clone(),
+                EntityScope::default(),
+                revision,
+                &lease,
+            )
+            .map_err(|error| CoreError::Internal(error.to_string()))?;
+            self.db
+                .commit_mutation(MutationInput {
+                    context: ctx,
+                    operation: "test.lease_renew",
+                    idempotency_key: &IdempotencyKey("renew-during-reassign".into()),
+                    request: &lease,
+                    preconditions: Vec::new(),
+                    result: &lease,
+                    changes: vec![change],
+                    event: NewEvent::from_context(
+                        ctx,
+                        "supervisor",
+                        EventScope {
+                            project_id: Some(self.project_id),
+                            run_id: Some(self.run_id),
+                            task_id: Some(self.task_id),
+                        },
+                        "lease.renewed",
+                        serde_json::json!({}),
+                    ),
+                })
+                .map_err(|error| CoreError::Internal(error.to_string()))?;
+        }
+        Ok(())
+    }
+}
+fn context(role: Role) -> SessionContext {
+    SessionContext::validated(SessionId::new(), ActorId::new(), role)
+}
+fn engine(db: Database) -> TaskEngine {
+    engine_with_human(db, Arc::new(Human::default()))
+}
+fn engine_with_human(db: Database, human: Arc<dyn HumanTransitionGate>) -> TaskEngine {
+    TaskEngine::new(
+        db,
+        Arc::new(Policy),
+        Arc::new(Reviews),
+        human,
+        Arc::new(Leases),
+    )
+}
+fn seed_project(db: &Database, ctx: &SessionContext) -> ProjectId {
+    let project = Project {
+        id: ProjectId::new(),
+        name: "test".into(),
+    };
+    let change = StateChange::insert(
+        EntityKind::Project,
+        project.id.0.to_string(),
+        EntityScope::default(),
+        &project,
+    )
+    .unwrap();
+    db.commit_mutation(MutationInput {
+        context: ctx,
+        operation: "test.project",
+        idempotency_key: &IdempotencyKey(Uuid::new_v4().to_string()),
+        request: &project,
+        preconditions: Vec::new(),
+        result: &project,
+        changes: vec![change],
+        event: NewEvent::from_context(
+            ctx,
+            "test",
+            EventScope {
+                project_id: Some(project.id),
+                run_id: None,
+                task_id: None,
+            },
+            "project.created",
+            serde_json::json!({}),
+        ),
+    })
+    .unwrap();
+    project.id
+}
+
+fn seed_coder(db: &Database, ctx: &SessionContext) -> Actor {
+    let coder = Actor {
+        id: ActorId::new(),
+        display_name: "coder".into(),
+        role: Role::Coder,
+    };
+    let change = StateChange::insert(
+        EntityKind::Actor,
+        coder.id.0.to_string(),
+        EntityScope::default(),
+        &coder,
+    )
+    .unwrap();
+    db.commit_mutation(MutationInput {
+        context: ctx,
+        operation: "test.actor",
+        idempotency_key: &IdempotencyKey(Uuid::new_v4().to_string()),
+        request: &coder,
+        preconditions: Vec::new(),
+        result: &coder,
+        changes: vec![change],
+        event: NewEvent::from_context(
+            ctx,
+            "supervisor",
+            EventScope {
+                project_id: None,
+                run_id: None,
+                task_id: None,
+            },
+            "actor.created",
+            serde_json::json!({}),
+        ),
+    })
+    .unwrap();
+    coder
+}
+
+#[test]
+fn transition_graph_rejects_skipping_submission_and_terminal_reopens() {
+    assert!(transition_allowed(
+        TaskStatus::Coding,
+        TaskStatus::Submitted
+    ));
+    assert!(!transition_allowed(
+        TaskStatus::Coding,
+        TaskStatus::Completed
+    ));
+    assert!(!transition_allowed(
+        TaskStatus::Completed,
+        TaskStatus::Ready
+    ));
+}
+
+#[test]
+fn create_run_replays_and_dependency_unblocks_atomically() {
+    let temp = TempDb::new();
+    let db = Database::open(&temp.0).unwrap();
+    let ctx = context(Role::Supervisor);
+    let project = seed_project(&db, &ctx);
+    let engine = engine(db.clone());
+    let run_request = CreateRun {
+        project_id: project,
+        goal: "ship feature".into(),
+    };
+    let run_key = IdempotencyKey("create-run".into());
+    let first = engine
+        .create_run(&ctx, run_request.clone(), run_key.clone())
+        .unwrap();
+    let replay = engine.create_run(&ctx, run_request, run_key).unwrap();
+    assert!(!first.replayed && replay.replayed);
+    assert_eq!(first.event_id, replay.event_id);
+
+    let prerequisite = engine
+        .create_task(
+            &ctx,
+            CreateTask {
+                run_id: first.value.id,
+                title: "first".into(),
+                goal: "do first".into(),
+            },
+            IdempotencyKey("task-one".into()),
+        )
+        .unwrap()
+        .value;
+    let dependent = engine
+        .create_task_with_dependencies(
+            &ctx,
+            CreateTaskWithDependencies {
+                run_id: first.value.id,
+                title: "second".into(),
+                goal: "do second".into(),
+                dependencies: vec![prerequisite.id],
+            },
+            IdempotencyKey("task-two".into()),
+        )
+        .unwrap()
+        .value;
+    assert_eq!(dependent.status, TaskStatus::Blocked);
+
+    let coder = seed_coder(&db, &ctx);
+    let coder_ctx = SessionContext::validated(SessionId::new(), coder.id, Role::Coder);
+    engine
+        .assign_task(
+            &ctx,
+            AssignTask {
+                task_id: prerequisite.id,
+                assignee: coder.id,
+            },
+            IdempotencyKey("assign".into()),
+        )
+        .unwrap();
+    engine
+        .claim_task(
+            &coder_ctx,
+            ClaimTask {
+                task_id: prerequisite.id,
+            },
+            IdempotencyKey("claim".into()),
+        )
+        .unwrap();
+    engine
+        .submit_task(
+            &coder_ctx,
+            SubmitTask {
+                task_id: prerequisite.id,
+                commit_ids: vec!["abc123".into()],
+                summary: "done".into(),
+            },
+            IdempotencyKey("submit".into()),
+        )
+        .unwrap();
+    engine
+        .transition_for_review(
+            &ctx,
+            ReviewTaskTransition {
+                task_id: prerequisite.id,
+                status: TaskStatus::InReview,
+                reason: "review requested".into(),
+            },
+            IdempotencyKey("review-state".into()),
+        )
+        .unwrap();
+    engine
+        .transition_for_review(
+            &ctx,
+            ReviewTaskTransition {
+                task_id: prerequisite.id,
+                status: TaskStatus::RevisionRequired,
+                reason: "revise".into(),
+            },
+            IdempotencyKey("revision-required".into()),
+        )
+        .unwrap();
+    engine
+        .assign_task(
+            &ctx,
+            AssignTask {
+                task_id: prerequisite.id,
+                assignee: coder.id,
+            },
+            IdempotencyKey("revision-assigned".into()),
+        )
+        .unwrap();
+    engine
+        .claim_task(
+            &coder_ctx,
+            ClaimTask {
+                task_id: prerequisite.id,
+            },
+            IdempotencyKey("revision-claim".into()),
+        )
+        .unwrap();
+    engine
+        .submit_task(
+            &coder_ctx,
+            SubmitTask {
+                task_id: prerequisite.id,
+                commit_ids: vec!["abc124".into()],
+                summary: "revised".into(),
+            },
+            IdempotencyKey("revision-submit".into()),
+        )
+        .unwrap();
+    engine
+        .transition_for_review(
+            &ctx,
+            ReviewTaskTransition {
+                task_id: prerequisite.id,
+                status: TaskStatus::InReview,
+                reason: "ready for review".into(),
+            },
+            IdempotencyKey("review-state-2".into()),
+        )
+        .unwrap();
+
+    engine
+        .record_task_disposition(
+            &ctx,
+            FinalTaskDisposition {
+                task_id: prerequisite.id,
+                outcome: FinalTaskOutcome::Completed,
+                reason: "done".into(),
+            },
+            IdempotencyKey("finish-one".into()),
+        )
+        .unwrap();
+    let unlocked = db
+        .load::<TaskRecord>(EntityKind::Task, &dependent.id.0.to_string())
+        .unwrap()
+        .unwrap()
+        .0;
+    assert_eq!(unlocked.task.status, TaskStatus::Ready);
+    assert!(!unlocked.waiting_on_dependencies);
+    drop(db);
+    let reopened = Database::open(&temp.0).unwrap();
+    assert_eq!(
+        reopened
+            .load::<TaskRecord>(EntityKind::Task, &dependent.id.0.to_string())
+            .unwrap()
+            .unwrap()
+            .0
+            .task
+            .status,
+        TaskStatus::Ready
+    );
+}
+
+#[test]
+fn concurrency_and_retry_limits_are_enforced() {
+    let temp = TempDb::new();
+    let db = Database::open(&temp.0).unwrap();
+    let supervisor = context(Role::Supervisor);
+    let project = seed_project(&db, &supervisor);
+    let engine = engine(db.clone());
+    let run = engine
+        .create_run(
+            &supervisor,
+            CreateRun {
+                project_id: project,
+                goal: "work".into(),
+            },
+            IdempotencyKey("run".into()),
+        )
+        .unwrap()
+        .value;
+    let coder = seed_coder(&db, &supervisor);
+    let create = |name: &str| {
+        engine
+            .create_task(
+                &supervisor,
+                CreateTask {
+                    run_id: run.id,
+                    title: name.into(),
+                    goal: name.into(),
+                },
+                IdempotencyKey(format!("task-{name}")),
+            )
+            .unwrap()
+            .value
+    };
+    let first = create("first");
+    let second = create("second");
+    let third = create("third");
+    for task in [first.id, second.id] {
+        engine
+            .assign_task(
+                &supervisor,
+                AssignTask {
+                    task_id: task,
+                    assignee: coder.id,
+                },
+                IdempotencyKey(format!("assign-{task:?}")),
+            )
+            .unwrap();
+    }
+    assert!(matches!(
+        engine.assign_task(
+            &supervisor,
+            AssignTask {
+                task_id: third.id,
+                assignee: coder.id
+            },
+            IdempotencyKey("assign-third".into())
+        ),
+        Err(CoreError::Recoverable(_))
+    ));
+    let fourth = create("fourth");
+    engine
+        .release_task(
+            &supervisor,
+            ReleaseTask {
+                task_id: first.id,
+                reason: "retry".into(),
+            },
+            IdempotencyKey("release-1".into()),
+        )
+        .unwrap();
+    for attempt in 0..2 {
+        engine
+            .assign_task(
+                &supervisor,
+                AssignTask {
+                    task_id: first.id,
+                    assignee: coder.id,
+                },
+                IdempotencyKey(format!("retry-assign-{attempt}")),
+            )
+            .unwrap();
+        engine
+            .release_task(
+                &supervisor,
+                ReleaseTask {
+                    task_id: first.id,
+                    reason: "retry".into(),
+                },
+                IdempotencyKey(format!("retry-release-{attempt}")),
+            )
+            .unwrap();
+    }
+    // Initial assignment plus two retries are allowed. The next assignment stops the run durably.
+    assert!(matches!(
+        engine.assign_task(
+            &supervisor,
+            AssignTask {
+                task_id: first.id,
+                assignee: coder.id
+            },
+            IdempotencyKey("retry-exhausted".into())
+        ),
+        Err(CoreError::Recoverable(_))
+    ));
+    let stopped = db
+        .load::<Run>(EntityKind::Run, &run.id.0.to_string())
+        .unwrap()
+        .unwrap()
+        .0;
+    assert_eq!(stopped.status, RunStatus::Stopped);
+    assert!(stopped
+        .outcome
+        .unwrap()
+        .remaining_task_ids
+        .contains(&fourth.id));
+}
+
+#[test]
+fn renewal_between_expiry_read_and_reassignment_commit_is_fenced() {
+    let temp = TempDb::new();
+    let db = Database::open(&temp.0).unwrap();
+    let supervisor = context(Role::Supervisor);
+    let project = seed_project(&db, &supervisor);
+    let base_engine = engine(db.clone());
+    let run = base_engine
+        .create_run(
+            &supervisor,
+            CreateRun {
+                project_id: project,
+                goal: "lease race".into(),
+            },
+            IdempotencyKey("run".into()),
+        )
+        .unwrap()
+        .value;
+    let first_coder = seed_coder(&db, &supervisor);
+    let second_coder = seed_coder(&db, &supervisor);
+    let task = base_engine
+        .create_task(
+            &supervisor,
+            CreateTask {
+                run_id: run.id,
+                title: "task".into(),
+                goal: "keep current owner".into(),
+            },
+            IdempotencyKey("task".into()),
+        )
+        .unwrap()
+        .value;
+    base_engine
+        .assign_task(
+            &supervisor,
+            AssignTask {
+                task_id: task.id,
+                assignee: first_coder.id,
+            },
+            IdempotencyKey("assign-first".into()),
+        )
+        .unwrap();
+
+    let lease_id = SessionId::new().0.to_string();
+    let lease = LeaseState {
+        task_id: task.id,
+        owner_id: first_coder.id,
+        expired: true,
+    };
+    let lease_change = StateChange::insert(
+        EntityKind::Session,
+        lease_id.clone(),
+        EntityScope::default(),
+        &lease,
+    )
+    .unwrap();
+    db.commit_mutation(MutationInput {
+        context: &supervisor,
+        operation: "test.lease",
+        idempotency_key: &IdempotencyKey("lease".into()),
+        request: &lease,
+        preconditions: Vec::new(),
+        result: &lease,
+        changes: vec![lease_change],
+        event: NewEvent::from_context(
+            &supervisor,
+            "supervisor",
+            EventScope {
+                project_id: Some(project),
+                run_id: Some(run.id),
+                task_id: Some(task.id),
+            },
+            "lease.expired",
+            serde_json::json!({}),
+        ),
+    })
+    .unwrap();
+
+    let racing_engine = TaskEngine::new(
+        db.clone(),
+        Arc::new(Policy),
+        Arc::new(Reviews),
+        Arc::new(RenewOnAssignment {
+            db: db.clone(),
+            lease_id: lease_id.clone(),
+            project_id: project,
+            run_id: run.id,
+            task_id: task.id,
+        }),
+        Arc::new(DatabaseLeases {
+            db: db.clone(),
+            entity_id: lease_id.clone(),
+        }),
+    );
+    let result = racing_engine.assign_task(
+        &supervisor,
+        AssignTask {
+            task_id: task.id,
+            assignee: second_coder.id,
+        },
+        IdempotencyKey("reassign".into()),
+    );
+    assert!(matches!(result, Err(CoreError::Recoverable(_))));
+    let current = db
+        .load::<TaskRecord>(EntityKind::Task, &task.id.0.to_string())
+        .unwrap()
+        .unwrap()
+        .0;
+    assert_eq!(current.task.status, TaskStatus::Assigned);
+    assert_eq!(current.task.owner, Some(first_coder.id));
+    assert!(
+        !db.load::<LeaseState>(EntityKind::Session, &lease_id)
+            .unwrap()
+            .unwrap()
+            .0
+            .expired
+    );
+}
+
+#[test]
+fn available_work_allows_supervisors_and_persists_expired_run_stop() {
+    let temp = TempDb::new();
+    let db = Database::open(&temp.0).unwrap();
+    let supervisor = context(Role::Supervisor);
+    let project = seed_project(&db, &supervisor);
+    let engine = engine(db.clone());
+    let run = engine
+        .create_run(
+            &supervisor,
+            CreateRun {
+                project_id: project,
+                goal: "expires".into(),
+            },
+            IdempotencyKey("run".into()),
+        )
+        .unwrap()
+        .value;
+    let task = engine
+        .create_task(
+            &supervisor,
+            CreateTask {
+                run_id: run.id,
+                title: "ready".into(),
+                goal: "ready".into(),
+            },
+            IdempotencyKey("task".into()),
+        )
+        .unwrap()
+        .value;
+    assert_eq!(
+        engine
+            .available_work(
+                &supervisor,
+                project,
+                PageRequest {
+                    limit: 50,
+                    after: None
+                }
+            )
+            .unwrap()
+            .items,
+        vec![task.clone()]
+    );
+
+    let (mut expired, revision) = db
+        .load::<Run>(EntityKind::Run, &run.id.0.to_string())
+        .unwrap()
+        .unwrap();
+    expired.started_at = Utc::now() - ChronoDuration::hours(25);
+    let change = StateChange::update(
+        EntityKind::Run,
+        run.id.0.to_string(),
+        scope_for_run(&expired),
+        revision,
+        &expired,
+    )
+    .unwrap();
+    db.commit_mutation(MutationInput {
+        context: &supervisor,
+        operation: "test.expire_run",
+        idempotency_key: &IdempotencyKey("expire".into()),
+        request: &expired,
+        preconditions: Vec::new(),
+        result: &expired,
+        changes: vec![change],
+        event: NewEvent::from_context(
+            &supervisor,
+            "supervisor",
+            EventScope {
+                project_id: Some(project),
+                run_id: Some(run.id),
+                task_id: None,
+            },
+            "run.aged",
+            serde_json::json!({}),
+        ),
+    })
+    .unwrap();
+    let work = engine
+        .available_work(
+            &supervisor,
+            project,
+            PageRequest {
+                limit: 50,
+                after: None,
+            },
+        )
+        .unwrap();
+    assert!(work.items.is_empty());
+    let stopped = db
+        .load::<Run>(EntityKind::Run, &run.id.0.to_string())
+        .unwrap()
+        .unwrap()
+        .0;
+    assert_eq!(stopped.status, RunStatus::Stopped);
+    let outcome = stopped.outcome.unwrap();
+    assert!(outcome.reason.contains("duration"));
+    assert_eq!(outcome.remaining_task_ids, vec![task.id]);
+}
+
+#[test]
+fn human_gate_receives_specific_run_completion_context() {
+    let temp = TempDb::new();
+    let db = Database::open(&temp.0).unwrap();
+    let supervisor = context(Role::Supervisor);
+    let project = seed_project(&db, &supervisor);
+    let human = Arc::new(Human::default());
+    let engine = engine_with_human(db, human.clone());
+    let run = engine
+        .create_run(
+            &supervisor,
+            CreateRun {
+                project_id: project,
+                goal: "complete".into(),
+            },
+            IdempotencyKey("run".into()),
+        )
+        .unwrap()
+        .value;
+    engine
+        .complete_run(
+            &supervisor,
+            CompleteRun {
+                run_id: run.id,
+                outstanding_integration_steps: vec![],
+            },
+            IdempotencyKey("complete".into()),
+        )
+        .unwrap();
+    assert!(human.0.lock().unwrap().contains(&TransitionContext {
+        project_id: project,
+        run_id: run.id,
+        task_id: None,
+        from: Some(LifecycleState::Run(RunStatus::Active)),
+        to: Some(LifecycleState::Run(RunStatus::Completed)),
+        identity: TransitionIdentity::RunCompletion,
+    }));
+}
+
+#[test]
+fn coder_cannot_create_run() {
+    let temp = TempDb::new();
+    let db = Database::open(&temp.0).unwrap();
+    let ctx = context(Role::Coder);
+    let project = seed_project(&db, &context(Role::Supervisor));
+    assert!(matches!(
+        engine(db).create_run(
+            &ctx,
+            CreateRun {
+                project_id: project,
+                goal: "x".into()
+            },
+            IdempotencyKey("k".into())
+        ),
+        Err(CoreError::Forbidden)
+    ));
+}
