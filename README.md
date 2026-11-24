@@ -134,10 +134,16 @@ plain-language request is ambiguous. To register a repository directly:
 tesselate project ensure --repo ~/Development/bitwars
 ```
 
+The agent proposes an integration-only validation command from repository
+instructions. At the validation prompt, press Enter to use that proposal or
+type an override; a separate confirmation displays the exact command before
+the run starts. If no command was proposed, the agent must investigate and
+retry rather than starting without validation.
+
 The extension launches separate OMP processes for the coder and two reviewers;
 ordinary OMP subagents share their parent's MCP connection and cannot represent
 independent Tesselate roles. A task worktree is not the integration branch.
-Choose a validation command explicitly; do not run shared services in task
+Confirm an integration-only validation command explicitly; do not run shared services in task
 worktrees. Bitwars needs human-approved provisioning of ignored `.env` and
 `packages/content/.revisions` in the integration checkout if validation needs
 them. No automatic push, PR creation, or merge into local `main`.

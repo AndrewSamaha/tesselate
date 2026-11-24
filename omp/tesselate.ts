@@ -574,7 +574,7 @@ export default function tesselateExtension(pi: ExtensionAPI): void {
       const constraints = await ui.input("Constraints / prohibited actions (blank if none)");
       if (constraints === undefined) return;
       pending = { goal, acceptance, constraints, cwd, source_cwd };
-      pi.sendUserMessage(`Draft a clear, concise feature specification from this user request. Goal: ${goal}\nAcceptance criteria: ${acceptance}\nConstraints: ${constraints || "None specified"}\nAsk clarifying questions if needed. Then call tesselate_feature_start exactly once with the agreed goal, acceptance_criteria, constraints, and proposed validation_command (empty if unknown). Do not start coding in this main session; the tool will confirm branch and launch separate OMP sessions.`, { attribution: "agent" });
+      pi.sendUserMessage(`Draft a clear, concise feature specification from this user request. Goal: ${goal}\nAcceptance criteria: ${acceptance}\nConstraints: ${constraints || "None specified"}\nAsk clarifying questions if needed. Inspect repository test instructions and propose a safe integration-only validation_command. Then call tesselate_feature_start with the agreed goal, acceptance_criteria, constraints, and proposed validation_command. If the tool asks for a missing command, inspect the repository and retry. Do not start coding in this main session; the tool will confirm branch and launch separate OMP sessions.`, { attribution: "agent" });
     } catch (error) { ui.notify(cleanError(error), "error"); }
   }
   pi.on("input", async (event, ctx) => {
@@ -593,8 +593,11 @@ export default function tesselateExtension(pi: ExtensionAPI): void {
       if (!pending || pending.source_cwd !== ctx.cwd) return { content: [{ type: "text", text: "Use /feature or submit a feature request first; no workflow started." }] };
       const request = pending;
       if (!params.goal.trim() || !params.acceptance_criteria.trim()) return { content: [{ type: "text", text: "Goal and acceptance criteria are required." }] };
-      const validation = await ctx.ui.input(`Integration-only validation command (not run in coder worktrees; proposed: ${params.validation_command || "none"})`);
-      if (!validation?.trim()) return { content: [{ type: "text", text: "No validation command selected; no run started." }] };
+      const proposed = params.validation_command.trim();
+      const entered = await ctx.ui.input(`Integration-only validation command (press Enter to use agent proposal: ${proposed || "none"})`);
+      if (entered === undefined) return { content: [{ type: "text", text: "Validation selection cancelled; no run started." }] };
+      const validation = entered.trim() || proposed;
+      if (!validation) return { content: [{ type: "text", text: "No validation command proposed. Inspect repository test instructions, choose a safe integration-only validation command, and call tesselate_feature_start again; no run started." }] };
       if (!await ctx.ui.confirm(`Start independent Tesselate coder and reviewer sessions for: ${params.goal}? Validation in the integration worktree: ${validation}`)) return { content: [{ type: "text", text: "Cancelled; no run started." }] };
       pending = undefined;
       try {

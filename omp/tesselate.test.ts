@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -163,11 +163,26 @@ export async function runSmoke(): Promise<void> {
     assert.match(messages[0], /feature\.txt is committed/);
     assert.match(messages[0], /no shared-service tests/);
     assert.ok(tool);
+    const proposal = { goal: "Write feature.txt", acceptance_criteria: "feature.txt is committed", constraints: "no shared-service tests", validation_command: "git diff --exit-code HEAD -- README.md" };
+    const missing = await tool!.execute("call", { ...proposal, validation_command: "" }, undefined, undefined, { cwd: workspace_root, ui: {
+      ...ui, input: async () => "", confirm: async () => { throw new Error("Unproposed validation must not start a run"); }
+    } });
+    assert.match(missing.content[0].text, /Inspect repository test instructions/);
+    const cancelled = await tool!.execute("call", proposal, undefined, undefined, { cwd: workspace_root, ui: {
+      ...ui, input: async () => undefined, confirm: async () => { throw new Error("Cancelled validation must not start a run"); }
+    } });
+    assert.match(cancelled.content[0].text, /cancelled; no run started/);
+    const confirmations: string[] = [];
     process.env.FIXTURE_FAIL_AFTER_RUN_CREATE = "1";
-    const interrupted = await tool!.execute("call", { goal: "Write feature.txt", acceptance_criteria: "feature.txt is committed", constraints: "no shared-service tests", validation_command: "git diff --exit-code HEAD -- README.md" }, undefined, undefined, { cwd: workspace_root, ui: {
-      ...ui, input: async () => "git diff --exit-code HEAD -- README.md"
+    const interrupted = await tool!.execute("call", proposal, undefined, undefined, { cwd: workspace_root, ui: {
+      ...ui, input: async () => "", confirm: async (question: string) => {
+        confirmations.push(question);
+        return true;
+      }
     } });
     assert.match(interrupted.content[0].text, /paused/);
+    assert.match(confirmations[0], /Validation in the integration worktree: git diff --exit-code HEAD -- README\.md/);
+    assert.ok(existsSync(join(state_dir, "omp-runs", "intents")), interrupted.content[0].text);
     assert.equal(readdirSync(join(state_dir, "omp-runs", "intents")).length, 1);
     delete process.env.FIXTURE_FAIL_AFTER_RUN_CREATE;
     // A second interruption after role-token persistence replays issuance without the secret.
