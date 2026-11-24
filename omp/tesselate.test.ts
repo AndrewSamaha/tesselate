@@ -116,6 +116,12 @@ if(role==='coder') {
   fs.writeFileSync(path.join(cwd,'.workmux-local','completion.md'),'Coder completion handoff\n');
   process.stdout.write('Committed implementation.\n');
 } else {
+  const marker = path.join(process.env.FIXTURE_STATE,'retry-review.marker');
+  if(process.env.FIXTURE_RETRY_REVIEW==='1' && !fs.existsSync(marker)) {
+    fs.writeFileSync(marker,'1');
+    process.stdout.write('Working...\nCodex error event: usage limit reached (code=usage_limit_reached)\n');
+    process.exit(1);
+  }
   const review = round===1 && prompt.startsWith('Independent reviewer 1')
     ? {passed:false,summary:'Missing explicit acceptance text',findings:[{severity:'medium',location:'feature.txt:1',evidence:'Expected acceptance phrase absent',proposed_correction:'Include acceptance phrase'}]}
     : {passed:true,summary:'Reviewed committed change independently',findings:[]};
@@ -129,7 +135,7 @@ function git(repo: string, ...args: string[]): string {
   return execFileSync("git", ["-C", repo, ...args], { encoding: "utf8" }).trim();
 }
 
-export async function runSmoke(trackIgnored = false, trailingReview = false): Promise<void> {
+export async function runSmoke(trackIgnored = false, trailingReview = false, retryReview = false): Promise<void> {
   const root = mkdtempSync(join(tmpdir(), "tesselate-omp-fixture-"));
   const previousPath = process.env.PATH;
   const previousRepo = process.env.FIXTURE_REPO;
@@ -139,6 +145,7 @@ export async function runSmoke(trackIgnored = false, trailingReview = false): Pr
   const previousCaptureCrash = process.env.FIXTURE_FAIL_AFTER_CAPTURE;
   const previousTracked = process.env.FIXTURE_TRACK_IGNORED;
   const previousTrailing = process.env.FIXTURE_TRAILING_REVIEW;
+  const previousRetry = process.env.FIXTURE_RETRY_REVIEW;
   try {
     const home = join(root, "home"), workspace_root = join(home, "Development"), repo = join(workspace_root, "sample"), state_dir = join(workspace_root, ".tesselate");
     const ext = join(home, ".omp", "agent", "extensions");
@@ -263,10 +270,18 @@ export async function runSmoke(trackIgnored = false, trailingReview = false): Pr
       assert.equal(readFileSync(workerLog, "utf8").trim().split("\n").length, 2);
       return;
     }
+    if (retryReview) {
+      process.env.FIXTURE_RETRY_REVIEW = "1";
+      await featureCommand!("resume", { cwd: workspace_root, ui: resumeUi });
+      assert.ok(notifications.some(message => /usage limit reached/.test(message)));
+      notifications.length = 0;
+      delete process.env.FIXTURE_RETRY_REVIEW;
+    }
     await featureCommand!("resume", { cwd: workspace_root, ui: resumeUi });
     assert.ok(notifications.some(message => message.includes(`Resuming Tesselate run ${interruptedRun}`)));
     assert.ok(notifications.some(message => message.includes(`Tesselate run ${interruptedRun}: done`)));
     assert.equal(JSON.parse(readFileSync(join(state_dir, "fixture-db.json"), "utf8")).runCreateCount, 1);
+    if (retryReview) assert.ok(readdirSync(join(state_dir, "omp-runs", interruptedRun)).some(name => name.startsWith("reviewer-0-round-1.log.attempt-")));
     const record = JSON.parse(readFileSync(join(state_dir, "omp-runs", interruptedRun, "record.json"), "utf8"));
     assert.equal(record.phase, "done");
     assert.equal(git(repo, "rev-parse", "main"), mainHead);
@@ -275,9 +290,12 @@ export async function runSmoke(trackIgnored = false, trailingReview = false): Pr
     assert.equal(readFileSync(join(record.integration_dir, "packages/content/.revisions/snapshot.json"), "utf8"), "{\"id\":1}\n");
     assert.doesNotMatch(readFileSync(join(state_dir, "omp-runs", interruptedRun, "record.json"), "utf8"), /fixture-secret/);
     const launches = readFileSync(join(state_dir, "worker-launches.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
-    assert.deepEqual(launches.map(item => item.role), ["coder", "reviewer", "reviewer", "coder", "reviewer", "reviewer"]);
-    assert.notEqual(launches[0].cwd, launches[3].cwd);
-    assert.equal(launches[3].cwd, record.workspace_dir);
+    assert.deepEqual(launches.map(item => item.role), retryReview
+      ? ["coder", "reviewer", "reviewer", "reviewer", "coder", "reviewer", "reviewer"]
+      : ["coder", "reviewer", "reviewer", "coder", "reviewer", "reviewer"]);
+    const revisionCoder = launches.findIndex((item, index) => index > 0 && item.role === "coder");
+    assert.notEqual(launches[0].cwd, launches[revisionCoder].cwd);
+    assert.equal(launches[revisionCoder].cwd, record.workspace_dir);
     assert.ok(launches.filter(item => item.role === "reviewer").every(item => item.readOnly && item.cwd !== record.workspace_dir && item.workerEnv === "1"));
     assert.ok(launches.every(item => !existsSync(join(item.cwd, ".env")) && !existsSync(join(item.cwd, "packages/content/.revisions"))));
     assert.ok(existsSync(join(record.workspace_dir, ".workmux-local", "completion.md")));
@@ -304,7 +322,7 @@ export async function runSmoke(trackIgnored = false, trailingReview = false): Pr
     const resumed = await startFeature({ binary, state_dir, workspace_root, supervisor_credential_file }, repo,
       { goal: "Write feature.txt", acceptance_criteria: "feature.txt is committed", constraints: "", validation_command: "git diff --exit-code HEAD -- README.md", base_branch: "" }, ui);
     assert.equal(resumed.run_id, record.run_id);
-    assert.equal(readFileSync(join(state_dir, "worker-launches.jsonl"), "utf8").trim().split("\n").length, 6);
+    assert.equal(readFileSync(join(state_dir, "worker-launches.jsonl"), "utf8").trim().split("\n").length, retryReview ? 7 : 6);
     assert.equal(database.runCreateCount, 1);
   } finally {
     if (previousPath === undefined) delete process.env.PATH; else process.env.PATH = previousPath;
@@ -315,6 +333,7 @@ export async function runSmoke(trackIgnored = false, trailingReview = false): Pr
     if (previousCaptureCrash === undefined) delete process.env.FIXTURE_FAIL_AFTER_CAPTURE; else process.env.FIXTURE_FAIL_AFTER_CAPTURE = previousCaptureCrash;
     if (previousTracked === undefined) delete process.env.FIXTURE_TRACK_IGNORED; else process.env.FIXTURE_TRACK_IGNORED = previousTracked;
     if (previousTrailing === undefined) delete process.env.FIXTURE_TRAILING_REVIEW; else process.env.FIXTURE_TRAILING_REVIEW = previousTrailing;
+    if (previousRetry === undefined) delete process.env.FIXTURE_RETRY_REVIEW; else process.env.FIXTURE_RETRY_REVIEW = previousRetry;
     rmSync(root, { recursive: true, force: true });
   }
 }

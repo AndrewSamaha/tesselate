@@ -210,6 +210,21 @@ function running(worker: Worker): boolean {
   if (!worker.pid) return false;
   try { process.kill(worker.pid, 0); return true; } catch { return false; }
 }
+function failureHint(log: string): string {
+  try {
+    const text = readFileSync(log, "utf8");
+    const match = text.match(/Codex error event:\s*([^\n]+)/i) ?? text.match(/(usage limit reached[^\n]*|rate limit[^\n]*|quota[^\n]*|authentication failed[^\n]*)/i);
+    const detail = match?.[1]?.trim() ?? match?.[0]?.trim();
+    return detail ? ` (${detail})` : "";
+  } catch { return ""; }
+}
+function validFinal(text: string, role: Worker["role"]): boolean {
+  if (!text || /Codex error event/i.test(text) || /^\s*Working\.\.\.\s*$/i.test(text)) return false;
+  if (role === "reviewer") {
+    try { return reviewValid(jsonResult<Review>(text)); } catch { return false; }
+  }
+  return text.split(/\r?\n/).some(line => line.trim().length > 0 && !/^Working\.\.\.$/i.test(line.trim()));
+}
 type SessionActivity = { age_ms?: number; tool?: string };
 const supervisorStarts = new Map<string, string>();
 const toolPhrases: Record<string, string> = {
@@ -315,9 +330,18 @@ async function launch(record: RunRecord, config: Config, label: string, role: Wo
     throw new Error(`Worker ${label} has a persisted launch intent but no PID. Inspect ${prior.session_dir} and ${prior.log}; do not relaunch until its status is reconciled.`);
   }
   if (prior && !running(prior)) {
-    // A crashed supervisor cannot know whether an orphan exited successfully; the final
-    // response and all Git/Tesselate evidence are rechecked by the caller below.
-    return workerResult(prior.log);
+    const text = existsSync(prior.log) ? readFileSync(prior.log, "utf8").trim() : "";
+    if (validFinal(text, role)) return text;
+    // The prior attempt never produced a final response (for example a provider limit).
+    // Preserve its log and launch a fresh attempt under the same stable worker label.
+    if (existsSync(prior.log)) {
+      const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+      renameSync(prior.log, `${prior.log}.attempt-${stamp}`);
+    }
+    delete record.workers[label];
+    save(record, config);
+    writeHeartbeats(config, record);
+    return launch(record, config, label, role, cwd, credential, assignment, prompt);
   }
   if (!prior) {
     const root = join(config.state_dir, "omp-runs", record.run_id);
@@ -349,7 +373,7 @@ async function launch(record: RunRecord, config: Config, label: string, role: Wo
   if (live) {
     const code = await live;
     liveWorkers.delete(worker.pid!);
-    if (code !== 0) throw new Error(`OMP ${label} exited ${code}; inspect private log ${worker.log} before resuming.`);
+    if (code !== 0) throw new Error(`OMP ${label} exited ${code}${failureHint(worker.log)}; inspect private log ${worker.log} before resuming.`);
   } else {
     while (running(worker)) await new Promise(done => setTimeout(done, 3000));
   }
@@ -402,7 +426,10 @@ async function performReviews(config: Config, record: RunRecord): Promise<Review
     const text = await launch(record, config, `reviewer-${i}-round-${record.round}`, "reviewer", cwd, record.reviewer_credential_files[i], `review · round ${record.round} · reviewer ${i + 1}/2`, prompt);
     let review: Review;
     try { review = jsonResult<Review>(text); }
-    catch { throw new Error(`Reviewer ${i + 1} did not end with valid JSON; inspect ${record.workers[`reviewer-${i}-round-${record.round}`].log} before resuming.`); }
+    catch {
+      const log = record.workers[`reviewer-${i}-round-${record.round}`].log;
+      throw new Error(`Reviewer ${i + 1} did not end with valid JSON${failureHint(log)}; inspect ${log} before resuming.`);
+    }
     if (!reviewValid(review)) throw new Error(`Reviewer ${i + 1} returned an invalid review; retain session for recovery.`);
     await reviewerCheckout(record, config, i); // re-check immutable HEAD immediately before accepting result
     const findings = review.findings.map(f => ({ id: randomUUID(), ...f }));

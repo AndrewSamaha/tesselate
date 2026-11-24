@@ -194,7 +194,10 @@ not require a credential.
 Reviewer workers may print progress before their final JSON response. Tesselate
 parses only a final JSON object or fenced JSON response and rejects trailing
 non-JSON output; after a parse pause, `/feature resume` reuses the finished
-worker's saved log rather than launching that reviewer again.
+worker's saved log rather than launching that reviewer again. If a worker
+process died before producing a final response, resume archives its old log as
+`<label>.log.attempt-<timestamp>` and launches a fresh attempt for that role.
+Provider failures such as usage limits are included in the pause message.
 
 Workspace inspection reports both `capture_ready` and `clean`. Committed work
 can be captured when branch/HEAD identity matches and there are no tracked
