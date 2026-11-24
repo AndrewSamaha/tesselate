@@ -11,7 +11,7 @@ use tesselate::{
 #[tokio::main]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
-    let state_dir = match prepare_state_dir(&cli.state_dir) {
+    let state_dir = match cli.state_dir().and_then(|path| prepare_state_dir(&path)) {
         Ok(path) => path,
         Err(error) => return report(error),
     };

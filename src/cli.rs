@@ -1,5 +1,9 @@
 //! Scriptable command-line adapter. All workflow decisions are delegated to `Coordination`.
 
+#[path = "omp_install.rs"]
+mod omp_install;
+use omp_install::ensure_project;
+
 use crate::{
     config::load_project_config,
     coordination::{application::Application, Coordination},
@@ -30,21 +34,43 @@ fn parse_uuid(field: &str, value: &str) -> Result<Uuid, CliError> {
     about = "Local multi-agent workflow coordinator"
 )]
 pub struct Cli {
-    #[arg(
-        long,
-        global = true,
-        env = "TESSELATE_STATE_DIR",
-        default_value = ".tesselate"
-    )]
-    pub state_dir: PathBuf,
+    #[arg(long, global = true, env = "TESSELATE_STATE_DIR")]
+    pub state_dir: Option<PathBuf>,
     #[arg(long, global = true, env = "TESSELATE_CREDENTIAL_FILE")]
     pub credential_file: Option<PathBuf>,
     #[command(subcommand)]
     pub command: Command,
 }
 
+impl Cli {
+    pub fn state_dir(&self) -> Result<PathBuf, CliError> {
+        if let Some(path) = &self.state_dir {
+            return Ok(path.clone());
+        }
+        if matches!(
+            self.command,
+            Command::Install { .. }
+                | Command::Uninstall { .. }
+                | Command::Project {
+                    action: ProjectAction::Ensure { .. }
+                }
+        ) {
+            return Ok(omp_install::workspace_root()?.join(".tesselate"));
+        }
+        Ok(PathBuf::from(".tesselate"))
+    }
+}
+
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    Install {
+        #[command(subcommand)]
+        action: OmpAction,
+    },
+    Uninstall {
+        #[command(subcommand)]
+        action: OmpAction,
+    },
     Credential {
         #[command(subcommand)]
         action: CredentialAction,
@@ -82,6 +108,11 @@ pub enum Command {
 }
 
 #[derive(Debug, Subcommand)]
+pub enum OmpAction {
+    Omp,
+}
+
+#[derive(Debug, Subcommand)]
 pub enum CredentialAction {
     /// Create the initial supervisor credential and store it privately.
     Bootstrap {
@@ -114,6 +145,10 @@ pub enum CredentialRole {
 
 #[derive(Debug, Subcommand)]
 pub enum ProjectAction {
+    Ensure {
+        #[arg(long)]
+        repo: PathBuf,
+    },
     Register {
         #[arg(long)]
         config: PathBuf,
@@ -255,6 +290,12 @@ pub fn execute(
     command: Command,
 ) -> Result<Value, CliError> {
     match command {
+        Command::Install {
+            action: OmpAction::Omp,
+        } => omp_install::install(app, state_dir, credential_file),
+        Command::Uninstall {
+            action: OmpAction::Omp,
+        } => omp_install::uninstall(state_dir),
         Command::Credential { action } => match action {
             CredentialAction::Bootstrap { actor_name } => {
                 let bootstrap_secret = app.prepare_bootstrap()?;
@@ -307,6 +348,9 @@ pub fn execute(
                     path,
                     IdempotencyKey(idempotency_key),
                 )?)
+            }
+            ProjectAction::Ensure { repo } => {
+                ensure_project(app, state_dir, credential_file, &repo)
             }
         },
         Command::Inspect { query } => {
@@ -571,6 +615,23 @@ fn dispatch(
         }};
     }
     match tool {
+        "tesselate.v1.sessions.renew" => {
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Empty {}
+            decode::<Empty>(params)?;
+            let key = key.ok_or_else(|| CoreError::Invalid("mutations require --idempotency-key".into()))?;
+            to_value(app.renew_session(ctx, key)?)
+        }
+        "tesselate.v1.assignments.lease.renew" => {
+            #[derive(Deserialize)]
+            struct Request {
+                task_id: TaskId,
+            }
+            let request = decode::<Request>(params)?;
+            let key = key.ok_or_else(|| CoreError::Invalid("mutations require --idempotency-key".into()))?;
+            to_value(app.renew_assignment_lease(ctx, request.task_id, key)?)
+        }
         "tesselate.v1.projects.list" => {
             read!(PageRequest, |a: &Application, c, p| a.list_projects(c, p))
         }
