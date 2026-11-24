@@ -168,8 +168,10 @@ type an override; a separate confirmation displays the exact command before
 the run starts. If no command was proposed, the agent must investigate and
 retry rather than starting without validation.
 
-The extension launches separate OMP processes for the coder and two reviewers;
-ordinary OMP subagents share their parent's MCP connection and cannot represent
+The extension launches separate OMP processes for the coder and two reviewers
+using the initiating session's selected model. Select the model in the OMP
+session before starting or resuming; an in-flight worker is not switched.
+Ordinary OMP subagents share their parent's MCP connection and cannot represent
 independent Tesselate roles. A task worktree is not the integration branch.
 Confirm an integration-only validation command explicitly; do not run shared
 services in task worktrees. Bitwars' configured ignored files are copied into

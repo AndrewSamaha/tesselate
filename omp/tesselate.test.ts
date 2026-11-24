@@ -102,7 +102,7 @@ const fakeOmp = String.raw`#!/usr/bin/env node
 const fs=require('node:fs'),cp=require('node:child_process'),path=require('node:path');
 const a=process.argv.slice(2),cwd=a[a.indexOf('--cwd')+1],prompt=a[a.length-1];
 const role=prompt.startsWith('Independent reviewer')?'reviewer':'coder';
-fs.appendFileSync(path.join(process.env.FIXTURE_STATE,'worker-launches.jsonl'),JSON.stringify({role,cwd,readOnly:a.includes('--tools=read,grep,glob'),workerEnv:process.env.TESSELATE_WORKER})+'\n');
+fs.appendFileSync(path.join(process.env.FIXTURE_STATE,'worker-launches.jsonl'),JSON.stringify({role,cwd,readOnly:a.includes('--tools=read,grep,glob'),workerEnv:process.env.TESSELATE_WORKER,model:a[a.indexOf('--model')+1]})+'\n');
 const round = Number(prompt.match(/round (\d+)/)?.[1] ?? 1);
 if(role==='coder') {
   fs.writeFileSync(path.join(cwd,'feature.txt'),round===1?'implemented in task worktree\n':'feature.txt is committed (review correction)\n');
@@ -135,7 +135,7 @@ function git(repo: string, ...args: string[]): string {
   return execFileSync("git", ["-C", repo, ...args], { encoding: "utf8" }).trim();
 }
 
-export async function runSmoke(trackIgnored = false, trailingReview = false, retryReview = false): Promise<void> {
+export async function runSmoke(trackIgnored = false, trailingReview = false, retryReview = false, workerModel = ""): Promise<void> {
   const root = mkdtempSync(join(tmpdir(), "tesselate-omp-fixture-"));
   const previousPath = process.env.PATH;
   const previousRepo = process.env.FIXTURE_REPO;
@@ -216,7 +216,8 @@ export async function runSmoke(trackIgnored = false, trailingReview = false, ret
     assert.match(cancelled.content[0].text, /cancelled; no run started/);
     const confirmations: string[] = [];
     process.env.FIXTURE_FAIL_AFTER_RUN_CREATE = "1";
-    const interrupted = await tool!.execute("call", proposal, undefined, undefined, { cwd: workspace_root, ui: {
+    const modelContext = workerModel ? { model: { provider: workerModel.split("/")[0], id: workerModel.split("/").slice(1).join("/") } } : {};
+    const interrupted = await tool!.execute("call", proposal, undefined, undefined, { cwd: workspace_root, ...modelContext, ui: {
       ...ui, input: async () => "", confirm: async (question: string) => {
         confirmations.push(question);
         return true;
@@ -298,6 +299,7 @@ export async function runSmoke(trackIgnored = false, trailingReview = false, ret
     assert.equal(launches[revisionCoder].cwd, record.workspace_dir);
     assert.ok(launches.filter(item => item.role === "reviewer").every(item => item.readOnly && item.cwd !== record.workspace_dir && item.workerEnv === "1"));
     assert.ok(launches.every(item => !existsSync(join(item.cwd, ".env")) && !existsSync(join(item.cwd, "packages/content/.revisions"))));
+    if (workerModel) assert.ok(launches.every(item => item.model === workerModel));
     assert.ok(existsSync(join(record.workspace_dir, ".workmux-local", "completion.md")));
     const heartbeatNames = readdirSync(heartbeatDir).filter(name => name.endsWith(".json")).sort();
     assert.deepEqual(heartbeatNames, ["coder-round-1.json", "coder-round-2.json", "reviewer-0-round-1.json", "reviewer-0-round-2.json", "reviewer-1-round-1.json", "reviewer-1-round-2.json", "supervisor.json"]);

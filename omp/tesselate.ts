@@ -27,8 +27,9 @@ type RunRecord = {
   round_id?: string; previous_finding_ids: string[]; workers: Record<string, Worker>;
   validation_log?: string; validation_attempts?: number; validation_passed?: boolean; error?: string;
   provisioning?: Provisioning;
+  worker_model?: string;
 };
-type RunIntent = { version: 1; repository: string; project_id: string; repository_id: string; spec: Spec; base: string; key: string; supervisor_credential_file: string; run_id?: string };
+type RunIntent = { version: 1; repository: string; project_id: string; repository_id: string; spec: Spec; base: string; key: string; supervisor_credential_file: string; run_id?: string; worker_model?: string };
 type UIOps = { input(question: string): Promise<string | undefined>; select(question: string, choices: string[]): Promise<string | undefined>; confirm(question: string): Promise<boolean>; notify(message: string, level: "info" | "warning" | "error"): void };
 
 function configAt(path: string): Config {
@@ -41,6 +42,15 @@ function configAt(path: string): Config {
     if (typeof c[key] !== "string" || !isAbsolute(c[key] as string)) throw new Error(`Invalid ${key} in Tesselate OMP configuration; reinstall the extension.`);
   }
   return c as Config;
+}
+function selectedModel(ctx: { model?: unknown; models?: { current?: () => unknown } }): string | undefined {
+  const model = ctx.model ?? ctx.models?.current?.();
+  if (typeof model === "string") return model;
+  const candidate = model as { provider?: unknown; id?: unknown } | undefined;
+  if (candidate && typeof candidate.provider === "string" && typeof candidate.id === "string") {
+    return `${candidate.provider}/${candidate.id}`;
+  }
+  return undefined;
 }
 function inside(path: string, root: string): boolean {
   const sub = relative(root, path);
@@ -354,6 +364,7 @@ async function launch(record: RunRecord, config: Config, label: string, role: Wo
     writeHeartbeats(config, record);
     const fd = openSync(log, "wx", 0o600);
     const args = ["-p", "--cwd", cwd, "--session-dir", session_dir, "--wait-async", "--max-time", "2h", "--no-extensions", "--no-skills"];
+    if (record.worker_model) args.push("--model", record.worker_model);
     if (role === "reviewer") args.push("--tools=read,grep,glob");
     args.push(prompt);
     const child = spawn("omp", args, { cwd, env: ensureWorkerEnv(), detached: true, stdio: ["ignore", fd, fd] });
@@ -590,7 +601,7 @@ async function supervise(config: Config, record: RunRecord): Promise<RunRecord> 
   }
   return record;
 }
-async function createRun(config: Config, repo: string, requested: Spec): Promise<RunRecord> {
+async function createRun(config: Config, repo: string, requested: Spec, workerModel?: string): Promise<RunRecord> {
   const ensured = await cli<{ project_id: string; repository_id: string; canonical_path: string }>(config, config.supervisor_credential_file, ["project", "ensure", "--repo", repo]);
   const { project_id, repository_id } = ensured;
   if (!project_id || !repository_id || ensured.canonical_path !== repo) throw new Error("Project ensure returned a different repository or no registration.");
@@ -601,9 +612,11 @@ async function createRun(config: Config, repo: string, requested: Spec): Promise
   }
   const intent: RunIntent = previous ?? { version: 1, repository: repo, project_id, repository_id, spec: requested,
     base: await git(repo, "rev-parse", "--verify", `${requested.base_branch}^{commit}`), key: `omp:new:${randomUUID()}`,
-    supervisor_credential_file: config.supervisor_credential_file };
+    supervisor_credential_file: config.supervisor_credential_file, worker_model: workerModel };
   if (intent.project_id !== project_id || intent.repository_id !== repository_id) throw new Error("Pending run intent references another project; inspect before continuing.");
+  if (workerModel && intent.worker_model !== workerModel) intent.worker_model = workerModel;
   if (!previous) saveIntent(config, intent, true); // Durable idempotency identity before runs.create.
+  else if (workerModel) saveIntent(config, intent);
   const spec = intent.spec;
   const existing = intent.run_id ? runs.find(r => r.id === intent.run_id) : undefined;
   if (intent.run_id && !existing) throw new Error("Pending run ID is missing from Tesselate; inspect its state before continuing.");
@@ -620,8 +633,9 @@ async function createRun(config: Config, repo: string, requested: Spec): Promise
   const record: RunRecord = load(config, run.id) ?? { version: 1, project_id, repository_id, repository: repo,
     run_id: run.id, task_id: "", base: intent.base, base_branch: spec.base_branch, branch, integration_dir,
     workspace_id: "", workspace_dir: "", coder_credential_file: "", coder_actor_id: "", reviewer_credential_files: [],
-    reviewer_actor_ids: [], spec, phase: "coding", round: 1, previous_finding_ids: [], workers: {} };
+    reviewer_actor_ids: [], spec, worker_model: intent.worker_model, phase: "coding", round: 1, previous_finding_ids: [], workers: {} };
   if (record.repository !== repo || record.base !== intent.base || record.branch !== branch) throw new Error("Run handoff disagrees with its durable intent.");
+  if (workerModel) record.worker_model = workerModel;
   save(record, config);
   if (record.workspace_id) {
     unlinkSync(intentPath(config, repo));
@@ -848,9 +862,10 @@ async function resumableRuns(config: Config, repo: string): Promise<Array<{ run:
     return record?.repository === repo ? [{ run, record }] : [];
   });
 }
-async function resumeRecord(config: Config, record: RunRecord, ui: UIOps): Promise<RunRecord> {
+async function resumeRecord(config: Config, record: RunRecord, ui: UIOps, workerModel?: string): Promise<RunRecord> {
   if (record.phase === "done") return record;
   record.error = undefined;
+  if (workerModel) record.worker_model = workerModel;
   save(record, config);
   await provisionRun(config, record, ui);
   if (record.phase === "integrating" && record.validation_log && !record.validation_passed) {
@@ -862,12 +877,12 @@ async function resumeRecord(config: Config, record: RunRecord, ui: UIOps): Promi
   ui.notify(`Resuming Tesselate run ${record.run_id} on ${record.branch}; no new run will be created.`, "info");
   return supervise(config, record);
 }
-async function resumeFeature(config: Config, cwd: string, ui: UIOps, requestedId?: string): Promise<RunRecord> {
+async function resumeFeature(config: Config, cwd: string, ui: UIOps, requestedId?: string, workerModel?: string): Promise<RunRecord> {
   const repo = await chooseRepo(cwd, config, ui);
   const intent = readIntent(config, repo);
   if (intent && (!requestedId || requestedId === intent.run_id)) {
     if (!await ui.confirm(`Resume interrupted Tesselate run setup for ${intent.spec.goal}?`)) throw new Error("Pending run setup left untouched.");
-    return resumeRecord(config, await createRun(config, repo, intent.spec), ui);
+    return resumeRecord(config, await createRun(config, repo, intent.spec, workerModel), ui, workerModel);
   }
   const runs = await resumableRuns(config, repo);
   if (!runs.length) throw new Error(`No resumable Tesselate runs for ${repo}.`);
@@ -881,16 +896,16 @@ async function resumeFeature(config: Config, cwd: string, ui: UIOps, requestedId
     chosen = runs[labels.indexOf(selection)];
   }
   if (!chosen) throw new Error(`Tesselate run ${requestedId ?? "selection"} was not found for ${repo}.`);
-  return resumeRecord(config, chosen.record, ui);
+  return resumeRecord(config, chosen.record, ui, workerModel);
 }
 
 // Exported for a deterministic, no-model smoke fixture. Production uses the same path.
-export async function startFeature(config: Config, cwd: string, spec: Spec, ui: UIOps): Promise<RunRecord> {
+export async function startFeature(config: Config, cwd: string, spec: Spec, ui: UIOps, workerModel?: string): Promise<RunRecord> {
   const repo = await repoFor(cwd, config);
   const pendingIntent = readIntent(config, repo);
   if (pendingIntent) {
     if (!await ui.confirm(`Resume interrupted Tesselate run setup for ${pendingIntent.spec.goal}?`)) throw new Error("Pending run setup left untouched.");
-    return resumeRecord(config, await createRun(config, repo, pendingIntent.spec), ui);
+    return resumeRecord(config, await createRun(config, repo, pendingIntent.spec, workerModel), ui, workerModel);
   }
   if (!spec.goal.trim() || !spec.acceptance_criteria.trim()) throw new Error("Goal and acceptance criteria are required.");
   if (!spec.validation_command.trim()) throw new Error("Choose an explicit integration-only validation command before starting.");
@@ -899,14 +914,14 @@ export async function startFeature(config: Config, cwd: string, spec: Spec, ui: 
     const selected = await ui.select("Resume or inspect an existing feature, or start another run?", [...existingRun.map(x => `Resume ${x.run.id}: ${x.run.goal.slice(0, 60)}`), "Start new run"]);
     if (!selected) throw new Error("No run selected.");
     const match = existingRun.find(x => selected.startsWith(`Resume ${x.run.id}:`));
-    if (match) return resumeRecord(config, match.record, ui);
+    if (match) return resumeRecord(config, match.record, ui, workerModel);
   }
   const base = await selectBase(repo, ui);
   spec.base_branch = base.branch;
   const approved = await approveProvisioning(config, repo, ui);
   if (!await ui.confirm(`Start Tesselate feature on ${base.branch}@${base.base.slice(0, 12)}? No push or main merge will occur.`)) throw new Error("Feature start cancelled.");
   if (await git(repo, "rev-parse", "--verify", `${base.branch}^{commit}`) !== base.base) throw new Error("Selected base moved; restart feature setup.");
-  const record = await createRun(config, repo, spec);
+  const record = await createRun(config, repo, spec, workerModel);
   await provisionRun(config, record, ui, approved);
   return supervise(config, record);
 }
@@ -942,7 +957,7 @@ export default function tesselateExtension(pi: ExtensionAPI): void {
         if (id && !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)) {
           throw new Error("Use /feature resume or /feature resume <full-run-UUID>.");
         }
-        const result = await resumeFeature(configured(), ctx.cwd, ctx.ui, id || undefined);
+        const result = await resumeFeature(configured(), ctx.cwd, ctx.ui, id || undefined, selectedModel(ctx));
         ctx.ui.notify(`Tesselate run ${result.run_id}: ${result.phase}. Integration branch ${result.branch}; no push or main merge.`, "info");
       } catch (error) { ctx.ui.notify(`Tesselate paused: ${cleanError(error)}`, "error"); }
       return;
@@ -964,7 +979,7 @@ export default function tesselateExtension(pi: ExtensionAPI): void {
       if (!await ctx.ui.confirm(`Start independent Tesselate coder and reviewer sessions for: ${params.goal}? Validation in the integration worktree: ${validation}`)) return { content: [{ type: "text", text: "Cancelled; no run started." }] };
       pending = undefined;
       try {
-        const result = await startFeature(configured(), request.cwd, { goal: params.goal, acceptance_criteria: params.acceptance_criteria, constraints: params.constraints, validation_command: validation, base_branch: "" }, ctx.ui);
+        const result = await startFeature(configured(), request.cwd, { goal: params.goal, acceptance_criteria: params.acceptance_criteria, constraints: params.constraints, validation_command: validation, base_branch: "" }, ctx.ui, selectedModel(ctx));
         return { content: [{ type: "text", text: `Tesselate run ${result.run_id}: ${result.phase}. Integration branch ${result.branch}, ${result.integration_dir}. No push or main merge.` }] };
       } catch (error) {
         return { content: [{ type: "text", text: `Tesselate paused: ${cleanError(error)}. Use /feature resume after resolving; no push or main merge was attempted.` }], isError: true };
