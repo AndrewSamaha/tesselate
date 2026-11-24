@@ -10,6 +10,8 @@ pub const TOOLS: &[&str] = &[
     "tesselate.v1.repositories.list",
     "tesselate.v1.agents.list",
     "tesselate.v1.runs.list",
+    "tesselate.v1.sessions.renew",
+    "tesselate.v1.assignments.lease.renew",
     "tesselate.v1.runs.create",
     "tesselate.v1.work.available",
     "tesselate.v1.tasks.list",

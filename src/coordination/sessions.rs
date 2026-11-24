@@ -150,6 +150,56 @@ impl SessionManager {
         Ok(secret)
     }
 
+    /// Local CLI recovery only. This deliberately bypasses expiry, not revocation, and must
+    /// never be dispatched through an authenticated socket or MCP operation.
+    pub fn recover_local_supervisor(
+        &self,
+        old_secret: &str,
+        idempotency_key: IdempotencyKey,
+    ) -> CoreResult<SessionContext> {
+        let verifier_hash = digest(old_secret);
+        let (mut record, revision) = self
+            .db
+            .load::<CredentialRecord>(EntityKind::Credential, &verifier_hash)
+            .map_err(storage_error)?
+            .ok_or(CoreError::Unauthenticated)?;
+        if !constant_time_eq(&record.verifier_hash, &verifier_hash)
+            || record.status != CredentialStatus::Active
+            || record.role != Some(Role::Supervisor)
+        {
+            return Err(CoreError::Unauthenticated);
+        }
+        let ctx = SessionContext::validated(
+            record.session_id,
+            record.actor_id.ok_or(CoreError::Unauthenticated)?,
+            Role::Supervisor,
+        );
+        record.expires_at = Some(Utc::now() + self.session_ttl);
+        let event = session_event(
+            &ctx,
+            "session.supervisor_recovered",
+            json!({"session_id":record.session_id}),
+        );
+        self.commit(
+            &ctx,
+            "sessions.supervisor.recover_local",
+            &idempotency_key,
+            &record.session_id,
+            &record.expires_at.unwrap(),
+            vec![StateChange::update(
+                EntityKind::Credential,
+                verifier_hash,
+                credential_scope(&record),
+                revision,
+                &record,
+            )
+            .map_err(storage_error)?],
+            vec![],
+            event,
+        )?;
+        Ok(ctx)
+    }
+
     pub fn renew_session(
         &self,
         ctx: &SessionContext,
@@ -1159,3 +1209,115 @@ fn storage_error(error: PersistenceError) -> CoreError {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod local_recovery_tests {
+    use super::*;
+    use std::{fs, path::PathBuf};
+
+    struct TempDb(PathBuf);
+
+    impl TempDb {
+        fn new() -> Self {
+            let directory = std::env::temp_dir().join(format!("tesselate-recovery-{}", Uuid::new_v4()));
+            fs::create_dir_all(&directory).unwrap();
+            Self(directory.join("state.sqlite3"))
+        }
+    }
+
+    impl Drop for TempDb {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(self.0.parent().unwrap());
+        }
+    }
+
+    #[test]
+    fn only_exact_active_supervisor_secret_can_recover_a_lapsed_session() {
+        let temp = TempDb::new();
+        let db = Database::open(&temp.0).unwrap();
+        let manager = SessionManager::new(db.clone());
+        let bootstrap = manager.prepare_bootstrap().unwrap();
+        let supervisor = manager
+            .bootstrap_supervisor(&bootstrap, "owner", IdempotencyKey("bootstrap".into()))
+            .unwrap();
+        let secret = supervisor.secret.as_deref().unwrap();
+        let context = manager.authenticate(secret).unwrap();
+        let coder = manager
+            .issue_agent(&context, "coder", AgentRole::Coder, IdempotencyKey("coder".into()))
+            .unwrap();
+        assert!(matches!(
+            manager.recover_local_supervisor(
+                coder.secret.as_deref().unwrap(),
+                IdempotencyKey("coder-recovery".into())
+            ),
+            Err(CoreError::Unauthenticated)
+        ));
+        let verifier_hash = digest(secret);
+        let (mut record, revision) = manager.load_credential(&verifier_hash).unwrap();
+        record.expires_at = Some(Utc::now() - Duration::days(1));
+        db.commit_mutation(MutationInput {
+            context: &context,
+            operation: "test.supervisor.expire",
+            idempotency_key: &IdempotencyKey("test-expiry".into()),
+            request: &context.session_id(),
+            preconditions: vec![],
+            result: &true,
+            changes: vec![StateChange::update(
+                EntityKind::Credential,
+                &verifier_hash,
+                credential_scope(&record),
+                revision,
+                &record,
+            )
+            .unwrap()],
+            event: session_event(&context, "test.session_lapsed", json!({})),
+        })
+        .unwrap();
+        let reopened = SessionManager::new(Database::open(&temp.0).unwrap());
+        assert!(matches!(
+            reopened.authenticate(secret),
+            Err(CoreError::Unauthenticated)
+        ));
+        assert!(matches!(
+            reopened.recover_local_supervisor(&format!("{secret}x"), IdempotencyKey("wrong".into())),
+            Err(CoreError::Unauthenticated)
+        ));
+        let recovered = reopened
+            .recover_local_supervisor(secret, IdempotencyKey("recover".into()))
+            .unwrap();
+        assert_eq!(recovered.session_id(), context.session_id());
+        assert_eq!(reopened.authenticate(secret).unwrap().role(), Role::Supervisor);
+        let count = db.event_count().unwrap();
+        assert_eq!(
+            reopened
+                .recover_local_supervisor(secret, IdempotencyKey("recover".into()))
+                .unwrap()
+                .session_id(),
+            recovered.session_id()
+        );
+        assert_eq!(db.event_count().unwrap(), count);
+        reopened
+            .revoke(
+                &recovered,
+                recovered.session_id(),
+                IdempotencyKey("revoke-supervisor".into()),
+            )
+            .unwrap();
+        assert!(matches!(
+            reopened.recover_local_supervisor(secret, IdempotencyKey("recover-again".into())),
+            Err(CoreError::Unauthenticated)
+        ));
+        let events = db
+            .events_after(
+                EventScope {
+                    project_id: None,
+                    run_id: None,
+                    task_id: None,
+                },
+                None,
+                100,
+            )
+            .unwrap();
+        assert!(!serde_json::to_string(&events).unwrap().contains(secret));
+    }
+}

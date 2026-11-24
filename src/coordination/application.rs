@@ -3,7 +3,7 @@
 use super::{
     human::{HumanCoordinator, ProjectHumanGatePolicy},
     reviews::{ProjectReviewPolicy, ReviewCoordinator, ReviewPolicy as CoordinationReviewPolicy},
-    sessions::SessionManager,
+    sessions::{AssignmentLeaseRecord, SessionManager},
     tasks::{ProjectWorkflowPolicy, TaskEngine},
     Coordination,
 };
@@ -19,6 +19,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{collections::HashSet, path::Path, sync::Arc};
+use uuid::Uuid;
 
 const PAGE_SIZE: u32 = 500;
 
@@ -106,6 +107,15 @@ impl Application {
 
     pub fn authenticate(&self, credential: &str) -> CoreResult<SessionContext> {
         self.sessions.authenticate(credential)
+    }
+
+    /// Local CLI only: possession of the old supervisor credential can renew a lapsed
+    /// session without making expired credentials valid through ordinary authentication.
+    pub fn recover_local_supervisor(&self, old_secret: &str) -> CoreResult<SessionContext> {
+        self.sessions.recover_local_supervisor(
+            old_secret,
+            IdempotencyKey(Uuid::new_v4().to_string()),
+        )
     }
 
     pub fn issue_agent(
@@ -321,6 +331,23 @@ impl Coordination for Application {
         self.db
             .list_entities(EntityKind::Project, &EntityScope::default(), page)
             .map_err(storage_error)
+    }
+
+    fn renew_session(
+        &self,
+        ctx: &SessionContext,
+        key: IdempotencyKey,
+    ) -> CoreResult<Mutation<DateTime<Utc>>> {
+        self.sessions.renew_session(ctx, key)
+    }
+
+    fn renew_assignment_lease(
+        &self,
+        ctx: &SessionContext,
+        task_id: TaskId,
+        key: IdempotencyKey,
+    ) -> CoreResult<Mutation<AssignmentLeaseRecord>> {
+        self.sessions.renew_assignment_lease(ctx, task_id, key)
     }
 
     fn list_repositories(

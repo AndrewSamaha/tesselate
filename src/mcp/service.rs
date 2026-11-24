@@ -7,7 +7,7 @@ use crate::{
         EventScope, FinalTaskDisposition, HumanRequest, IdempotencyKey, InspectWorkspace,
         ListHumanRequests, ListReviewRounds, ListReviews, PageRequest, ReadMessages, ReleaseTask,
         ResolveHumanRequest, ReviewRequest, SendMessage, SessionAuthenticator, SessionContext,
-        SubmitReview, SubmitTask, UpdateProgress, WorkspaceRequest,
+        SubmitReview, SubmitTask, TaskId, UpdateProgress, WorkspaceRequest,
     },
 };
 use rmcp::{
@@ -332,6 +332,14 @@ struct ArtifactPage {
     page: PageRequest,
 }
 
+#[derive(Deserialize)]
+struct SessionRenewal {}
+#[derive(Deserialize)]
+struct LeaseRenewal {
+    task_id: TaskId,
+}
+
+
 fn decode<T: DeserializeOwned>(value: Value) -> CoreResult<T> {
     serde_json::from_value(value).map_err(|error| CoreError::Invalid(error.to_string()))
 }
@@ -379,6 +387,14 @@ fn invoke(
         "tesselate.v1.runs.list" => {
             let r = decode::<ProjectPage>(params)?;
             encode(service.list_runs(ctx, r.project_id, r.page)?)
+        }
+        "tesselate.v1.sessions.renew" => {
+            mutation!(SessionRenewal, |s: &dyn Coordination, c, _r, k| s
+                .renew_session(c, k))
+        }
+        "tesselate.v1.assignments.lease.renew" => {
+            mutation!(LeaseRenewal, |s: &dyn Coordination, c, r: LeaseRenewal, k| s
+                .renew_assignment_lease(c, r.task_id, k))
         }
         "tesselate.v1.runs.create" => mutation!(CreateRun, |s: &dyn Coordination, c, r, k| s
             .create_run(c, r, k)),
@@ -743,6 +759,10 @@ fn params_schema(tool: &str) -> Value {
         | "tesselate.v1.agents.list"
         | "tesselate.v1.runs.list"
         | "tesselate.v1.work.available" => project_page_schema(),
+        "tesselate.v1.sessions.renew" => object_schema(json!({}), &[]),
+        "tesselate.v1.assignments.lease.renew" => {
+            object_schema(json!({"task_id":task_id}), &["task_id"])
+        }
         "tesselate.v1.runs.create" => object_schema(
             json!({"project_id":project_id,"goal":string_schema()}),
             &["project_id", "goal"],
@@ -895,11 +915,13 @@ mod tests {
             assert_eq!(params["type"], "object", "{} params schema", tool.name);
             assert_eq!(params["additionalProperties"], false, "{}", tool.name);
             assert!(params["properties"].is_object(), "{}", tool.name);
-            assert!(
-                !params["required"].as_array().unwrap().is_empty(),
-                "{}",
-                tool.name
-            );
+            if tool.name != "tesselate.v1.sessions.renew" {
+                assert!(
+                    !params["required"].as_array().unwrap().is_empty(),
+                    "{}",
+                    tool.name
+                );
+            }
         }
         let mutation = tools
             .iter()
@@ -1023,5 +1045,37 @@ mod tests {
         assert!(!is_mutation("tesselate.v1.work.available"));
         assert!(!is_mutation("tesselate.v1.human.list"));
         assert!(is_mutation("tesselate.v1.human.resolve"));
+    }
+
+    #[test]
+    fn renewal_tools_require_keys_and_admit_only_bearer_bound_params() {
+        for name in [
+            "tesselate.v1.sessions.renew",
+            "tesselate.v1.assignments.lease.renew",
+        ] {
+            assert!(TOOLS.contains(&name));
+            assert!(is_mutation(name));
+            let tool = tool_definitions()
+                .into_iter()
+                .find(|tool| tool.name == name)
+                .unwrap();
+            assert!(tool.input_schema["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("idempotency_key")));
+        }
+        let session_schema = params_schema("tesselate.v1.sessions.renew");
+        validate_params(&json!({}), &session_schema).unwrap();
+        assert!(validate_params(&json!({"secret":"injected"}), &session_schema).is_err());
+        let lease_schema = params_schema("tesselate.v1.assignments.lease.renew");
+        let task_id = TaskId::new();
+        validate_params(&json!({"task_id":task_id}), &lease_schema).unwrap();
+        assert!(validate_params(&json!({}), &lease_schema).is_err());
+        assert!(validate_params(
+            &json!({"task_id":task_id,"actor_id":crate::core::ActorId::new()}),
+            &lease_schema
+        )
+        .is_err());
+        assert!(!TOOLS.contains(&"tesselate.v1.sessions.supervisor.recover_local"));
     }
 }
