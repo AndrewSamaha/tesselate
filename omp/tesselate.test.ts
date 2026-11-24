@@ -115,16 +115,21 @@ if(role==='coder') {
   fs.mkdirSync(path.join(cwd,'.workmux-local'),{recursive:true});
   fs.writeFileSync(path.join(cwd,'.workmux-local','completion.md'),'Coder completion handoff\n');
   process.stdout.write('Committed implementation.\n');
-} else if (round===1 && prompt.startsWith('Independent reviewer 1')) {
-  process.stdout.write(JSON.stringify({passed:false,summary:'Missing explicit acceptance text',findings:[{severity:'medium',location:'feature.txt:1',evidence:'Expected acceptance phrase absent',proposed_correction:'Include acceptance phrase'}]})+'\n');
-} else process.stdout.write(JSON.stringify({passed:true,summary:'Reviewed committed change independently',findings:[]})+'\n');
+} else {
+  const review = round===1 && prompt.startsWith('Independent reviewer 1')
+    ? {passed:false,summary:'Missing explicit acceptance text',findings:[{severity:'medium',location:'feature.txt:1',evidence:'Expected acceptance phrase absent',proposed_correction:'Include acceptance phrase'}]}
+    : {passed:true,summary:'Reviewed committed change independently',findings:[]};
+  process.stdout.write('Working...\n');
+  process.stdout.write(JSON.stringify(review,null,round===1?2:undefined)+'\n');
+  if(process.env.FIXTURE_TRAILING_REVIEW==='1') process.stdout.write('Unexpected trailing output\n');
+}
 `;
 
 function git(repo: string, ...args: string[]): string {
   return execFileSync("git", ["-C", repo, ...args], { encoding: "utf8" }).trim();
 }
 
-export async function runSmoke(trackIgnored = false): Promise<void> {
+export async function runSmoke(trackIgnored = false, trailingReview = false): Promise<void> {
   const root = mkdtempSync(join(tmpdir(), "tesselate-omp-fixture-"));
   const previousPath = process.env.PATH;
   const previousRepo = process.env.FIXTURE_REPO;
@@ -133,6 +138,7 @@ export async function runSmoke(trackIgnored = false): Promise<void> {
   const previousIssueCrash = process.env.FIXTURE_FAIL_AFTER_CODER_ISSUE;
   const previousCaptureCrash = process.env.FIXTURE_FAIL_AFTER_CAPTURE;
   const previousTracked = process.env.FIXTURE_TRACK_IGNORED;
+  const previousTrailing = process.env.FIXTURE_TRAILING_REVIEW;
   try {
     const home = join(root, "home"), workspace_root = join(home, "Development"), repo = join(workspace_root, "sample"), state_dir = join(workspace_root, ".tesselate");
     const ext = join(home, ".omp", "agent", "extensions");
@@ -244,6 +250,16 @@ export async function runSmoke(trackIgnored = false): Promise<void> {
       assert.equal(git(join(state_dir, "omp-runs", interruptedRun, "integration"), "rev-parse", "HEAD"), mainHead);
       return;
     }
+    if (trailingReview) {
+      process.env.FIXTURE_TRAILING_REVIEW = "1";
+      await featureCommand!("resume", { cwd: repo, ui: resumeUi });
+      assert.ok(notifications.some(message => /Reviewer 1 did not end with valid JSON; inspect/.test(message)));
+      const paused = JSON.parse(readFileSync(join(state_dir, "omp-runs", interruptedRun, "record.json"), "utf8"));
+      assert.equal(paused.phase, "review");
+      assert.equal(JSON.parse(readFileSync(join(state_dir, "fixture-db.json"), "utf8")).reviews.length, 0);
+      assert.equal(readFileSync(workerLog, "utf8").trim().split("\n").length, 2);
+      return;
+    }
     await featureCommand!("resume", { cwd: workspace_root, ui: resumeUi });
     assert.ok(notifications.some(message => message.includes(`Resuming Tesselate run ${interruptedRun}`)));
     assert.ok(notifications.some(message => message.includes(`Tesselate run ${interruptedRun}: done`)));
@@ -281,6 +297,7 @@ export async function runSmoke(trackIgnored = false): Promise<void> {
     if (previousIssueCrash === undefined) delete process.env.FIXTURE_FAIL_AFTER_CODER_ISSUE; else process.env.FIXTURE_FAIL_AFTER_CODER_ISSUE = previousIssueCrash;
     if (previousCaptureCrash === undefined) delete process.env.FIXTURE_FAIL_AFTER_CAPTURE; else process.env.FIXTURE_FAIL_AFTER_CAPTURE = previousCaptureCrash;
     if (previousTracked === undefined) delete process.env.FIXTURE_TRACK_IGNORED; else process.env.FIXTURE_TRACK_IGNORED = previousTracked;
+    if (previousTrailing === undefined) delete process.env.FIXTURE_TRAILING_REVIEW; else process.env.FIXTURE_TRAILING_REVIEW = previousTrailing;
     rmSync(root, { recursive: true, force: true });
   }
 }

@@ -176,6 +176,11 @@ services in task worktrees. Bitwars' configured ignored files are copied into
 the integration checkout only after approval; absent optional files are skipped.
 No automatic push, PR creation, or merge into local `main`.
 
+Reviewer workers may print progress before their final JSON response. Tesselate
+parses only a final JSON object or fenced JSON response and rejects trailing
+non-JSON output; after a parse pause, `/feature resume` reuses the finished
+worker's saved log rather than launching that reviewer again.
+
 Workspace inspection reports both `capture_ready` and `clean`. Committed work
 can be captured when branch/HEAD identity matches and there are no tracked
 changes or non-ignored untracked files; ignored build output and local handoffs

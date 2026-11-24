@@ -199,8 +199,11 @@ function workerResult(log: string): string {
 }
 function jsonResult<T>(text: string): T {
   const trimmed = text.trim();
-  const match = trimmed.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
-  return JSON.parse(match ? match[1] : trimmed) as T;
+  const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)\s*```\s*$/i);
+  if (fenced) return JSON.parse(fenced[1]) as T;
+  // OMP may print progress before its final answer; only the final JSON object is authoritative.
+  const finalObject = trimmed.match(/(?:^|\r?\n)[ \t]*(\{[\s\S]*\})$/);
+  return JSON.parse(finalObject ? finalObject[1] : trimmed) as T;
 }
 function running(worker: Worker): boolean {
   if (!worker.pid) return false;
@@ -296,7 +299,9 @@ async function performReviews(config: Config, record: RunRecord): Promise<Review
     if (!existsSync(diff)) writeFileSync(diff, await git(record.repository, "diff", record.base, record.last_head!), { mode: 0o600, flag: "wx" });
     const prompt = `Independent reviewer ${i + 1} for Tesselate task ${record.task_id}, review round ${record.round}. Read AGENTS.md and the diff at ${diff}; inspect relevant sources in this detached checkout. Goal: ${record.spec.goal}\nAcceptance: ${record.spec.acceptance_criteria}\nConstraints: ${record.spec.constraints}\nDo not edit files, invoke shell, run tests, access credentials or shared services. Reply ONLY JSON {"passed":boolean,"summary":"...","findings":[{"severity":"low|medium|high|critical","location":"path:line","evidence":"specific evidence","proposed_correction":"specific fix"}]}. A pass requires no findings; a failure requires findings. This is an adversarial review, not a summary.`;
     const text = await launch(record, config, `reviewer-${i}-round-${record.round}`, "reviewer", cwd, record.reviewer_credential_files[i], prompt);
-    const review = jsonResult<Review>(text);
+    let review: Review;
+    try { review = jsonResult<Review>(text); }
+    catch { throw new Error(`Reviewer ${i + 1} did not end with valid JSON; inspect ${record.workers[`reviewer-${i}-round-${record.round}`].log} before resuming.`); }
     if (!reviewValid(review)) throw new Error(`Reviewer ${i + 1} returned an invalid review; retain session for recovery.`);
     await reviewerCheckout(record, config, i); // re-check immutable HEAD immediately before accepting result
     const findings = review.findings.map(f => ({ id: randomUUID(), ...f }));
