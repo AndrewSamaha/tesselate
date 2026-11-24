@@ -112,10 +112,10 @@ credentials, run handoffs, worktrees, and artifacts. The installer places an
 extension, skill, and credential-file-path configuration in the active user's
 OMP agent directory; it adds no credentials or OMP files to a project repository.
 When running a binary from this checkout instead of an installed `tesselate` on `PATH`, use
-`./target/debug/tesselate install omp`. `install omp`, `uninstall omp`, and
-`project ensure` default to this shared state directory; other CLI commands
-retain the existing `.tesselate` default. Pass `--state-dir` explicitly when
-calling those commands by hand against the shared installation.
+`./target/debug/tesselate install omp`. `install omp`, `uninstall omp`,
+`project ensure`, and `project provision` default to this shared state directory;
+other CLI commands retain the existing `.tesselate` default. Pass `--state-dir`
+explicitly when calling those commands by hand against the shared installation.
 
 Installation follows the active `OMP_PROFILE` / `PI_PROFILE`, if set; otherwise
 it targets the default `~/.omp/agent` profile. Install separately for each named
@@ -134,6 +134,28 @@ plain-language request is ambiguous. To register a repository directly:
 tesselate project ensure --repo ~/Development/bitwars
 ```
 
+To opt into copying ignored local files for a repository, configure an
+integration-only policy once. Bitwars' existing `.workmux.yaml` lists these paths:
+
+```sh
+tesselate project provision --repo ~/Development/bitwars \
+  --copy .env --copy .env.local \
+  --copy apps/web/.env --copy apps/web/.env.local \
+  --copy apps/web/.env.development --copy apps/web/.env.development.local \
+  --copy services/rts-engine/.env \
+  --copy packages/content/.revisions
+```
+
+The private policy lives beside the generated project configuration under
+`~/Development/.tesselate/projects/`; repeat the same command safely, or use
+`--replace` to change its copy list. Other repositories can list their own
+Git-ignored relative paths. Tesselate shows present and missing optional paths
+for approval before creating a run, then snapshots files into the integration
+worktree with owner-only permissions. It neither copies to coder/reviewer
+worktrees nor executes workmux `post_create`, `pre_merge`, or `pre_remove` hooks,
+which can run arbitrary commands. Symlinks, tracked paths, and changed
+destinations stop provisioning for inspection; file contents are never logged.
+
 The agent proposes an integration-only validation command from repository
 instructions. At the validation prompt, press Enter to use that proposal or
 type an override; a separate confirmation displays the exact command before
@@ -143,10 +165,10 @@ retry rather than starting without validation.
 The extension launches separate OMP processes for the coder and two reviewers;
 ordinary OMP subagents share their parent's MCP connection and cannot represent
 independent Tesselate roles. A task worktree is not the integration branch.
-Confirm an integration-only validation command explicitly; do not run shared services in task
-worktrees. Bitwars needs human-approved provisioning of ignored `.env` and
-`packages/content/.revisions` in the integration checkout if validation needs
-them. No automatic push, PR creation, or merge into local `main`.
+Confirm an integration-only validation command explicitly; do not run shared
+services in task worktrees. Bitwars' configured ignored files are copied into
+the integration checkout only after approval; absent optional files are skipped.
+No automatic push, PR creation, or merge into local `main`.
 
 ```sh
 tesselate uninstall omp

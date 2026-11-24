@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -106,6 +107,10 @@ const round = Number(prompt.match(/round (\d+)/)?.[1] ?? 1);
 if(role==='coder') {
   fs.writeFileSync(path.join(cwd,'feature.txt'),round===1?'implemented in task worktree\n':'feature.txt is committed (review correction)\n');
   cp.execFileSync('git',['-C',cwd,'add','feature.txt']);
+  if(process.env.FIXTURE_TRACK_IGNORED==='1') {
+    fs.writeFileSync(path.join(cwd,'.env'),'worker-dummy-not-the-source-secret\n');
+    cp.execFileSync('git',['-C',cwd,'add','-f','.env']);
+  }
   cp.execFileSync('git',['-C',cwd,'-c','user.name=Fixture Coder','-c','user.email=coder@example.invalid','commit','-m','Implement feature round '+round]);
   process.stdout.write('Committed implementation.\n');
 } else if (round===1 && prompt.startsWith('Independent reviewer 1')) {
@@ -117,7 +122,7 @@ function git(repo: string, ...args: string[]): string {
   return execFileSync("git", ["-C", repo, ...args], { encoding: "utf8" }).trim();
 }
 
-export async function runSmoke(): Promise<void> {
+export async function runSmoke(trackIgnored = false): Promise<void> {
   const root = mkdtempSync(join(tmpdir(), "tesselate-omp-fixture-"));
   const previousPath = process.env.PATH;
   const previousRepo = process.env.FIXTURE_REPO;
@@ -125,17 +130,23 @@ export async function runSmoke(): Promise<void> {
   const previousCrash = process.env.FIXTURE_FAIL_AFTER_RUN_CREATE;
   const previousIssueCrash = process.env.FIXTURE_FAIL_AFTER_CODER_ISSUE;
   const previousCaptureCrash = process.env.FIXTURE_FAIL_AFTER_CAPTURE;
+  const previousTracked = process.env.FIXTURE_TRACK_IGNORED;
   try {
     const home = join(root, "home"), workspace_root = join(home, "Development"), repo = join(workspace_root, "sample"), state_dir = join(workspace_root, ".tesselate");
     const ext = join(home, ".omp", "agent", "extensions");
     mkdirSync(repo, { recursive: true }); mkdirSync(ext, { recursive: true }); mkdirSync(state_dir, { recursive: true });
     execFileSync("git", ["init", "-q", "-b", "main", repo]);
     writeFileSync(join(repo, "README.md"), "starting point\n");
-    git(repo, "add", "README.md");
+    writeFileSync(join(repo, ".gitignore"), ".env*\n/packages/content/.revisions/\n");
+    git(repo, "add", "README.md", ".gitignore");
     git(repo, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "Base");
     const mainHead = git(repo, "rev-parse", "main");
+    writeFileSync(join(repo, ".env"), "fixture-secret=not-for-reviewers\n", { mode: 0o600 });
+    mkdirSync(join(repo, "packages/content/.revisions"), { recursive: true });
+    writeFileSync(join(repo, "packages/content/.revisions/snapshot.json"), "{\"id\":1}\n");
     const bin = join(root, "bin"); mkdirSync(bin);
     const binary = join(bin, "tesselate");
+    if (trackIgnored) process.env.FIXTURE_TRACK_IGNORED = "1";
     writeFileSync(binary, fakeCli, { mode: 0o755 });
     writeFileSync(join(bin, "omp"), fakeOmp, { mode: 0o755 });
     process.env.PATH = bin + ":" + previousPath;
@@ -144,6 +155,12 @@ export async function runSmoke(): Promise<void> {
     writeFileSync(supervisor_credential_file, "supervisor-token", { mode: 0o600 });
     copyFileSync(join(import.meta.dir, "tesselate.ts"), join(ext, "tesselate.ts"));
     writeFileSync(join(ext, "tesselate.config.json"), JSON.stringify({ binary, state_dir, workspace_root, supervisor_credential_file }), { mode: 0o600 });
+    const canonicalRepo = realpathSync(repo);
+    const policyDir = join(state_dir, "projects", createHash("sha256").update(canonicalRepo).digest("hex"));
+    mkdirSync(policyDir, { recursive: true, mode: 0o700 });
+    writeFileSync(join(policyDir, "omp-provisioning.json"), JSON.stringify({
+      version: 1, repository: canonicalRepo, integration: { copy: [".env", ".env.local", "packages/content/.revisions"] }
+    }), { mode: 0o600 });
     const extension = (await import(pathToFileURL(join(ext, "tesselate.ts")).href)).default;
     let inputHandler: (event: { text: string; source: string }, ctx: unknown) => Promise<unknown> = async () => undefined;
     let tool: { execute: (...args: unknown[]) => Promise<{ content: Array<{ text: string }> }> } | undefined;
@@ -182,6 +199,7 @@ export async function runSmoke(): Promise<void> {
     } });
     assert.match(interrupted.content[0].text, /paused/);
     assert.match(confirmations[0], /Validation in the integration worktree: git diff --exit-code HEAD -- README\.md/);
+    assert.ok(confirmations.some(question => /Copy Git-ignored local paths into the integration worktree only/.test(question) && /Missing optional: .env.local/.test(question)));
     assert.ok(existsSync(join(state_dir, "omp-runs", "intents")), interrupted.content[0].text);
     assert.equal(readdirSync(join(state_dir, "omp-runs", "intents")).length, 1);
     delete process.env.FIXTURE_FAIL_AFTER_RUN_CREATE;
@@ -193,20 +211,39 @@ export async function runSmoke(): Promise<void> {
     await assert.rejects(startFeature(config, repo, spec, ui));
     delete process.env.FIXTURE_FAIL_AFTER_CODER_ISSUE;
     process.env.FIXTURE_FAIL_AFTER_CAPTURE = "1";
-    await assert.rejects(startFeature(config, repo, spec, ui));
-    assert.equal(readFileSync(join(state_dir, "worker-launches.jsonl"), "utf8").trim().split("\n").length, 1);
+    const secondFailure = await startFeature(config, repo, spec, ui).then(() => undefined, (error: Error) => error);
+    const interruptedRun = JSON.parse(readFileSync(join(state_dir, "fixture-db.json"), "utf8")).run.id;
+    const interruptedRecord = JSON.parse(readFileSync(join(state_dir, "omp-runs", interruptedRun, "record.json"), "utf8"));
+    const workerLog = join(state_dir, "worker-launches.jsonl");
+    assert.ok(existsSync(workerLog), secondFailure?.message ?? interruptedRecord.error);
+    assert.equal(readFileSync(workerLog, "utf8").trim().split("\n").length, 1);
+    const integrationEnv = join(state_dir, "omp-runs", interruptedRun, "integration", ".env");
+    assert.equal(readFileSync(integrationEnv, "utf8"), "fixture-secret=not-for-reviewers\n");
+    writeFileSync(integrationEnv, "modified locally\n");
+    await assert.rejects(startFeature(config, repo, spec, ui), /Existing provisioned file differs/);
+    writeFileSync(integrationEnv, "fixture-secret=not-for-reviewers\n");
     delete process.env.FIXTURE_FAIL_AFTER_CAPTURE;
+    if (trackIgnored) {
+      await assert.rejects(startFeature(config, repo, spec, ui), /Reviewed commits track a provisioned local path/);
+      assert.equal(readFileSync(integrationEnv, "utf8"), "fixture-secret=not-for-reviewers\n");
+      assert.equal(git(join(state_dir, "omp-runs", interruptedRun, "integration"), "rev-parse", "HEAD"), mainHead);
+      return;
+    }
     const completed = await startFeature(config, repo, spec, ui);
     assert.equal(completed.phase, "done");
     const record = JSON.parse(readFileSync(join(state_dir, "omp-runs", completed.run_id, "record.json"), "utf8"));
     assert.equal(record.phase, "done");
     assert.equal(git(repo, "rev-parse", "main"), mainHead);
     assert.equal(git(record.integration_dir, "rev-parse", "HEAD"), record.last_head);
+    assert.equal(statSync(integrationEnv).mode & 0o077, 0);
+    assert.equal(readFileSync(join(record.integration_dir, "packages/content/.revisions/snapshot.json"), "utf8"), "{\"id\":1}\n");
+    assert.doesNotMatch(readFileSync(join(state_dir, "omp-runs", completed.run_id, "record.json"), "utf8"), /fixture-secret/);
     const launches = readFileSync(join(state_dir, "worker-launches.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
     assert.deepEqual(launches.map(item => item.role), ["coder", "reviewer", "reviewer", "coder", "reviewer", "reviewer"]);
     assert.notEqual(launches[0].cwd, launches[3].cwd);
     assert.equal(launches[3].cwd, record.workspace_dir);
     assert.ok(launches.filter(item => item.role === "reviewer").every(item => item.readOnly && item.cwd !== record.workspace_dir && item.workerEnv === "1"));
+    assert.ok(launches.every(item => !existsSync(join(item.cwd, ".env")) && !existsSync(join(item.cwd, "packages/content/.revisions"))));
     const database = JSON.parse(readFileSync(join(state_dir, "fixture-db.json"), "utf8"));
     assert.equal(database.rounds.length, 2);
     assert.equal(database.dispositions[0].disposition, "fixed");
@@ -225,6 +262,7 @@ export async function runSmoke(): Promise<void> {
     if (previousCrash === undefined) delete process.env.FIXTURE_FAIL_AFTER_RUN_CREATE; else process.env.FIXTURE_FAIL_AFTER_RUN_CREATE = previousCrash;
     if (previousIssueCrash === undefined) delete process.env.FIXTURE_FAIL_AFTER_CODER_ISSUE; else process.env.FIXTURE_FAIL_AFTER_CODER_ISSUE = previousIssueCrash;
     if (previousCaptureCrash === undefined) delete process.env.FIXTURE_FAIL_AFTER_CAPTURE; else process.env.FIXTURE_FAIL_AFTER_CAPTURE = previousCaptureCrash;
+    if (previousTracked === undefined) delete process.env.FIXTURE_TRACK_IGNORED; else process.env.FIXTURE_TRACK_IGNORED = previousTracked;
     rmSync(root, { recursive: true, force: true });
   }
 }

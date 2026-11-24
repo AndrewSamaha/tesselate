@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { closeSync, existsSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { closeSync, constants, existsSync, fstatSync, linkSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, readSync, renameSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
+import type { Stats } from "node:fs";
 import { dirname, isAbsolute, join, relative } from "node:path";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 
@@ -15,6 +16,7 @@ type RoundState = { id: string; round: number };
 type WorkspaceState = { id: string; path: string };
 type CredentialState = { actor_id: string; session_id: string; credential_file: string | null };
 type Page<T> = { items: T[]; next_cursor: string | null };
+type Provisioning = { copy: string[]; directories: string[]; files: Array<{ path: string; sha256: string; size: number }>; complete: boolean };
 type RunRecord = {
   version: 1; project_id: string; repository_id: string; repository: string; run_id: string; task_id: string;
   base: string; base_branch: string; branch: string; integration_dir: string; workspace_id: string;
@@ -23,6 +25,7 @@ type RunRecord = {
   round: number; last_head?: string; commit_refs?: Array<{ repository_id: string; commit_id: string }>;
   round_id?: string; previous_finding_ids: string[]; workers: Record<string, Worker>;
   validation_log?: string; validation_attempts?: number; validation_passed?: boolean; error?: string;
+  provisioning?: Provisioning;
 };
 type RunIntent = { version: 1; repository: string; project_id: string; repository_id: string; spec: Spec; base: string; key: string; supervisor_credential_file: string; run_id?: string };
 type UIOps = { input(question: string): Promise<string | undefined>; select(question: string, choices: string[]): Promise<string | undefined>; confirm(question: string): Promise<boolean>; notify(message: string, level: "info" | "warning" | "error"): void };
@@ -417,10 +420,16 @@ async function supervise(config: Config, record: RunRecord): Promise<RunRecord> 
       } else if (record.phase === "integrating") {
         if (await git(record.integration_dir, "rev-parse", "--abbrev-ref", "HEAD") !== record.branch) throw new Error("Integration branch changed; refuse merge.");
         const head = await git(record.integration_dir, "rev-parse", "HEAD");
+        for (const path of record.provisioning?.copy ?? []) {
+          if (await git(record.repository, "ls-tree", "-r", "--name-only", record.last_head!, "--", path)) {
+            throw new Error(`Reviewed commits track a provisioned local path; refuse integration: ${path}`);
+          }
+        }
         if (head === record.base) {
           if (await git(record.integration_dir, "status", "--porcelain")) throw new Error("Integration checkout dirty; refuse merge.");
           await git(record.integration_dir, "merge", "--ff-only", record.last_head!);
         } else if (head !== record.last_head) throw new Error("Integration branch changed unexpectedly; refuse merge.");
+        await verifyProvisioningIgnored(record);
         await validate(record, config);
         if (await git(record.integration_dir, "rev-parse", "--abbrev-ref", "HEAD") !== record.branch ||
             await git(record.integration_dir, "rev-parse", "HEAD") !== record.last_head ||
@@ -517,6 +526,180 @@ async function createRun(config: Config, repo: string, requested: Spec): Promise
   return record;
 }
 
+function relativeCopyPath(path: string): boolean {
+  return path.length > 0 && !isAbsolute(path) && !/[\\\x00-\x1f]/.test(path) &&
+    path.split("/").every(part => part !== "" && part !== "." && part !== ".." && part !== ".git");
+}
+function provisioningPolicy(config: Config, repo: string): string[] {
+  const digest = createHash("sha256").update(repo).digest("hex");
+  const path = join(config.state_dir, "projects", digest, "omp-provisioning.json");
+  const metadata = lstatSync(path, { throwIfNoEntry: false });
+  if (!metadata) return [];
+  if (!metadata.isFile() || metadata.mode & 0o077 || (process.getuid && metadata.uid !== process.getuid())) {
+    throw new Error(`Provisioning policy is not an owner-only regular file: ${path}`);
+  }
+  const policy = JSON.parse(readFileSync(path, "utf8")) as { version: number; repository: string; integration?: { copy?: unknown } };
+  const copy = policy.integration?.copy;
+  if (policy.version !== 1 || policy.repository !== repo || !Array.isArray(copy) || !copy.length ||
+      copy.some(item => typeof item !== "string" || !relativeCopyPath(item)) ||
+      copy.some((item, index) => copy.slice(0, index).some(other => item === other || item.startsWith(`${other}/`) || other.startsWith(`${item}/`)))) {
+    throw new Error(`Invalid integration-only provisioning policy: ${path}`);
+  }
+  return copy as string[];
+}
+function checkedSource(repo: string, relativePath: string): Stats | undefined {
+  let path = repo;
+  let metadata: Stats | undefined;
+  for (const part of relativePath.split("/")) {
+    path = join(path, part);
+    metadata = lstatSync(path, { throwIfNoEntry: false });
+    if (!metadata) return undefined;
+    if (metadata.isSymbolicLink() || (!metadata.isFile() && !metadata.isDirectory())) {
+      throw new Error(`Provisioning source must be a regular file or directory without symlinks: ${relativePath}`);
+    }
+  }
+  return metadata;
+}
+function fileDigest(path: string): { sha256: string; size: number } {
+  const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+  try {
+    if (!fstatSync(fd).isFile()) throw new Error(`Provisioning source is not a regular file: ${path}`);
+    const hash = createHash("sha256"), buffer = Buffer.allocUnsafe(64 * 1024);
+    let size = 0, count: number;
+    while ((count = readSync(fd, buffer, 0, buffer.length, null)) > 0) {
+      hash.update(buffer.subarray(0, count)); size += count;
+    }
+    return { sha256: hash.digest("hex"), size };
+  } finally { closeSync(fd); }
+}
+function destinationDirectory(root: string, relativePath: string): void {
+  let path = root;
+  const rootMetadata = lstatSync(root);
+  if (!rootMetadata.isDirectory() || rootMetadata.isSymbolicLink()) throw new Error(`Integration checkout is not a directory: ${root}`);
+  for (const part of relativePath.split("/")) {
+    path = join(path, part);
+    let metadata = lstatSync(path, { throwIfNoEntry: false });
+    if (!metadata) {
+      mkdirSync(path, { mode: 0o700 });
+      metadata = lstatSync(path);
+    }
+    if (!metadata.isDirectory() || metadata.isSymbolicLink()) throw new Error(`Provisioning destination is not a directory: ${path}`);
+  }
+}
+function copyPrivateFile(source: string, destination: string, expected: { sha256: string; size: number }): void {
+  const existing = lstatSync(destination, { throwIfNoEntry: false });
+  if (existing) {
+    if (!existing.isFile() || existing.mode & 0o077 ||
+        fileDigest(destination).sha256 !== expected.sha256 || existing.size !== expected.size) {
+      throw new Error(`Existing provisioned file differs; preserve it and reconcile manually: ${destination}`);
+    }
+    return;
+  }
+  const temporary = `${destination}.tesselate-${randomUUID()}.tmp`;
+  const input = openSync(source, constants.O_RDONLY | constants.O_NOFOLLOW);
+  try {
+    if (!fstatSync(input).isFile()) throw new Error(`Provisioning source is not a regular file: ${source}`);
+    const output = openSync(temporary, "wx", 0o600);
+    try {
+      const hash = createHash("sha256"), buffer = Buffer.allocUnsafe(64 * 1024);
+      let size = 0, count: number;
+      while ((count = readSync(input, buffer, 0, buffer.length, null)) > 0) {
+        hash.update(buffer.subarray(0, count)); size += count;
+        for (let offset = 0; offset < count;) offset += writeSync(output, buffer, offset, count - offset);
+      }
+      if (size !== expected.size || hash.digest("hex") !== expected.sha256) {
+        throw new Error(`Provisioning source changed during copy; preserve run for inspection: ${source}`);
+      }
+    } finally { closeSync(output); }
+    linkSync(temporary, destination); // Exclusive publication; never replace an existing file.
+  } finally {
+    closeSync(input);
+    if (lstatSync(temporary, { throwIfNoEntry: false })) unlinkSync(temporary);
+  }
+}
+async function approveProvisioning(config: Config, repo: string, ui: UIOps): Promise<string[]> {
+  const copy = provisioningPolicy(config, repo);
+  if (!copy.length) return copy;
+  const present = copy.filter(path => checkedSource(repo, path));
+  const missing = copy.filter(path => !present.includes(path));
+  if (!await ui.confirm(`Copy Git-ignored local paths into the integration worktree only (never coder/reviewer worktrees)? Present: ${present.join(", ") || "none"}. Missing optional: ${missing.join(", ") || "none"}. No secrets will be printed or committed.`)) {
+    throw new Error("Integration-only file provisioning was not approved; no run started.");
+  }
+  return copy;
+}
+async function provisionRun(config: Config, record: RunRecord, ui: UIOps, approved?: string[]): Promise<void> {
+  if (!record.provisioning) {
+    const copy = approved ?? await approveProvisioning(config, record.repository, ui);
+    if (!copy.length) return;
+    const directories: string[] = [], files: Provisioning["files"] = [];
+    const collect = (name: string): void => {
+      const metadata = checkedSource(record.repository, name);
+      if (!metadata) return; // Missing configured paths are optional.
+      if (metadata.isDirectory()) {
+        directories.push(name);
+        for (const child of readdirSync(join(record.repository, name)).sort()) collect(`${name}/${child}`);
+      } else {
+        files.push({ path: name, ...fileDigest(join(record.repository, name)) });
+      }
+    };
+    for (const path of copy) {
+      const source = checkedSource(record.repository, path);
+      const ignoredPath = source?.isDirectory() ? `${path}/` : path;
+      try { await git(record.integration_dir, "check-ignore", "-q", "--", ignoredPath); }
+      catch {
+        if (source) throw new Error(`Provisioning path is not ignored in the integration checkout: ${path}`);
+        try { await git(record.integration_dir, "check-ignore", "-q", "--", `${path}/`); }
+        catch { throw new Error(`Provisioning path is not ignored in the integration checkout: ${path}`); }
+      }
+      if (await git(record.integration_dir, "ls-files", "--", path)) {
+        throw new Error(`Provisioning path contains tracked files: ${path}`);
+      }
+      collect(path);
+    }
+    record.provisioning = { copy, directories, files, complete: false };
+    save(record, config); // Snapshot hashes before any file copy for crash-safe replay.
+  }
+  const snapshot = record.provisioning;
+  if (snapshot.copy.some(path => !relativeCopyPath(path))) throw new Error("Provisioning snapshot has an unsafe configured path.");
+  for (const file of snapshot.files) {
+    if (!relativeCopyPath(file.path)) throw new Error("Provisioning snapshot has an unsafe path.");
+    if (!snapshot.complete) {
+      checkedSource(record.repository, file.path);
+      const current = fileDigest(join(record.repository, file.path));
+      if (current.sha256 !== file.sha256 || current.size !== file.size) {
+        throw new Error(`Provisioning source changed after approval; preserve the run: ${file.path}`);
+      }
+    }
+  }
+  for (const directory of snapshot.directories) {
+    if (!relativeCopyPath(directory)) throw new Error("Provisioning snapshot has an unsafe directory.");
+    destinationDirectory(record.integration_dir, directory);
+  }
+  for (const file of snapshot.files) {
+    const parent = file.path.split("/").slice(0, -1).join("/");
+    if (parent) destinationDirectory(record.integration_dir, parent);
+    const destination = join(record.integration_dir, file.path);
+    if (snapshot.complete && !lstatSync(destination, { throwIfNoEntry: false })) {
+      throw new Error(`Provisioned file is missing; preserve the run for inspection: ${destination}`);
+    }
+    copyPrivateFile(join(record.repository, file.path), destination, file);
+  }
+  if (!snapshot.complete) {
+    snapshot.complete = true; save(record, config);
+    ui.notify(`Integration-only provisioning completed for ${snapshot.files.length} local file(s).`, "info");
+  }
+}
+async function verifyProvisioningIgnored(record: RunRecord): Promise<void> {
+  for (const path of record.provisioning?.copy ?? []) {
+    if (!record.provisioning?.files.some(file => file.path === path || file.path.startsWith(`${path}/`)) &&
+        !record.provisioning?.directories.includes(path)) continue;
+    try {
+      await git(record.integration_dir, "check-ignore", "-q", "--", path);
+      if (await git(record.integration_dir, "ls-files", "--", path)) throw new Error("tracked contents");
+    } catch { throw new Error(`Provisioned path is no longer fully ignored after integration: ${path}`); }
+  }
+}
+
 // Exported for a deterministic, no-model smoke fixture. Production uses the same path.
 export async function startFeature(config: Config, cwd: string, spec: Spec, ui: UIOps): Promise<RunRecord> {
   const repo = await repoFor(cwd, config);
@@ -524,7 +707,9 @@ export async function startFeature(config: Config, cwd: string, spec: Spec, ui: 
   if (pendingIntent) {
     if (!await ui.confirm(`Resume interrupted Tesselate run setup for ${pendingIntent.spec.goal}?`)) throw new Error("Pending run setup left untouched.");
     const record = await createRun(config, repo, pendingIntent.spec);
-    return record.phase === "done" ? record : supervise(config, record);
+    if (record.phase === "done") return record;
+    await provisionRun(config, record, ui);
+    return supervise(config, record);
   }
   if (!spec.goal.trim() || !spec.acceptance_criteria.trim()) throw new Error("Goal and acceptance criteria are required.");
   if (!spec.validation_command.trim()) throw new Error("Choose an explicit integration-only validation command before starting.");
@@ -539,6 +724,7 @@ export async function startFeature(config: Config, cwd: string, spec: Spec, ui: 
     if (match) {
       const record = match.record!;
       if (record.phase === "done") return record;
+      await provisionRun(config, record, ui);
       if (record.phase === "integrating" && record.validation_log && !record.validation_passed) {
         if (!await ui.confirm(`Prior integration validation may have failed or been interrupted. Inspect ${record.validation_log}; retry the same approved command on ${record.integration_dir}?`)) {
           throw new Error(`Validation not retried; inspect ${record.validation_log}.`);
@@ -550,13 +736,11 @@ export async function startFeature(config: Config, cwd: string, spec: Spec, ui: 
   }
   const base = await selectBase(repo, ui);
   spec.base_branch = base.branch;
-  if (repo.endsWith("/bitwars") && !await ui.confirm("Bitwars requires integration-only provisioning of ignored .env and packages/content/.revisions. No secrets will be copied automatically. Continue?")) {
-    throw new Error("Bitwars prerequisites not approved.");
-  }
+  const approved = await approveProvisioning(config, repo, ui);
   if (!await ui.confirm(`Start Tesselate feature on ${base.branch}@${base.base.slice(0, 12)}? No push or main merge will occur.`)) throw new Error("Feature start cancelled.");
   if (await git(repo, "rev-parse", "--verify", `${base.branch}^{commit}`) !== base.base) throw new Error("Selected base moved; restart feature setup.");
   const record = await createRun(config, repo, spec);
-  if (repo.endsWith("/bitwars")) ui.notify(`Integration checkout: ${record.integration_dir}. Provision ignored .env and packages/content/.revisions manually there if approved validation needs them; no automatic copy.`, "warning");
+  await provisionRun(config, record, ui, approved);
   return supervise(config, record);
 }
 

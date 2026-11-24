@@ -52,7 +52,7 @@ impl Cli {
             Command::Install { .. }
                 | Command::Uninstall { .. }
                 | Command::Project {
-                    action: ProjectAction::Ensure { .. }
+                    action: ProjectAction::Ensure { .. } | ProjectAction::Provision { .. }
                 }
         ) {
             return Ok(omp_install::workspace_root()?.join(".tesselate"));
@@ -148,6 +148,16 @@ pub enum ProjectAction {
     Ensure {
         #[arg(long)]
         repo: PathBuf,
+    },
+    /// Configure ignored local files copied only to OMP integration worktrees.
+    Provision {
+        #[arg(long)]
+        repo: PathBuf,
+        #[arg(long = "copy", required = true)]
+        copy: Vec<PathBuf>,
+        /// Explicitly replace an existing, different file policy.
+        #[arg(long)]
+        replace: bool,
     },
     Register {
         #[arg(long)]
@@ -351,6 +361,9 @@ pub fn execute(
             }
             ProjectAction::Ensure { repo } => {
                 ensure_project(app, state_dir, credential_file, &repo)
+            }
+            ProjectAction::Provision { repo, copy, replace } => {
+                omp_install::provision_project(app, state_dir, credential_file, &repo, &copy, replace)
             }
         },
         Command::Inspect { query } => {

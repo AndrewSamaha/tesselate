@@ -44,6 +44,20 @@ struct Manifest {
     files: Vec<OwnedFile>,
 }
 
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct ProvisioningPolicy {
+    version: u8,
+    repository: String,
+    integration: IntegrationFiles,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct IntegrationFiles {
+    copy: Vec<String>,
+}
+
 fn home() -> Result<PathBuf, CliError> {
     let home = env::var_os("HOME").ok_or_else(|| CoreError::Invalid("HOME is required for OMP integration".into()))?;
     Ok(fs::canonicalize(home)?)
@@ -397,6 +411,67 @@ fn ensure_project_with_workspace(app: &Application, state: &Path, credential: Op
         .ok_or_else(|| CoreError::Internal("registered repository was not found".into()))?;
     Ok(json!({"project_id": registered.value.id, "repository_id": found.id, "canonical_path": path}))
 }
+pub(super) fn provision_project(app: &Application, state: &Path, credential: Option<&Path>, repo: &Path, copy: &[PathBuf], replace: bool) -> Result<Value, CliError> {
+    let workspace = fs::canonicalize(configured_workspace_root(state)?)?;
+    provision_project_with_workspace(app, state, credential, repo, copy, replace, &workspace)
+}
+
+fn provision_project_with_workspace(app: &Application, state: &Path, credential: Option<&Path>, repo: &Path, copy: &[PathBuf], replace: bool, workspace: &Path) -> Result<Value, CliError> {
+    let ensured = ensure_project_with_workspace(app, state, credential, repo, workspace)?;
+    let repository = ensured["canonical_path"].as_str().ok_or_else(|| CoreError::Internal("project ensure returned no canonical path".into()))?;
+    let mut paths = Vec::with_capacity(copy.len());
+    for source in copy {
+        let name = source.to_str().ok_or_else(|| CoreError::Invalid("copy paths must be UTF-8".into()))?;
+        if name.is_empty() || name.chars().any(char::is_control) || name.contains('\\') ||
+            !name.split('/').all(|part| !part.is_empty() && part != "." && part != ".." && part != ".git") ||
+            source.components().any(|component| !matches!(component, std::path::Component::Normal(_))) {
+            return Err(CoreError::Invalid(format!("copy path must be a safe relative path: {name:?}")).into());
+        }
+        if paths.iter().any(|prior: &String| {
+            Path::new(prior).starts_with(source) || source.starts_with(prior)
+        }) {
+            return Err(CoreError::Invalid(format!("duplicate or nested copy path: {name:?}")).into());
+        }
+        let ignored = Command::new("git").arg("-C").arg(repository).args(["check-ignore", "-q", "--"]).arg(source).status()?;
+        let directory_ignored = if ignored.success() { true } else {
+            Command::new("git").arg("-C").arg(repository).args(["check-ignore", "-q", "--"])
+                .arg(format!("{name}/")).status()?.success()
+        };
+        if !directory_ignored {
+            return Err(CoreError::Invalid(format!("copy path is not Git-ignored: {name:?}")).into());
+        }
+        let tracked = Command::new("git").arg("-C").arg(repository).args(["ls-files", "--"]).arg(source).output()?;
+        if !tracked.status.success() || !tracked.stdout.is_empty() {
+            return Err(CoreError::Invalid(format!("copy path contains tracked files: {name:?}")).into());
+        }
+        paths.push(name.to_owned());
+    }
+    if paths.is_empty() { return Err(CoreError::Invalid("at least one --copy path is required".into()).into()); }
+    let policy = ProvisioningPolicy { version: 1, repository: repository.to_owned(), integration: IntegrationFiles { copy: paths } };
+    let project_dir = state.join("projects").join(digest(repository.as_bytes()));
+    create_directory(&project_dir)?;
+    let path = project_dir.join("omp-provisioning.json");
+    let content = serde_json::to_vec_pretty(&policy)?;
+    if let Some(existing) = existing_file(&path)? {
+        #[cfg(unix)] {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            let metadata = fs::symlink_metadata(&path)?;
+            if metadata.permissions().mode() & 0o077 != 0 || metadata.uid() != unsafe { libc::geteuid() } {
+                return Err(CoreError::Invalid("provisioning policy must be owned by the current user and mode 0600".into()).into());
+            }
+        }
+        let prior: ProvisioningPolicy = serde_json::from_slice(&existing)?;
+        if prior == policy { return Ok(json!({"config_path": path, "repository": repository, "integration": policy.integration})); }
+        if !replace || prior.repository != repository || prior.version != 1 {
+            return Err(CoreError::Invalid(format!("provisioning policy differs at {}; pass --replace to change the copy list", path.display())).into());
+        }
+        atomic_private_file(&path, &content)?;
+    } else {
+        private_file(&path, &content)?;
+    }
+    Ok(json!({"config_path": path, "repository": repository, "integration": policy.integration}))
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -491,5 +566,36 @@ mod tests {
         assert_eq!(first["canonical_path"], json!(repo));
         assert!(!repo.join(".tesselate").exists());
         assert!(state.join("projects").is_dir());
+    }
+    #[test]
+    fn provision_policy_is_private_idempotent_and_requires_explicit_replacement() {
+        let fixture = Fixture::new();
+        let (app, state, credential) = fixture.app();
+        let workspace = fixture.0.join("Development");
+        let repo = workspace.join("example");
+        fs::create_dir_all(&repo).unwrap();
+        assert!(Command::new("git").arg("init").arg("--quiet").arg(&repo).status().unwrap().success());
+        fs::write(repo.join(".gitignore"), ".env*\n/cache/\n").unwrap();
+        let copy = [PathBuf::from(".env"), PathBuf::from("cache")];
+        let first = provision_project_with_workspace(&app, &state, Some(&credential), &repo, &copy, false, &workspace).unwrap();
+        assert_eq!(first, provision_project_with_workspace(&app, &state, Some(&credential), &repo, &copy, false, &workspace).unwrap());
+        let policy_path = PathBuf::from(first["config_path"].as_str().unwrap());
+        let policy: ProvisioningPolicy = serde_json::from_slice(&fs::read(&policy_path).unwrap()).unwrap();
+        assert_eq!(policy.repository, repo.to_str().unwrap());
+        assert_eq!(policy.integration.copy, vec![".env", "cache"]);
+        #[cfg(unix)] {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(fs::metadata(&policy_path).unwrap().permissions().mode() & 0o077, 0);
+        }
+        for invalid in ["../outside", ".git/config", ".gitignore", ".env/../child", ".env"] {
+            let entries = if invalid == ".env" { vec![PathBuf::from(".env"), PathBuf::from(".env")] }
+                else { vec![PathBuf::from(invalid)] };
+            assert!(provision_project_with_workspace(&app, &state, Some(&credential), &repo, &entries, true, &workspace).is_err(), "{invalid}");
+        }
+        let revised = [PathBuf::from(".env.local")];
+        assert!(provision_project_with_workspace(&app, &state, Some(&credential), &repo, &revised, false, &workspace).is_err());
+        let replaced = provision_project_with_workspace(&app, &state, Some(&credential), &repo, &revised, true, &workspace).unwrap();
+        assert_eq!(replaced["integration"]["copy"], json!([".env.local"]));
+        assert_eq!(serde_json::from_slice::<ProvisioningPolicy>(&fs::read(&policy_path).unwrap()).unwrap().integration.copy, vec![".env.local"]);
     }
 }
