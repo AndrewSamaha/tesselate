@@ -247,7 +247,7 @@ impl GitWorkspaceManager {
         }
     }
 
-    /// Read-only inspection of the current worktree HEAD and working-tree status.
+    /// Read-only inspection: capture readiness excludes ignored files, while cleanup cleanliness includes them.
     pub fn inspect_workspace(
         &self,
         ctx: &SessionContext,
@@ -271,6 +271,7 @@ impl GitWorkspaceManager {
                 "workspace does not match its recorded repository, path, or branch".into(),
             ));
         }
+        let capture_ready = self.capture_ready(&path, &observed)?;
         Ok(WorkspaceInspection {
             head: CommitRef {
                 repository_id: workspace.repository_id,
@@ -279,6 +280,7 @@ impl GitWorkspaceManager {
                     .clone()
                     .ok_or_else(|| CoreError::Recoverable("worktree HEAD is unavailable".into()))?,
             },
+            capture_ready,
             clean: observed.clean.unwrap_or(false),
             changed_paths: self.changed_paths(&path)?,
             workspace,
@@ -321,6 +323,11 @@ impl GitWorkspaceManager {
         if observed.head_commit.as_deref() != Some(expected.as_str()) {
             return Err(CoreError::Recoverable(
                 "workspace HEAD changed; inspect and retry with the observed head".into(),
+            ));
+        }
+        if !self.capture_ready(&path, &observed)? {
+            return Err(CoreError::Recoverable(
+                "workspace has uncommitted or non-ignored untracked files; capture refused".into(),
             ));
         }
         self.ensure_ancestor(&repo, &workspace.base_commit, &expected)?;
@@ -1220,6 +1227,16 @@ impl GitWorkspaceManager {
         observed.repository_path == intent.canonical_repository_path
             && observed.worktree_path == intent.worktree_path
             && observed.branch.as_deref() == Some(intent.branch.as_str())
+    }
+
+    fn capture_ready(&self, path: &Path, observed: &ObservedGitState) -> CoreResult<bool> {
+        if observed.clean == Some(true) { return Ok(true); }
+        let top = self.git_output(path, ["rev-parse", "--show-toplevel"])?;
+        if fs::canonicalize(String::from_utf8_lossy(&top.stdout).trim()).map_err(io_error)? != path {
+            return Ok(false);
+        }
+        let status = self.git(path, ["status", "--porcelain=v1", "-z", "--untracked-files=all"])?;
+        Ok(status.stdout.is_empty())
     }
 
     fn changed_paths(&self, path: &Path) -> CoreResult<Vec<String>> {

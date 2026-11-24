@@ -450,6 +450,9 @@ pub struct InspectWorkspace {
 pub struct WorkspaceInspection {
     pub workspace: Workspace,
     pub head: CommitRef,
+    /// True when committed work can be captured: ignored local files do not block it.
+    pub capture_ready: bool,
+    /// Strict worktree cleanliness, including ignored files, for safe deletion.
     pub clean: bool,
     pub changed_paths: Vec<String>,
 }

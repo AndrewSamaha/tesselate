@@ -268,7 +268,7 @@ fn fixture(repo_count: usize) -> Fixture {
         git(&path, ["config", "user.name", "Test Author"]);
         git(&path, ["config", "user.email", "test@example.invalid"]);
         fs::write(path.join("README.md"), format!("repo {n}\n")).unwrap();
-        fs::write(path.join(".gitignore"), "ignored.txt\n").unwrap();
+        fs::write(path.join(".gitignore"), "ignored.txt\ntarget/\n.workmux-local/\n").unwrap();
         git(&path, ["add", "README.md", ".gitignore"]);
         git(&path, ["commit", "-m", "initial"]);
         let base = output(&path, ["rev-parse", "HEAD"]);
@@ -866,6 +866,7 @@ fn multiple_repositories_are_idempotent_capture_commits_and_refuse_dirty_cleanup
             },
         )
         .unwrap();
+    assert!(inspection.capture_ready);
     assert!(inspection.clean);
     let capture = CaptureWorkspaceCommits {
         workspace_id: workspace.id,
@@ -902,6 +903,10 @@ fn multiple_repositories_are_idempotent_capture_commits_and_refuse_dirty_cleanup
         )
         .unwrap()
         .is_some());
+    fs::create_dir_all(worktree.join("target/debug")).unwrap();
+    fs::write(worktree.join("target/debug/build-artifact"), "generated").unwrap();
+    fs::create_dir_all(worktree.join(".workmux-local")).unwrap();
+    fs::write(worktree.join(".workmux-local/completion.md"), "handoff").unwrap();
     fs::write(worktree.join("dirty.txt"), "uncommitted").unwrap();
     fs::write(worktree.join("ignored.txt"), "ignored but valuable").unwrap();
     let dirty = f
@@ -914,6 +919,15 @@ fn multiple_repositories_are_idempotent_capture_commits_and_refuse_dirty_cleanup
         )
         .unwrap();
     assert!(!dirty.clean);
+    assert!(!dirty.capture_ready);
+    assert!(matches!(
+        f.manager.capture_commit_refs(
+            &f.coder,
+            CaptureWorkspaceCommits { workspace_id: workspace.id, expected_head: inspection.head.commit_id.clone() },
+            IdempotencyKey("capture-untracked".into())
+        ),
+        Err(CoreError::Recoverable(_))
+    ));
     assert!(dirty.changed_paths.contains(&"dirty.txt".into()));
     assert!(dirty.changed_paths.contains(&"ignored.txt".into()));
     assert!(matches!(
@@ -928,6 +942,37 @@ fn multiple_repositories_are_idempotent_capture_commits_and_refuse_dirty_cleanup
     ));
     assert!(worktree.exists());
     fs::remove_file(worktree.join("dirty.txt")).unwrap();
+    let ignored_only = f.manager.inspect_workspace(
+        &f.coder,
+        InspectWorkspace { workspace_id: workspace.id },
+    ).unwrap();
+    assert!(ignored_only.capture_ready);
+    assert!(!ignored_only.clean);
+    assert!(ignored_only.changed_paths.contains(&"ignored.txt".into()));
+    assert_eq!(
+        f.manager.capture_commit_refs(
+            &f.coder,
+            CaptureWorkspaceCommits { workspace_id: workspace.id, expected_head: inspection.head.commit_id.clone() },
+            IdempotencyKey("capture-with-ignored".into())
+        ).unwrap().value.len(),
+        1
+    );
+    assert!(matches!(
+        f.manager.cleanup_workspace(
+            &f.supervisor,
+            CleanupWorkspace { workspace_id: workspace.id },
+            IdempotencyKey("ignored-cleanup".into())
+        ),
+        Err(CoreError::Recoverable(_))
+    ));
+    fs::write(worktree.join("change.txt"), "tracked but not committed").unwrap();
+    assert!(!f.manager.inspect_workspace(
+        &f.coder,
+        InspectWorkspace { workspace_id: workspace.id }
+    ).unwrap().capture_ready);
+    fs::write(worktree.join("change.txt"), "captured change\n").unwrap();
+    fs::remove_dir_all(worktree.join("target")).unwrap();
+    fs::remove_dir_all(worktree.join(".workmux-local")).unwrap();
     fs::remove_file(worktree.join("ignored.txt")).unwrap();
     f.manager
         .cleanup_workspace(

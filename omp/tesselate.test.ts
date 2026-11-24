@@ -67,7 +67,7 @@ else if (command === 'workspaces.request') {
 }
 else if (command === 'workspaces.inspect') {
   const ws=db.workspaces[params.workspace_id], head=git(ws.path,'rev-parse','HEAD');
-  reply({workspace:ws,head:{repository_id:ws.repository_id,commit_id:head},clean:git(ws.path,'status','--porcelain')===''});
+  reply({workspace:ws,head:{repository_id:ws.repository_id,commit_id:head},clean:git(ws.path,'status','--porcelain','--ignored=traditional')==='',capture_ready:git(ws.path,'status','--porcelain')===''});
 }
 else if (command === 'workspaces.commits.capture') {
   const key=opt('--idempotency-key');
@@ -112,6 +112,8 @@ if(role==='coder') {
     cp.execFileSync('git',['-C',cwd,'add','-f','.env']);
   }
   cp.execFileSync('git',['-C',cwd,'-c','user.name=Fixture Coder','-c','user.email=coder@example.invalid','commit','-m','Implement feature round '+round]);
+  fs.mkdirSync(path.join(cwd,'.workmux-local'),{recursive:true});
+  fs.writeFileSync(path.join(cwd,'.workmux-local','completion.md'),'Coder completion handoff\n');
   process.stdout.write('Committed implementation.\n');
 } else if (round===1 && prompt.startsWith('Independent reviewer 1')) {
   process.stdout.write(JSON.stringify({passed:false,summary:'Missing explicit acceptance text',findings:[{severity:'medium',location:'feature.txt:1',evidence:'Expected acceptance phrase absent',proposed_correction:'Include acceptance phrase'}]})+'\n');
@@ -137,7 +139,7 @@ export async function runSmoke(trackIgnored = false): Promise<void> {
     mkdirSync(repo, { recursive: true }); mkdirSync(ext, { recursive: true }); mkdirSync(state_dir, { recursive: true });
     execFileSync("git", ["init", "-q", "-b", "main", repo]);
     writeFileSync(join(repo, "README.md"), "starting point\n");
-    writeFileSync(join(repo, ".gitignore"), ".env*\n/packages/content/.revisions/\n");
+    writeFileSync(join(repo, ".gitignore"), ".env*\n/packages/content/.revisions/\n/.workmux-local/\n");
     git(repo, "add", "README.md", ".gitignore");
     git(repo, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "Base");
     const mainHead = git(repo, "rev-parse", "main");
@@ -244,6 +246,7 @@ export async function runSmoke(trackIgnored = false): Promise<void> {
     assert.equal(launches[3].cwd, record.workspace_dir);
     assert.ok(launches.filter(item => item.role === "reviewer").every(item => item.readOnly && item.cwd !== record.workspace_dir && item.workerEnv === "1"));
     assert.ok(launches.every(item => !existsSync(join(item.cwd, ".env")) && !existsSync(join(item.cwd, "packages/content/.revisions"))));
+    assert.ok(existsSync(join(record.workspace_dir, ".workmux-local", "completion.md")));
     const database = JSON.parse(readFileSync(join(state_dir, "fixture-db.json"), "utf8"));
     assert.equal(database.rounds.length, 2);
     assert.equal(database.dispositions[0].disposition, "fixed");

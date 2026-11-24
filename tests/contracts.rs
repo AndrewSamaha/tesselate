@@ -131,6 +131,7 @@ fn workspace_inspection_and_commit_capture_shapes_are_stable() {
             repository_id: workspace.repository_id,
             commit_id: "head-sha".into(),
         },
+        capture_ready: false,
         clean: false,
         changed_paths: vec!["src/main.rs".into()],
         workspace: workspace.clone(),
@@ -139,6 +140,7 @@ fn workspace_inspection_and_commit_capture_shapes_are_stable() {
     assert_eq!(value["workspace"]["assignment_id"], "assignment-1");
     assert_eq!(value["head"]["commit_id"], "head-sha");
     assert_eq!(value["clean"], false);
+    assert_eq!(value["capture_ready"], false);
     assert_eq!(value["changed_paths"][0], "src/main.rs");
     let capture = CaptureWorkspaceCommits {
         workspace_id: workspace.id,

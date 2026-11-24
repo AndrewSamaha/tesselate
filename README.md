@@ -170,6 +170,12 @@ services in task worktrees. Bitwars' configured ignored files are copied into
 the integration checkout only after approval; absent optional files are skipped.
 No automatic push, PR creation, or merge into local `main`.
 
+Workspace inspection reports both `capture_ready` and `clean`. Committed work
+can be captured when branch/HEAD identity matches and there are no tracked
+changes or non-ignored untracked files; ignored build output and local handoffs
+do not block review. Cleanup remains stricter: `clean` is false while any
+ignored files remain, so deleting a worktree cannot discard local data.
+
 ```sh
 tesselate uninstall omp
 ```

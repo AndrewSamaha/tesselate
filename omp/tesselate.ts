@@ -255,8 +255,8 @@ async function launch(record: RunRecord, config: Config, label: string, role: Wo
   return result;
 }
 async function capture(config: Config, record: RunRecord): Promise<void> {
-  const inspection = await call<{ clean: boolean; workspace: { path: string }; head: { commit_id: string } }>(config, config.supervisor_credential_file, "workspaces.inspect", { workspace_id: record.workspace_id });
-  if (!inspection.clean || inspection.workspace.path !== record.workspace_dir) throw new Error("Coder workspace is dirty or changed identity; preserve it and reconcile manually.");
+  const inspection = await call<{ capture_ready: boolean; workspace: { path: string }; head: { commit_id: string } }>(config, config.supervisor_credential_file, "workspaces.inspect", { workspace_id: record.workspace_id });
+  if (!inspection.capture_ready || inspection.workspace.path !== record.workspace_dir) throw new Error("Coder workspace has uncommitted or non-ignored files, or changed identity; preserve it and reconcile manually.");
   const head = inspection.head.commit_id as string;
   if (head === record.last_head) throw new Error("Coder returned no new committed work; preserve workspace for recovery.");
   await git(record.repository, "merge-base", "--is-ancestor", record.base, head);
