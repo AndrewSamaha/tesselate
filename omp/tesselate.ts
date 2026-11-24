@@ -700,39 +700,64 @@ async function verifyProvisioningIgnored(record: RunRecord): Promise<void> {
   }
 }
 
+async function resumableRuns(config: Config, repo: string): Promise<Array<{ run: RunSummary; record: RunRecord }>> {
+  const ensured = await cli<{ project_id: string }>(config, config.supervisor_credential_file, ["project", "ensure", "--repo", repo]);
+  const runs = await listed<RunSummary>(config, config.supervisor_credential_file, "runs.list", { project_id: ensured.project_id });
+  return runs.filter(run => run.status === "active" || run.status === "completed").flatMap(run => {
+    const record = load(config, run.id);
+    return record?.repository === repo ? [{ run, record }] : [];
+  });
+}
+async function resumeRecord(config: Config, record: RunRecord, ui: UIOps): Promise<RunRecord> {
+  if (record.phase === "done") return record;
+  await provisionRun(config, record, ui);
+  if (record.phase === "integrating" && record.validation_log && !record.validation_passed) {
+    if (!await ui.confirm(`Prior integration validation may have failed or been interrupted. Inspect ${record.validation_log}; retry the same approved command on ${record.integration_dir}?`)) {
+      throw new Error(`Validation not retried; inspect ${record.validation_log}.`);
+    }
+    record.validation_log = undefined; save(record, config);
+  }
+  ui.notify(`Resuming Tesselate run ${record.run_id} on ${record.branch}; no new run will be created.`, "info");
+  return supervise(config, record);
+}
+async function resumeFeature(config: Config, cwd: string, ui: UIOps, requestedId?: string): Promise<RunRecord> {
+  const repo = await chooseRepo(cwd, config, ui);
+  const intent = readIntent(config, repo);
+  if (intent && (!requestedId || requestedId === intent.run_id)) {
+    if (!await ui.confirm(`Resume interrupted Tesselate run setup for ${intent.spec.goal}?`)) throw new Error("Pending run setup left untouched.");
+    return resumeRecord(config, await createRun(config, repo, intent.spec), ui);
+  }
+  const runs = await resumableRuns(config, repo);
+  if (!runs.length) throw new Error(`No resumable Tesselate runs for ${repo}.`);
+  let chosen: { run: RunSummary; record: RunRecord } | undefined;
+  if (requestedId) {
+    chosen = runs.find(item => item.run.id === requestedId);
+  } else {
+    const labels = runs.map(item => `Resume ${item.run.id}: ${item.run.goal.slice(0, 60)}`);
+    const selection = await ui.select("Which Tesselate feature should resume?", labels);
+    if (!selection) throw new Error("Resume cancelled.");
+    chosen = runs[labels.indexOf(selection)];
+  }
+  if (!chosen) throw new Error(`Tesselate run ${requestedId ?? "selection"} was not found for ${repo}.`);
+  return resumeRecord(config, chosen.record, ui);
+}
+
 // Exported for a deterministic, no-model smoke fixture. Production uses the same path.
 export async function startFeature(config: Config, cwd: string, spec: Spec, ui: UIOps): Promise<RunRecord> {
   const repo = await repoFor(cwd, config);
   const pendingIntent = readIntent(config, repo);
   if (pendingIntent) {
     if (!await ui.confirm(`Resume interrupted Tesselate run setup for ${pendingIntent.spec.goal}?`)) throw new Error("Pending run setup left untouched.");
-    const record = await createRun(config, repo, pendingIntent.spec);
-    if (record.phase === "done") return record;
-    await provisionRun(config, record, ui);
-    return supervise(config, record);
+    return resumeRecord(config, await createRun(config, repo, pendingIntent.spec), ui);
   }
   if (!spec.goal.trim() || !spec.acceptance_criteria.trim()) throw new Error("Goal and acceptance criteria are required.");
   if (!spec.validation_command.trim()) throw new Error("Choose an explicit integration-only validation command before starting.");
-  const ensured = await cli<{ project_id: string; repository_id: string; canonical_path: string }>(config, config.supervisor_credential_file, ["project", "ensure", "--repo", repo]);
-  const existingRun = (await listed<RunSummary>(config, config.supervisor_credential_file, "runs.list", { project_id: ensured.project_id }))
-    .filter(r => r.status === "active" || r.status === "completed")
-    .map(r => ({ run: r, record: load(config, r.id) })).filter(item => item.record?.repository === repo);
+  const existingRun = await resumableRuns(config, repo);
   if (existingRun.length) {
     const selected = await ui.select("Resume or inspect an existing feature, or start another run?", [...existingRun.map(x => `Resume ${x.run.id}: ${x.run.goal.slice(0, 60)}`), "Start new run"]);
     if (!selected) throw new Error("No run selected.");
     const match = existingRun.find(x => selected.startsWith(`Resume ${x.run.id}:`));
-    if (match) {
-      const record = match.record!;
-      if (record.phase === "done") return record;
-      await provisionRun(config, record, ui);
-      if (record.phase === "integrating" && record.validation_log && !record.validation_passed) {
-        if (!await ui.confirm(`Prior integration validation may have failed or been interrupted. Inspect ${record.validation_log}; retry the same approved command on ${record.integration_dir}?`)) {
-          throw new Error(`Validation not retried; inspect ${record.validation_log}.`);
-        }
-        record.validation_log = undefined; save(record, config);
-      }
-      return supervise(config, record);
-    }
+    if (match) return resumeRecord(config, match.record, ui);
   }
   const base = await selectBase(repo, ui);
   spec.base_branch = base.branch;
@@ -768,7 +793,19 @@ export default function tesselateExtension(pi: ExtensionAPI): void {
     return { handled: true };
   });
   pi.registerCommand("feature", { description: "Start or resume a Tesselate feature", handler: async (args, ctx) => {
-    const goal = args.trim() || await ctx.ui.input("What feature should Tesselate build?");
+    const request = args.trim();
+    if (request === "resume" || request.startsWith("resume ")) {
+      try {
+        const id = request.slice("resume".length).trim();
+        if (id && !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)) {
+          throw new Error("Use /feature resume or /feature resume <full-run-UUID>.");
+        }
+        const result = await resumeFeature(configured(), ctx.cwd, ctx.ui, id || undefined);
+        ctx.ui.notify(`Tesselate run ${result.run_id}: ${result.phase}. Integration branch ${result.branch}; no push or main merge.`, "info");
+      } catch (error) { ctx.ui.notify(`Tesselate paused: ${cleanError(error)}`, "error"); }
+      return;
+    }
+    const goal = request || await ctx.ui.input("What feature should Tesselate build?");
     if (goal?.trim()) await kickoff(goal.trim(), ctx.cwd, ctx.ui);
   } });
   pi.registerTool({ name: "tesselate_feature_start", label: "Start Tesselate feature", description: "After agreeing on a specification, launch role-separated OMP processes in Tesselate workspaces. Requires a user-initiated /feature or feature input.",
@@ -788,7 +825,7 @@ export default function tesselateExtension(pi: ExtensionAPI): void {
         const result = await startFeature(configured(), request.cwd, { goal: params.goal, acceptance_criteria: params.acceptance_criteria, constraints: params.constraints, validation_command: validation, base_branch: "" }, ctx.ui);
         return { content: [{ type: "text", text: `Tesselate run ${result.run_id}: ${result.phase}. Integration branch ${result.branch}, ${result.integration_dir}. No push or main merge.` }] };
       } catch (error) {
-        return { content: [{ type: "text", text: `Tesselate paused: ${cleanError(error)}. Use /feature to resume after resolving; no push or main merge was attempted.` }], isError: true };
+        return { content: [{ type: "text", text: `Tesselate paused: ${cleanError(error)}. Use /feature resume after resolving; no push or main merge was attempted.` }], isError: true };
       }
     }
   });

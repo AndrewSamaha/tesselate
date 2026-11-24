@@ -134,6 +134,12 @@ plain-language request is ambiguous. To register a repository directly:
 tesselate project ensure --repo ~/Development/bitwars
 ```
 
+For an interrupted run, use `/feature resume` in OMP. It selects an existing
+run for the chosen repository without asking for a new goal, acceptance criteria,
+or validation command; `/feature resume <run-UUID>` targets one run directly.
+The existing provisioning approval and validation-log retry safeguards still
+apply. Restart OMP after `install omp` to load an updated extension.
+
 To opt into copying ignored local files for a repository, configure an
 integration-only policy once. Bitwars' existing `.workmux.yaml` lists these paths:
 

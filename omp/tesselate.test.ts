@@ -167,11 +167,20 @@ export async function runSmoke(trackIgnored = false): Promise<void> {
     let inputHandler: (event: { text: string; source: string }, ctx: unknown) => Promise<unknown> = async () => undefined;
     let tool: { execute: (...args: unknown[]) => Promise<{ content: Array<{ text: string }> }> } | undefined;
     const messages: string[] = [];
+    const notifications: string[] = [];
     const ui = { input: async (question: string) => question.startsWith("Acceptance") ? "feature.txt is committed" : "no shared-service tests",
       select: async (question: string, choices: string[]) => question.startsWith("Which repository") ? "sample" : question.startsWith("Resume") ? choices[0] : "main",
       confirm: async () => true, notify: () => {} };
+    let featureCommand: ((args: string, ctx: { cwd: string; ui: typeof ui }) => Promise<void>) | undefined;
+    const resumeUi = { ...ui, input: async () => { throw new Error("Resume must not ask for a new specification."); },
+      select: async (question: string, choices: string[]) => {
+        if (question.startsWith("Which repository")) return "sample";
+        if (question.startsWith("Which Tesselate feature")) return choices[0];
+        throw new Error(`Unexpected resume selection: ${question}`);
+      }, notify: (message: string) => { notifications.push(message); } };
     const pi = { zod: { object: () => ({}), string: () => ({}) }, on: (event: string, handler: typeof inputHandler) => { if (event === "input") inputHandler = handler; },
-      registerCommand: () => {}, registerTool: (definition: typeof tool) => { tool = definition; },
+      registerCommand: (name: string, definition: { handler: NonNullable<typeof featureCommand> }) => { if (name === "feature") featureCommand = definition.handler; },
+      registerTool: (definition: typeof tool) => { tool = definition; },
       sendUserMessage: (message: string) => { messages.push(message); } };
     // The test intentionally imports the installed extension by its runtime-selected user path.
     extension(pi as unknown as Parameters<typeof extension>[0]);
@@ -182,6 +191,7 @@ export async function runSmoke(trackIgnored = false): Promise<void> {
     assert.match(messages[0], /feature\.txt is committed/);
     assert.match(messages[0], /no shared-service tests/);
     assert.ok(tool);
+    assert.ok(featureCommand);
     const proposal = { goal: "Write feature.txt", acceptance_criteria: "feature.txt is committed", constraints: "no shared-service tests", validation_command: "git diff --exit-code HEAD -- README.md" };
     const missing = await tool!.execute("call", { ...proposal, validation_command: "" }, undefined, undefined, { cwd: workspace_root, ui: {
       ...ui, input: async () => "", confirm: async () => { throw new Error("Unproposed validation must not start a run"); }
@@ -210,7 +220,9 @@ export async function runSmoke(trackIgnored = false): Promise<void> {
     const config = { binary, state_dir, workspace_root, supervisor_credential_file };
     const spec = { goal: "Write feature.txt", acceptance_criteria: "feature.txt is committed", constraints: "", validation_command: "git diff --exit-code HEAD -- README.md", base_branch: "" };
     process.env.FIXTURE_FAIL_AFTER_CODER_ISSUE = "1";
-    await assert.rejects(startFeature(config, repo, spec, ui));
+    await featureCommand!("resume", { cwd: workspace_root, ui: resumeUi });
+    assert.ok(notifications.some(message => /Tesselate paused/.test(message)));
+    notifications.length = 0;
     delete process.env.FIXTURE_FAIL_AFTER_CODER_ISSUE;
     process.env.FIXTURE_FAIL_AFTER_CAPTURE = "1";
     const secondFailure = await startFeature(config, repo, spec, ui).then(() => undefined, (error: Error) => error);
@@ -226,20 +238,23 @@ export async function runSmoke(trackIgnored = false): Promise<void> {
     writeFileSync(integrationEnv, "fixture-secret=not-for-reviewers\n");
     delete process.env.FIXTURE_FAIL_AFTER_CAPTURE;
     if (trackIgnored) {
-      await assert.rejects(startFeature(config, repo, spec, ui), /Reviewed commits track a provisioned local path/);
+      await featureCommand!(`resume ${interruptedRun}`, { cwd: repo, ui: resumeUi });
+      assert.ok(notifications.some(message => /Reviewed commits track a provisioned local path/.test(message)));
       assert.equal(readFileSync(integrationEnv, "utf8"), "fixture-secret=not-for-reviewers\n");
       assert.equal(git(join(state_dir, "omp-runs", interruptedRun, "integration"), "rev-parse", "HEAD"), mainHead);
       return;
     }
-    const completed = await startFeature(config, repo, spec, ui);
-    assert.equal(completed.phase, "done");
-    const record = JSON.parse(readFileSync(join(state_dir, "omp-runs", completed.run_id, "record.json"), "utf8"));
+    await featureCommand!("resume", { cwd: workspace_root, ui: resumeUi });
+    assert.ok(notifications.some(message => message.includes(`Resuming Tesselate run ${interruptedRun}`)));
+    assert.ok(notifications.some(message => message.includes(`Tesselate run ${interruptedRun}: done`)));
+    assert.equal(JSON.parse(readFileSync(join(state_dir, "fixture-db.json"), "utf8")).runCreateCount, 1);
+    const record = JSON.parse(readFileSync(join(state_dir, "omp-runs", interruptedRun, "record.json"), "utf8"));
     assert.equal(record.phase, "done");
     assert.equal(git(repo, "rev-parse", "main"), mainHead);
     assert.equal(git(record.integration_dir, "rev-parse", "HEAD"), record.last_head);
     assert.equal(statSync(integrationEnv).mode & 0o077, 0);
     assert.equal(readFileSync(join(record.integration_dir, "packages/content/.revisions/snapshot.json"), "utf8"), "{\"id\":1}\n");
-    assert.doesNotMatch(readFileSync(join(state_dir, "omp-runs", completed.run_id, "record.json"), "utf8"), /fixture-secret/);
+    assert.doesNotMatch(readFileSync(join(state_dir, "omp-runs", interruptedRun, "record.json"), "utf8"), /fixture-secret/);
     const launches = readFileSync(join(state_dir, "worker-launches.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
     assert.deepEqual(launches.map(item => item.role), ["coder", "reviewer", "reviewer", "coder", "reviewer", "reviewer"]);
     assert.notEqual(launches[0].cwd, launches[3].cwd);
