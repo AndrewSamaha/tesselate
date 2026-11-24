@@ -5,6 +5,7 @@ pub mod coordination;
 pub mod git;
 pub mod mcp;
 pub mod persistence;
+pub mod status;
 
 pub mod core;
 

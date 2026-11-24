@@ -51,6 +51,7 @@ impl Cli {
             self.command,
             Command::Install { .. }
                 | Command::Uninstall { .. }
+                | Command::Status { .. }
                 | Command::Project {
                     action: ProjectAction::Ensure { .. } | ProjectAction::Provision { .. }
                 }
@@ -94,6 +95,14 @@ pub enum Command {
     Artifact {
         #[command(subcommand)]
         action: ArtifactAction,
+    },
+    /// Show live OMP run and agent status (read-only).
+    Status {
+        /// Refresh continuously until interrupted.
+        #[arg(long)]
+        watch: bool,
+        #[arg(long, default_value_t = 150)]
+        interval_ms: u64,
     },
     /// Start the one shared coordinator for MCP harness sessions.
     Serve,
@@ -300,6 +309,10 @@ pub fn execute(
     command: Command,
 ) -> Result<Value, CliError> {
     match command {
+        Command::Status { .. } => Err(CoreError::Internal(
+            "status is handled before the coordinator CLI dispatcher".into(),
+        )
+        .into()),
         Command::Install {
             action: OmpAction::Omp,
         } => omp_install::install(app, state_dir, credential_file),

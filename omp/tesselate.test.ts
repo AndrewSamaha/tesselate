@@ -235,6 +235,7 @@ export async function runSmoke(trackIgnored = false, trailingReview = false): Pr
     const interruptedRun = JSON.parse(readFileSync(join(state_dir, "fixture-db.json"), "utf8")).run.id;
     const interruptedRecord = JSON.parse(readFileSync(join(state_dir, "omp-runs", interruptedRun, "record.json"), "utf8"));
     const workerLog = join(state_dir, "worker-launches.jsonl");
+    const heartbeatDir = join(state_dir, "omp-runs", interruptedRun, "heartbeat");
     assert.ok(existsSync(workerLog), secondFailure?.message ?? interruptedRecord.error);
     assert.equal(readFileSync(workerLog, "utf8").trim().split("\n").length, 1);
     const integrationEnv = join(state_dir, "omp-runs", interruptedRun, "integration", ".env");
@@ -246,6 +247,7 @@ export async function runSmoke(trackIgnored = false, trailingReview = false): Pr
     if (trackIgnored) {
       await featureCommand!(`resume ${interruptedRun}`, { cwd: repo, ui: resumeUi });
       assert.ok(notifications.some(message => /Reviewed commits track a provisioned local path/.test(message)));
+      assert.equal(JSON.parse(readFileSync(join(heartbeatDir, "supervisor.json"), "utf8")).state, "failed");
       assert.equal(readFileSync(integrationEnv, "utf8"), "fixture-secret=not-for-reviewers\n");
       assert.equal(git(join(state_dir, "omp-runs", interruptedRun, "integration"), "rev-parse", "HEAD"), mainHead);
       return;
@@ -254,6 +256,7 @@ export async function runSmoke(trackIgnored = false, trailingReview = false): Pr
       process.env.FIXTURE_TRAILING_REVIEW = "1";
       await featureCommand!("resume", { cwd: repo, ui: resumeUi });
       assert.ok(notifications.some(message => /Reviewer 1 did not end with valid JSON; inspect/.test(message)));
+      assert.equal(JSON.parse(readFileSync(join(heartbeatDir, "supervisor.json"), "utf8")).state, "failed");
       const paused = JSON.parse(readFileSync(join(state_dir, "omp-runs", interruptedRun, "record.json"), "utf8"));
       assert.equal(paused.phase, "review");
       assert.equal(JSON.parse(readFileSync(join(state_dir, "fixture-db.json"), "utf8")).reviews.length, 0);
@@ -278,6 +281,20 @@ export async function runSmoke(trackIgnored = false, trailingReview = false): Pr
     assert.ok(launches.filter(item => item.role === "reviewer").every(item => item.readOnly && item.cwd !== record.workspace_dir && item.workerEnv === "1"));
     assert.ok(launches.every(item => !existsSync(join(item.cwd, ".env")) && !existsSync(join(item.cwd, "packages/content/.revisions"))));
     assert.ok(existsSync(join(record.workspace_dir, ".workmux-local", "completion.md")));
+    const heartbeatNames = readdirSync(heartbeatDir).filter(name => name.endsWith(".json")).sort();
+    assert.deepEqual(heartbeatNames, ["coder-round-1.json", "coder-round-2.json", "reviewer-0-round-1.json", "reviewer-0-round-2.json", "reviewer-1-round-1.json", "reviewer-1-round-2.json", "supervisor.json"]);
+    const supervisorHeartbeat = JSON.parse(readFileSync(join(heartbeatDir, "supervisor.json"), "utf8"));
+    assert.equal(supervisorHeartbeat.state, "finished");
+    assert.equal(supervisorHeartbeat.role, "supervisor");
+    assert.equal(supervisorHeartbeat.run_id, interruptedRun);
+    const coderHeartbeat = JSON.parse(readFileSync(join(heartbeatDir, "coder-round-2.json"), "utf8"));
+    assert.equal(coderHeartbeat.state, "finished");
+    assert.equal(coderHeartbeat.role, "coder");
+    assert.equal(coderHeartbeat.assignment, "revise Write feature.txt · round 2");
+    const reviewerHeartbeat = JSON.parse(readFileSync(join(heartbeatDir, "reviewer-1-round-1.json"), "utf8"));
+    assert.equal(reviewerHeartbeat.role, "reviewer");
+    assert.equal(reviewerHeartbeat.assignment, "review · round 1 · reviewer 2/2");
+    for (const name of heartbeatNames) assert.doesNotMatch(readFileSync(join(heartbeatDir, name), "utf8"), /fixture-secret/);
     const database = JSON.parse(readFileSync(join(state_dir, "fixture-db.json"), "utf8"));
     assert.equal(database.rounds.length, 2);
     assert.equal(database.dispositions[0].disposition, "fixed");

@@ -176,6 +176,21 @@ services in task worktrees. Bitwars' configured ignored files are copied into
 the integration checkout only after approval; absent optional files are skipped.
 No automatic push, PR creation, or merge into local `main`.
 
+## Live status
+
+Watch every OMP-coordinated run, grouped by `run_id`, with one line per agent:
+
+```sh
+tesselate status --watch
+```
+
+Each line shows the role, its assignment, and current status. Active agents show
+an animated cursor. The OMP bridge writes supervisor and worker heartbeats every
+two seconds; a heartbeat older than 15 seconds is stale. Runs created before
+heartbeat support fall back to worker PID and OMP session activity. `tesselate
+status` without `--watch` prints one snapshot. This view is read-only and does
+not require a credential.
+
 Reviewer workers may print progress before their final JSON response. Tesselate
 parses only a final JSON object or fenced JSON response and rejects trailing
 non-JSON output; after a parse pause, `/feature resume` reuses the finished

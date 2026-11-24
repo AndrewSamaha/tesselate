@@ -1,13 +1,14 @@
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { closeSync, constants, existsSync, fstatSync, linkSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, readSync, renameSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
+import { closeSync, constants, existsSync, fstatSync, linkSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, readSync, renameSync, statSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
 import type { Stats } from "node:fs";
 import { dirname, isAbsolute, join, relative } from "node:path";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 
 type Config = { binary: string; state_dir: string; workspace_root: string; supervisor_credential_file: string };
 type Spec = { goal: string; acceptance_criteria: string; constraints: string; validation_command: string; base_branch: string };
-type Worker = { role: "coder" | "reviewer"; cwd: string; credential_file: string; log: string; session_dir: string; pid?: number; finished?: boolean };
+type Worker = { role: "coder" | "reviewer"; cwd: string; credential_file: string; log: string; session_dir: string; pid?: number; finished?: boolean; assignment?: string; started_at?: string };
+type Heartbeat = { version: 1; run_id: string; agent: string; role: string; assignment: string; status: string; state: "working" | "waiting" | "finished" | "failed" | "stopped"; pid?: number; started_at: string; updated_at: string; working: boolean; error?: string };
 type Review = { passed: boolean; summary: string; findings: Array<{ severity: "low" | "medium" | "high" | "critical"; location: string; evidence: string; proposed_correction: string }> };
 type RunSummary = { id: string; status: string; goal: string };
 type TaskState = { id: string; status: string };
@@ -209,8 +210,105 @@ function running(worker: Worker): boolean {
   if (!worker.pid) return false;
   try { process.kill(worker.pid, 0); return true; } catch { return false; }
 }
+type SessionActivity = { age_ms?: number; tool?: string };
+const supervisorStarts = new Map<string, string>();
+const toolPhrases: Record<string, string> = {
+  edit: "editing files", ast_edit: "editing files", write: "writing files", bash: "running commands",
+  read: "reading code", grep: "searching code", glob: "searching files", task: "delegating work",
+  ask: "awaiting input", web_search: "researching"
+};
+function shortText(text: string, limit: number): string {
+  const oneLine = text.replace(/\s+/g, " ").trim();
+  if (!oneLine) return "(unnamed)";
+  return oneLine.length <= limit ? oneLine : `${oneLine.slice(0, Math.max(0, limit - 1))}…`;
+}
+function ago(ms: number): string {
+  const seconds = Math.max(0, Math.floor(ms / 1000));
+  if (seconds < 5) return "just now";
+  if (seconds < 60) return `${seconds}s ago`;
+  const minutes = Math.floor(seconds / 60);
+  return minutes < 60 ? `${minutes}m ago` : `${Math.floor(minutes / 60)}h ago`;
+}
+function sessionActivity(sessionDir: string): SessionActivity {
+  try {
+    let newest: { path: string; mtime: number; size: number } | undefined;
+    for (const entry of readdirSync(sessionDir, { withFileTypes: true })) {
+      if (!entry.isFile() || !entry.name.endsWith(".jsonl")) continue;
+      const path = join(sessionDir, entry.name);
+      const stat = statSync(path);
+      if (!newest || stat.mtimeMs > newest.mtime) newest = { path, mtime: stat.mtimeMs, size: stat.size };
+    }
+    if (!newest) return {};
+    let tool: string | undefined;
+    if (newest.size > 0) {
+      const length = Math.min(newest.size, 131072);
+      const buffer = Buffer.allocUnsafe(length);
+      const fd = openSync(newest.path, "r");
+      try { readSync(fd, buffer, 0, length, Math.max(0, newest.size - length)); } finally { closeSync(fd); }
+      const text = buffer.toString("utf8");
+      const index = text.lastIndexOf('"toolName":"');
+      if (index >= 0) {
+        const start = index + '"toolName":"'.length;
+        const end = text.indexOf('"', start);
+        if (end > start) tool = text.slice(start, end);
+      }
+    }
+    return { age_ms: Math.max(0, Date.now() - newest.mtime), tool };
+  } catch { return {}; }
+}
+function activityStatus(activity: SessionActivity): { working: boolean; status: string } {
+  if (activity.age_ms === undefined) return { working: true, status: "starting" };
+  const phrase = activity.tool ? (toolPhrases[activity.tool] ?? `using ${activity.tool}`) : "thinking";
+  return activity.age_ms <= 45_000
+    ? { working: true, status: `${phrase} · ${ago(activity.age_ms)}` }
+    : { working: false, status: `quiet · ${ago(activity.age_ms)}` };
+}
+function fallbackAssignment(label: string): string {
+  const coder = label.match(/^coder-round-(\d+)$/);
+  if (coder) return `implementation · round ${coder[1]}`;
+  const reviewer = label.match(/^reviewer-(\d+)-round-(\d+)$/);
+  if (reviewer) return `review · round ${reviewer[2]} · reviewer ${Number(reviewer[1]) + 1}/2`;
+  return label;
+}
+function writeHeartbeat(dir: string, agent: string, heartbeat: Heartbeat): void {
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const path = join(dir, `${agent}.json`);
+  const pending = `${path}.${randomUUID()}.tmp`;
+  writeFileSync(pending, JSON.stringify(heartbeat), { mode: 0o600, flag: "wx" });
+  renameSync(pending, path);
+}
+function writeHeartbeats(config: Config, record: RunRecord, final = false): void {
+  try {
+    const dir = join(config.state_dir, "omp-runs", record.run_id, "heartbeat");
+    const now = new Date().toISOString();
+    const started = supervisorStarts.get(record.run_id) ?? now;
+    supervisorStarts.set(record.run_id, started);
+    const error = record.error ? shortText(record.error, 200) : undefined;
+    const state: Heartbeat["state"] = record.phase === "done" ? "finished" : error ? "failed" : final ? "stopped" : "working";
+    const status = state === "failed" ? `failed · ${error}` : state === "finished" ? "complete" : `${record.phase} · round ${record.round}`;
+    writeHeartbeat(dir, "supervisor", { version: 1, run_id: record.run_id, agent: "supervisor", role: "supervisor",
+      assignment: shortText(record.spec.goal, 80), status, state, pid: process.pid, started_at: started,
+      updated_at: now, working: state === "working", ...(error ? { error } : {}) });
+    for (const [label, worker] of Object.entries(record.workers)) {
+      const finished = worker.finished === true;
+      const alive = running(worker);
+      let workerState: Heartbeat["state"] = "stopped";
+      let status = "process ended";
+      let working = false;
+      if (finished) { workerState = "finished"; status = "finished"; }
+      else if (alive) {
+        const evaluated = activityStatus(sessionActivity(worker.session_dir));
+        working = evaluated.working; status = evaluated.status;
+        workerState = working ? "working" : "waiting";
+      }
+      writeHeartbeat(dir, label, { version: 1, run_id: record.run_id, agent: label, role: worker.role,
+        assignment: worker.assignment ?? fallbackAssignment(label), status, state: workerState, pid: worker.pid,
+        started_at: worker.started_at ?? started, updated_at: now, working });
+    }
+  } catch { /* Status is best effort; never fail a run because a heartbeat write failed. */ }
+}
 const liveWorkers = new Map<number, Promise<number | null>>();
-async function launch(record: RunRecord, config: Config, label: string, role: Worker["role"], cwd: string, credential: string, prompt: string): Promise<string> {
+async function launch(record: RunRecord, config: Config, label: string, role: Worker["role"], cwd: string, credential: string, assignment: string, prompt: string): Promise<string> {
   const prior = record.workers[label];
   if (prior?.finished) return workerResult(prior.log);
   if (prior && !prior.pid) {
@@ -226,9 +324,10 @@ async function launch(record: RunRecord, config: Config, label: string, role: Wo
     const session_dir = join(root, `session-${label}`);
     mkdirSync(session_dir, { recursive: true, mode: 0o700 });
     const log = join(root, `${label}.log`);
-    const worker: Worker = { role, cwd, credential_file: credential, log, session_dir };
+    const worker: Worker = { role, cwd, credential_file: credential, log, session_dir, assignment, started_at: new Date().toISOString() };
     record.workers[label] = worker;
     save(record, config); // The launch intent precedes both the log and the subprocess.
+    writeHeartbeats(config, record);
     const fd = openSync(log, "wx", 0o600);
     const args = ["-p", "--cwd", cwd, "--session-dir", session_dir, "--wait-async", "--max-time", "2h", "--no-extensions", "--no-skills"];
     if (role === "reviewer") args.push("--tools=read,grep,glob");
@@ -242,6 +341,7 @@ async function launch(record: RunRecord, config: Config, label: string, role: Wo
     liveWorkers.set(child.pid, promise);
     worker.pid = child.pid;
     save(record, config);
+    writeHeartbeats(config, record);
     child.unref();
   }
   const worker = record.workers[label];
@@ -255,6 +355,7 @@ async function launch(record: RunRecord, config: Config, label: string, role: Wo
   }
   const result = workerResult(worker.log);
   worker.finished = true; save(record, config);
+  writeHeartbeats(config, record);
   return result;
 }
 async function capture(config: Config, record: RunRecord): Promise<void> {
@@ -298,7 +399,7 @@ async function performReviews(config: Config, record: RunRecord): Promise<Review
     const diff = join(config.state_dir, "omp-runs", record.run_id, `round-${record.round}.diff`);
     if (!existsSync(diff)) writeFileSync(diff, await git(record.repository, "diff", record.base, record.last_head!), { mode: 0o600, flag: "wx" });
     const prompt = `Independent reviewer ${i + 1} for Tesselate task ${record.task_id}, review round ${record.round}. Read AGENTS.md and the diff at ${diff}; inspect relevant sources in this detached checkout. Goal: ${record.spec.goal}\nAcceptance: ${record.spec.acceptance_criteria}\nConstraints: ${record.spec.constraints}\nDo not edit files, invoke shell, run tests, access credentials or shared services. Reply ONLY JSON {"passed":boolean,"summary":"...","findings":[{"severity":"low|medium|high|critical","location":"path:line","evidence":"specific evidence","proposed_correction":"specific fix"}]}. A pass requires no findings; a failure requires findings. This is an adversarial review, not a summary.`;
-    const text = await launch(record, config, `reviewer-${i}-round-${record.round}`, "reviewer", cwd, record.reviewer_credential_files[i], prompt);
+    const text = await launch(record, config, `reviewer-${i}-round-${record.round}`, "reviewer", cwd, record.reviewer_credential_files[i], `review · round ${record.round} · reviewer ${i + 1}/2`, prompt);
     let review: Review;
     try { review = jsonResult<Review>(text); }
     catch { throw new Error(`Reviewer ${i + 1} did not end with valid JSON; inspect ${record.workers[`reviewer-${i}-round-${record.round}`].log} before resuming.`); }
@@ -336,6 +437,7 @@ async function validate(record: RunRecord, config: Config): Promise<void> {
 }
 async function supervise(config: Config, record: RunRecord): Promise<RunRecord> {
   let heartbeat: NodeJS.Timeout | undefined;
+  let statusHeartbeat: NodeJS.Timeout | undefined;
   let heartbeatError: unknown;
   let renewing = false;
   let lastSessionRenewal = 0;
@@ -356,6 +458,8 @@ async function supervise(config: Config, record: RunRecord): Promise<RunRecord> 
     } finally { renewing = false; }
   };
   try {
+    writeHeartbeats(config, record);
+    statusHeartbeat = setInterval(() => writeHeartbeats(config, record), 2_000);
     await renew(true);
     heartbeat = setInterval(() => {
       if (heartbeatError) return;
@@ -388,8 +492,9 @@ async function supervise(config: Config, record: RunRecord): Promise<RunRecord> 
         const priorFindings = revision ? (await listed<ReviewState>(config, config.supervisor_credential_file, "reviews.list", { task_id: record.task_id }))
           .flatMap(r => r.findings).filter(f => record.previous_finding_ids.includes(f.id))
           .map(f => `${f.location}: ${f.evidence} — ${f.proposed_correction}`).join("\n") : "";
+        const assignment = `${revision ? "revise" : "implement"} ${shortText(record.spec.goal, 32)} · round ${record.round}`;
         const prompt = `Implement Tesselate task ${record.task_id}, round ${record.round}. Goal: ${record.spec.goal}\nAcceptance criteria: ${record.spec.acceptance_criteria}\nConstraints: ${record.spec.constraints}\n${revision ? `Address these reviewer findings with new commits:\n${priorFindings}` : ""}\nRead repository AGENTS.md before coding. This is the assigned isolated task worktree, not integration/main. Do not push, merge, run tests or start shared app/server/Redis services in this task worktree. Bitwars .env and packages/content/.revisions do not travel with worktrees: do not copy secrets or assume they exist. Commit your changes on this task branch. Do not use any supervisor credential or Tesselate operations. End with a concise plain-text summary; the supervisor inspects and captures committed refs.`;
-        await launch(record, config, `coder-round-${record.round}`, "coder", record.workspace_dir, record.coder_credential_file, prompt);
+        await launch(record, config, `coder-round-${record.round}`, "coder", record.workspace_dir, record.coder_credential_file, assignment, prompt);
         if (heartbeatError) throw new Error(`Credential or assignment lease renewal failed: ${cleanError(heartbeatError)}`);
         if (!record.commit_refs) await capture(config, record);
         assignmentReady = false;
@@ -452,6 +557,9 @@ async function supervise(config: Config, record: RunRecord): Promise<RunRecord> 
     throw error;
   } finally {
     clearInterval(heartbeat);
+    clearInterval(statusHeartbeat);
+    writeHeartbeats(config, record, true);
+    supervisorStarts.delete(record.run_id);
   }
   return record;
 }
@@ -715,6 +823,8 @@ async function resumableRuns(config: Config, repo: string): Promise<Array<{ run:
 }
 async function resumeRecord(config: Config, record: RunRecord, ui: UIOps): Promise<RunRecord> {
   if (record.phase === "done") return record;
+  record.error = undefined;
+  save(record, config);
   await provisionRun(config, record, ui);
   if (record.phase === "integrating" && record.validation_log && !record.validation_passed) {
     if (!await ui.confirm(`Prior integration validation may have failed or been interrupted. Inspect ${record.validation_log}; retry the same approved command on ${record.integration_dir}?`)) {
