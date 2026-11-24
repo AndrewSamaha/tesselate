@@ -98,6 +98,58 @@ TESSELATE_CREDENTIAL=<credential for this agent>
 
 The adapter speaks MCP on stdio and forwards requests to the shared coordinator. Never put credentials in tool arguments or logs. Use `tesselate call` for any versioned coordination tool, or the purpose-built `inspect`, `human`, `workspace`, and `artifact` commands. Mutating calls require an idempotency key.
 
+## OMP integration
+
+For OMP sessions working in repositories under `~/Development`, install the
+bundled OMP extension and feature skill once:
+
+```sh
+tesselate install omp
+```
+
+This uses `~/Development/.tesselate` for private coordinator state,
+credentials, run handoffs, worktrees, and artifacts. The installer places an
+extension, skill, and credential-file-path configuration in the active user's
+OMP agent directory; it adds no credentials or OMP files to a project repository.
+When running a binary from this checkout instead of an installed `tesselate` on `PATH`, use
+`./target/debug/tesselate install omp`. `install omp`, `uninstall omp`, and
+`project ensure` default to this shared state directory; other CLI commands
+retain the existing `.tesselate` default. Pass `--state-dir` explicitly when
+calling those commands by hand against the shared installation.
+
+Installation follows the active `OMP_PROFILE` / `PI_PROFILE`, if set; otherwise
+it targets the default `~/.omp/agent` profile. Install separately for each named
+profile. The generated OMP configuration stores credential **file paths**, not
+bearer values. The installed CLI recovers an expired, non-revoked supervisor
+session only from its owner-only local credential file; socket/MCP authentication
+continues to reject expired credentials.
+
+Start OMP from a repository, or from `~/Development`, and ask for a new feature
+in a named repository. The integration asks for the feature goal and acceptance
+criteria, then uses Tesselate for the run, assigned coding worktrees, independent
+reviews, and durable history. `/feature` is the explicit alternative when a
+plain-language request is ambiguous. To register a repository directly:
+
+```sh
+tesselate project ensure --repo ~/Development/bitwars
+```
+
+The extension launches separate OMP processes for the coder and two reviewers;
+ordinary OMP subagents share their parent's MCP connection and cannot represent
+independent Tesselate roles. A task worktree is not the integration branch.
+Choose a validation command explicitly; do not run shared services in task
+worktrees. Bitwars needs human-approved provisioning of ignored `.env` and
+`packages/content/.revisions` in the integration checkout if validation needs
+them. No automatic push, PR creation, or merge into local `main`.
+
+```sh
+tesselate uninstall omp
+```
+
+Uninstall removes only Tesselate-owned, unmodified OMP integration files; it
+preserves coordinator state, credentials, project configurations, and worktrees.
+Restart OMP to load an installed or removed extension.
+
 ## Documentation
 
 - [Product and technical specification](docs/spec.md)

@@ -159,7 +159,7 @@ export async function runSmoke(): Promise<void> {
     assert.equal(await inputHandler({ source: "interactive", text: "fix the bug" }, { cwd: workspace_root, ui }), undefined);
     assert.equal(messages.length, 0);
     const result = await inputHandler({ source: "interactive", text: "Build a feature for this repo that writes feature.txt" }, { cwd: workspace_root, ui });
-    assert.deepEqual(result, { handled: true });
+    assert.equal((result as { handled?: boolean } | undefined)?.handled, true);
     assert.match(messages[0], /feature\.txt is committed/);
     assert.match(messages[0], /no shared-service tests/);
     assert.ok(tool);

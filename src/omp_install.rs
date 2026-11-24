@@ -46,7 +46,7 @@ struct Manifest {
 
 fn home() -> Result<PathBuf, CliError> {
     let home = env::var_os("HOME").ok_or_else(|| CoreError::Invalid("HOME is required for OMP integration".into()))?;
-    Ok(PathBuf::from(home))
+    Ok(fs::canonicalize(home)?)
 }
 
 pub(super) fn workspace_root() -> Result<PathBuf, CliError> {
@@ -409,7 +409,7 @@ mod tests {
         fn new() -> Self {
             let root = env::temp_dir().join(format!("tesselate-omp-{}", Uuid::new_v4()));
             fs::create_dir_all(&root).unwrap();
-            Self(root)
+            Self(fs::canonicalize(root).unwrap())
         }
 
         fn app(&self) -> (Application, PathBuf, PathBuf) {

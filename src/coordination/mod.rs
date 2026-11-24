@@ -111,6 +111,17 @@ pub trait Coordination: Send + Sync {
         ctx: &SessionContext,
         request: ReadMessages,
     ) -> CoreResult<Page<Message>>;
+    fn renew_session(
+        &self,
+        ctx: &SessionContext,
+        key: IdempotencyKey,
+    ) -> CoreResult<Mutation<chrono::DateTime<chrono::Utc>>>;
+    fn renew_assignment_lease(
+        &self,
+        ctx: &SessionContext,
+        task_id: TaskId,
+        key: IdempotencyKey,
+    ) -> CoreResult<Mutation<sessions::AssignmentLeaseRecord>>;
     fn request_workspace(
         &self,
         ctx: &SessionContext,
