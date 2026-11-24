@@ -13,6 +13,34 @@ The MVP is local and Unix-only. It uses a single SQLite database and does not ho
 - Serves concurrent agent sessions through MCP over a local Unix socket.
 - Persists workflow history in SQLite and exports portable JSON Lines and Markdown artifacts.
 
+## How it fits together
+
+Tesselate is the coordination layer; an agent harness runs the agents. In the
+[OMP integration](#omp-integration), the extension inside the parent OMP session
+acts as the supervisor: it gathers the feature specification and launches
+separate `omp -p` processes for the coder and two reviewers. Those workers use
+Tesselate-created worktrees and role-specific credentials.
+
+```mermaid
+flowchart TD
+  P["Parent OMP session<br/>(supervisor, spec intake)"] -->|spawns| C["omp -p coder"]
+  P -->|spawns| R1["omp -p reviewer 1"]
+  P -->|spawns| R2["omp -p reviewer 2"]
+  P -->|"CLI calls"| T["Tesselate state<br/>run, tasks, leases, reviews"]
+  C --> W["Tesselate coder worktree"]
+  R1 --> D1["Externally created<br/>detached review checkout"]
+  R2 --> D2["Externally created<br/>detached review checkout"]
+```
+
+A **Tesselate run** is the logical wrapper: `run_id` groups the supervisor,
+coder, reviewers, worktrees, reviews, and artifacts. Tesselate’s internal
+“sessions” are credential sessions, not agent processes. It does not host the
+model or the agent loop.
+
+In the OMP flow, the extension calls the `tesselate` CLI directly against
+SQLite. The separate `tesselate serve` coordinator and MCP socket are for MCP
+clients; they are not required for the `/feature` workflow.
+
 ## Requirements
 
 - Rust toolchain and Cargo
