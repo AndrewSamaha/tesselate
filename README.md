@@ -278,8 +278,9 @@ Watch active OMP-coordinated runs, grouped by `run_id`, with one line per agent:
 tesselate status --watch
 ```
 
-Completed, stopped, and paused runs are hidden; use `tesselate status --all` or
-`tesselate status --watch --all` to include them.
+Completed, stopped, and paused runs are hidden while any run is active. When no
+run is active, the most recent run is shown with a “No active runs” notice. Use
+`tesselate status --all` or `tesselate status --watch --all` to include every run.
 
 Each line shows the role, its assignment, and current status. Active agents show
 an animated cursor. The OMP bridge writes supervisor and worker heartbeats every

@@ -122,6 +122,7 @@ struct RunView {
     supervisor_stale: bool,
     error: Option<String>,
     updated: SystemTime,
+    recent: bool,
 }
 
 #[derive(Debug)]
@@ -182,13 +183,29 @@ fn snapshot(state_dir: &Path, all: bool) -> Vec<RunView> {
         if record.run_id.is_empty() {
             continue;
         }
-        if !all && !is_active(&record, statuses.get(&record.run_id)) {
-            continue;
-        }
-        runs.push(build_run(&dir, record));
+        let active = is_active(&record, statuses.get(&record.run_id));
+        runs.push((build_run(&dir, record), active));
     }
-    runs.sort_by_key(|run| std::cmp::Reverse(run.updated));
+    runs.sort_by_key(|(run, _)| std::cmp::Reverse(run.updated));
+    if all {
+        return runs.into_iter().map(|(run, _)| run).collect();
+    }
+    let live: Vec<RunView> = runs
+        .iter()
+        .filter(|(_, active)| *active)
+        .map(|(run, _)| run.clone())
+        .collect();
+    if !live.is_empty() {
+        return live;
+    }
     runs
+        .into_iter()
+        .take(1)
+        .map(|(mut run, _)| {
+            run.recent = true;
+            run
+        })
+        .collect()
 }
 
 fn is_active(record: &RunRecord, status: Option<&RunStatus>) -> bool {
@@ -324,6 +341,7 @@ fn build_run(dir: &Path, record: RunRecord) -> RunView {
         supervisor_stale,
         error: heartbeat_error.or(record.error),
         updated,
+        recent: false,
     }
 }
 
@@ -530,6 +548,9 @@ fn render(runs: &[RunView], frame: usize, width: usize) -> String {
     if runs.is_empty() {
         output.push_str("No OMP runs under the configured state directory.\n");
         return output;
+    }
+    if runs.iter().any(|run| run.recent) {
+        output.push_str("No active runs; showing the most recent run.\n");
     }
     let spinner = SPINNER[frame % SPINNER.len()];
     for run in runs {
@@ -805,6 +826,47 @@ mod tests {
         assert_eq!(active_only.len(), 1);
         assert_eq!(active_only[0].short, "12345678");
         assert_eq!(snapshot(&temp.0, true).len(), 3);
+    }
+
+    #[test]
+    fn no_active_run_falls_back_to_most_recent_run() {
+        let temp = TempDir::new();
+        let older = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+        let recent = "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff";
+        for id in [older, recent] {
+            fs::create_dir_all(temp.0.join("omp-runs").join(id)).unwrap();
+        }
+        let write = |id: &str, phase: &str| {
+            fs::write(
+                temp.0.join("omp-runs").join(id).join("record.json"),
+                format!(
+                    r#"{{"version":1,"run_id":"{id}","repository":"/tmp/demo","phase":"{phase}","spec":{{"goal":"ended"}},"workers":{{}},"error":"task retry limit reached"}}"#
+                ),
+            )
+            .unwrap();
+        };
+        write(older, "revision");
+        std::thread::sleep(Duration::from_millis(20));
+        write(recent, "done");
+        let connection = Connection::open(temp.0.join("coordinator.sqlite3")).unwrap();
+        connection
+            .execute_batch("CREATE TABLE runs(id TEXT PRIMARY KEY, payload_json TEXT NOT NULL);")
+            .unwrap();
+        for (id, status) in [(older, "stopped"), (recent, "completed")] {
+            connection
+                .execute(
+                    "INSERT INTO runs(id,payload_json) VALUES (?1,?2)",
+                    rusqlite::params![id, format!(r#"{{"id":"{id}","status":"{status}"}}"#)],
+                )
+                .unwrap();
+        }
+
+        let runs = snapshot(&temp.0, false);
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].short, "bbbbbbbb");
+        assert!(runs[0].recent);
+        assert!(render(&runs, 0, 120).contains("No active runs; showing the most recent run."));
+        assert_eq!(snapshot(&temp.0, true).len(), 2);
     }
 
     #[test]
