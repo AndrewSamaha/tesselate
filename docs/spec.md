@@ -95,7 +95,7 @@ Before a Git mutation, Tesselate verifies the target repository, branch, and wor
 The initial MCP tools cover:
 
 - **Discovery:** list projects, repositories, agents, runs, tasks, and available work.
-- **Coordination:** create and assign tasks, claim or release an assignment, update progress, submit work, and record a final disposition.
+- **Coordination:** create and assign tasks, claim or release an assignment, update progress, submit work, record a final disposition, and reopen a budget-exhausted task with a supervisor repair.
 - **Communication:** send task-scoped or project-scoped messages and read messages since an event cursor.
 - **Workspace:** request or inspect assignment worktrees and their Git references.
 - **Review:** request a review, submit findings or a pass, and read review rounds.

@@ -6,7 +6,7 @@ use crate::{
         CoreResult, CreateComparisonRun, CreateRun, CreateTask, CreateTaskWithDependencies,
         DispositionFindings, EventScope, FinalTaskDisposition, HumanRequest, IdempotencyKey,
         InspectWorkspace, ListHumanRequests, ListReviewRounds, ListReviews, PageRequest,
-        ReadMessages, ReleaseTask, ResolveHumanRequest, ReviewRequest, SelectCandidate,
+        ReadMessages, ReleaseTask, RepairTask, ResolveHumanRequest, ReviewRequest, SelectCandidate,
         SendMessage, SessionAuthenticator, SessionContext, SubmitReview, SubmitTask, TaskId,
         UpdateProgress, WorkspaceRequest,
     },
@@ -437,6 +437,8 @@ fn invoke(
             mutation!(FinalTaskDisposition, |s: &dyn Coordination, c, r, k| s
                 .record_task_disposition(c, r, k))
         }
+        "tesselate.v1.tasks.repair" => mutation!(RepairTask, |s: &dyn Coordination, c, r, k| s
+            .repair_task(c, r, k)),
         "tesselate.v1.runs.complete" => mutation!(CompleteRun, |s: &dyn Coordination, c, r, k| s
             .complete_run(c, r, k)),
         "tesselate.v1.messages.send" => mutation!(SendMessage, |s: &dyn Coordination, c, r, k| s
@@ -829,6 +831,10 @@ fn params_schema(tool: &str) -> Value {
         "tesselate.v1.tasks.disposition" => object_schema(
             json!({"task_id":task_id,"outcome":{"type":"string","enum":["completed","blocked","failed","cancelled"]},"reason":string_schema()}),
             &["task_id", "outcome", "reason"],
+        ),
+        "tesselate.v1.tasks.repair" => object_schema(
+            json!({"run_id":id_schema(),"task_id":task_id,"mode":{"type":"string","enum":["retry_once","reset_attempts"]},"reason":string_schema()}),
+            &["run_id", "task_id", "mode", "reason"],
         ),
         "tesselate.v1.runs.complete" => object_schema(
             json!({"run_id":id_schema(),"outstanding_integration_steps":array_schema(string_schema())}),

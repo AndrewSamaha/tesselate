@@ -65,6 +65,7 @@ pub enum TransitionIdentity {
     TaskSubmission,
     ReviewStatus,
     FinalDisposition,
+    TaskRepair,
     RunCompletion,
 }
 
@@ -1276,6 +1277,136 @@ impl TaskEngine {
         });
         let changes = vec![self.bump_run(&mut run, run_revision)?];
         self.commit_run(ctx, OP, &key, &request, &run, changes, review_guards, event)
+    }
+
+    /// Supervisor-only recovery after a task exhausted its retry or review budget.
+    /// Reopens the task and raises the run's pinned limits just enough for another
+    /// attempt; attempts are either preserved (retry once) or reset to zero.
+    pub fn repair_task(
+        &self,
+        ctx: &SessionContext,
+        request: RepairTask,
+        key: IdempotencyKey,
+    ) -> CoreResult<Mutation<RepairResult>> {
+        const OP: &str = "tasks.repair";
+        if let Some(prior) = self
+            .db
+            .prior_mutation::<_, RepairResult>(ctx, OP, &key, &request)
+            .map_err(storage_error)?
+        {
+            return Ok(prior);
+        }
+        require_role(ctx, Role::Supervisor)?;
+        if request.reason.trim().is_empty() {
+            return Err(CoreError::Invalid("repair reason is required".into()));
+        }
+        let (mut record, task_revision) = self.load_task(request.task_id)?;
+        let (mut run, run_revision) = self.load_run(record.task.run_id)?;
+        if record.task.run_id != request.run_id || run.id != request.run_id {
+            return Err(CoreError::Invalid("task does not belong to this run".into()));
+        }
+        if matches!(
+            run.status,
+            RunStatus::Completed | RunStatus::Failed | RunStatus::Cancelled
+        ) {
+            return Err(CoreError::Invalid("run cannot be repaired".into()));
+        }
+        if duration_expired(&run) {
+            return Err(CoreError::Invalid(
+                "run duration expired; start a new run instead".into(),
+            ));
+        }
+        if !matches!(
+            record.task.status,
+            TaskStatus::InReview | TaskStatus::RevisionRequired | TaskStatus::Failed
+        ) {
+            return Err(CoreError::Invalid("task is not awaiting repair".into()));
+        }
+        if let Some(comparison) = &run.comparison {
+            if comparison.winner.is_some() {
+                return Err(CoreError::Invalid(
+                    "comparison winner is already selected".into(),
+                ));
+            }
+            if !comparison.candidates.contains(&request.task_id) {
+                return Err(CoreError::Invalid(
+                    "task is not a candidate in this comparison".into(),
+                ));
+            }
+        }
+        let old_limits = run.limits.clone();
+        let old_attempts = record.task.attempts;
+        let old_status = record.task.status;
+        let review_rounds = self
+            .all_entities::<ReviewRound>(
+                EntityKind::ReviewRound,
+                EntityScope {
+                    task_id: Some(request.task_id.0.to_string()),
+                    ..Default::default()
+                },
+            )?
+            .into_iter()
+            .map(|round| round.round)
+            .max()
+            .unwrap_or(0);
+        match request.mode {
+            RepairMode::RetryOnce => {
+                run.limits.max_task_retries = run.limits.max_task_retries.max(record.task.attempts);
+            }
+            RepairMode::ResetAttempts => record.task.attempts = 0,
+        }
+        run.limits.max_review_rounds = run.limits.max_review_rounds.max(review_rounds + 1);
+        run.status = RunStatus::Active;
+        run.outcome = None;
+        record.task.status = TaskStatus::RevisionRequired;
+        record.task.result = Some(request.reason.clone());
+        record.final_disposition = None;
+        self.ensure_transition(
+            ctx,
+            run.project_id,
+            run.id,
+            Some(request.task_id),
+            Some(LifecycleState::Task(old_status)),
+            Some(LifecycleState::Task(TaskStatus::RevisionRequired)),
+            TransitionIdentity::TaskRepair,
+        )?;
+        let result = RepairResult {
+            run: run.clone(),
+            task: record.task.clone(),
+        };
+        let changes = vec![
+            self.bump_run(&mut run, run_revision)?,
+            self.task_update(&record, task_revision, &run)?,
+        ];
+        let event = event_for(
+            ctx,
+            Some(run.project_id),
+            Some(run.id),
+            Some(request.task_id),
+            "task.repaired",
+            json!({
+                "task_id":request.task_id,
+                "mode":request.mode,
+                "reason":request.reason,
+                "previous_status":old_status,
+                "previous_attempts":old_attempts,
+                "attempts":record.task.attempts,
+                "previous_limits":old_limits,
+                "limits":run.limits,
+            }),
+        );
+        self.db
+            .commit_mutation(MutationInput {
+                context: ctx,
+                operation: OP,
+                idempotency_key: &key,
+                request: &request,
+                preconditions: vec![],
+                result: &result,
+                changes,
+                event,
+            })
+            .map_err(storage_error)
     }
 
     pub fn complete_run(

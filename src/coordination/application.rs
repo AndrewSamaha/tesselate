@@ -475,6 +475,15 @@ impl Coordination for Application {
         self.tasks.select_candidate(ctx, request, key)
     }
 
+    fn repair_task(
+        &self,
+        ctx: &SessionContext,
+        request: RepairTask,
+        key: IdempotencyKey,
+    ) -> CoreResult<Mutation<RepairResult>> {
+        self.tasks.repair_task(ctx, request, key)
+    }
+
     fn create_task(
         &self,
         ctx: &SessionContext,

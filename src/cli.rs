@@ -738,6 +738,8 @@ fn dispatch(
             mutation!(FinalTaskDisposition, |a: &Application, c, r, k| a
                 .record_task_disposition(c, r, k))
         }
+        "tesselate.v1.tasks.repair" => mutation!(RepairTask, |a: &Application, c, r, k| a
+            .repair_task(c, r, k)),
         "tesselate.v1.runs.complete" => mutation!(CompleteRun, |a: &Application, c, r, k| a
             .complete_run(c, r, k)),
         "tesselate.v1.messages.send" => mutation!(SendMessage, |a: &Application, c, r, k| a

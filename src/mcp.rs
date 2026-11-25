@@ -25,6 +25,7 @@ pub const TOOLS: &[&str] = &[
     "tesselate.v1.tasks.progress",
     "tesselate.v1.tasks.submit",
     "tesselate.v1.tasks.disposition",
+    "tesselate.v1.tasks.repair",
     "tesselate.v1.runs.complete",
     "tesselate.v1.messages.send",
     "tesselate.v1.messages.read",

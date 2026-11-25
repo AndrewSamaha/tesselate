@@ -58,6 +58,12 @@ pub trait Coordination: Send + Sync {
         request: SelectCandidate,
         key: IdempotencyKey,
     ) -> CoreResult<Mutation<Run>>;
+    fn repair_task(
+        &self,
+        ctx: &SessionContext,
+        request: RepairTask,
+        key: IdempotencyKey,
+    ) -> CoreResult<Mutation<RepairResult>>;
     fn create_task(
         &self,
         ctx: &SessionContext,

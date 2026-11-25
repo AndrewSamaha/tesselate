@@ -454,6 +454,25 @@ pub struct SubmitTask {
     pub commits: Vec<CommitRef>,
     pub summary: String,
 }
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RepairMode {
+    RetryOnce,
+    ResetAttempts,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RepairTask {
+    pub run_id: RunId,
+    pub task_id: TaskId,
+    pub mode: RepairMode,
+    pub reason: String,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RepairResult {
+    pub run: Run,
+    pub task: Task,
+}
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct CompleteRun {

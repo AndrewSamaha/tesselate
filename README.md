@@ -7,6 +7,7 @@ The MVP is local and Unix-only. It uses a single SQLite database and does not ho
 ## What it does
 
 - Coordinates runs, dependent tasks, assignments, leases, and bounded retries.
+- Reopens a budget-exhausted task after an explicit supervisor repair choice.
 - Creates isolated Git worktrees and records submitted commit references.
 - Enforces independent review rounds, findings, and finding dispositions.
 - Supports optional human approval gates resolved through the CLI.
@@ -167,6 +168,14 @@ run for the chosen repository without asking for a new goal, acceptance criteria
 or validation command; `/feature resume <run-UUID>` targets one run directly.
 The existing provisioning approval and validation-log retry safeguards still
 apply. Restart OMP after `install omp` to load an updated extension.
+
+When a task exhausts its coding retry or review round budget, OMP pauses and
+offers a repair choice: try one more round, reset the attempt count to zero and
+try again, or leave it for manual repair. The first two call
+`tesselate.v1.tasks.repair`, which raises the run's pinned limits just enough,
+reopens the task, and records a `task.repaired` event. Manual repair leaves the
+run stopped or the comparison candidate failed; use `/feature resume` after
+resolving the cause outside Tesselate.
 
 ### Compare two implementations
 

@@ -17,6 +17,7 @@ type Winner = { task_id: string; commit_id: string; reason: string };
 type Limits = { max_task_retries: number; max_review_rounds: number };
 type RunSummary = { id: string; status: string; goal: string; limits?: Limits;
   comparison?: { workflow: Workflow; candidates: [string, string]; winner?: Winner | null } };
+type RepairResult = { run: RunSummary; task: TaskState };
 type TaskState = { id: string; status: string; attempts?: number };
 type ReviewState = Review & { round_id: string; reviewer: string; findings: Array<Review["findings"][number] & { id: string }> };
 type RoundState = { id: string; round: number };
@@ -40,7 +41,7 @@ type Comparison = {
 type RunRecord = TaskLane & ValidationState & {
   version: 1; project_id: string; repository_id: string; repository: string; run_id: string;
   base: string; base_branch: string; branch: string; integration_dir: string;
-  spec: Spec; workers: Record<string, Worker>; error?: string;
+  spec: Spec; workers: Record<string, Worker>; error?: string; limits?: Limits;
   provisioning?: Provisioning; worker_model?: string; workflow?: Workflow; comparison?: Comparison;
 };
 type RunIntent = { version: 1; repository: string; project_id: string; repository_id: string; spec: Spec; base: string; key: string; supervisor_credential_file: string; run_id?: string; worker_model?: string; workflow?: Workflow };
@@ -610,15 +611,52 @@ async function validate(record: RunRecord, config: Config, state: ValidationStat
     await promise;
   } finally { closeSync(fd); }
 }
+async function askRepair(ui: UIOps, label: string, reason: string): Promise<"retry_once" | "reset_attempts" | "manual"> {
+  const choice = await ui.select(`${label} stopped: ${reason}\nHow should Tesselate repair it?`, [
+    "Try one more round",
+    "Reset the task attempt count to 0 and try again",
+    "Leave for manual repair",
+  ]);
+  if (choice?.startsWith("Reset")) return "reset_attempts";
+  if (choice?.startsWith("Try")) return "retry_once";
+  return "manual";
+}
+
 async function superviseLane(config: Config, record: RunRecord, lane: TaskLane,
-                             leased: Set<TaskLane>, checkHeartbeat: () => void): Promise<void> {
-  const limits = record.comparison?.limits;
+                             leased: Set<TaskLane>, checkHeartbeat: () => void,
+                             ui: UIOps): Promise<void> {
   const fail = async (reason: string): Promise<void> => {
     await mutate(config, record, "tasks.disposition", { task_id: lane.task_id, outcome: "failed", reason }, laneKey(lane, "fail"));
     lane.failure = reason; lane.phase = "failed"; save(record, config);
   };
+  const repairOrContinue = async (reason: string): Promise<boolean> => {
+    const choice = await askRepair(ui, lane.slot ? `Candidate ${lane.slot}` : "Task", reason);
+    if (choice === "manual") {
+      if (record.comparison) { await fail(reason); return false; }
+      try { await fail(reason); }
+      catch (error) {
+        // A stopped standard run cannot accept a final disposition; leave its task
+        // revision_required for a later explicit repair or a new run.
+        if (!/run is not active/.test(cleanError(error))) throw error;
+      }
+      lane.failure = reason; lane.phase = "failed"; save(record, config);
+      throw new Error(`Task left for manual repair: ${reason}`);
+    }
+    const repaired = await mutate<RepairResult>(config, record, "tasks.repair", {
+      run_id: record.run_id, task_id: lane.task_id, mode: choice, reason,
+    }, laneKey(lane, `repair:${choice}:${lane.round}`));
+    if (repaired.run.limits) {
+      if (record.comparison) record.comparison.limits = repaired.run.limits;
+      else record.limits = repaired.run.limits;
+    }
+    lane.failure = undefined; lane.phase = "revision";
+    lane.commit_refs = undefined; lane.round_id = undefined;
+    save(record, config);
+    return true;
+  };
   while (lane.phase !== "integrating" && lane.phase !== "failed") {
     checkHeartbeat();
+    const limits = record.comparison?.limits ?? record.limits;
     const task = (await listed<TaskState>(config, config.supervisor_credential_file, "tasks.list", { run_id: record.run_id })).find(t => t.id === lane.task_id);
     if (!task) throw new Error("Run's task no longer exists; cannot recover automatically.");
     if (task.status === "completed") {
@@ -637,8 +675,10 @@ async function superviseLane(config: Config, record: RunRecord, lane: TaskLane,
     if (lane.phase === "coding" || lane.phase === "revision") {
       const revision = lane.phase === "revision";
       if (task.status === "revision_required") {
-        if (limits && (task.attempts ?? 0) > limits.max_task_retries) { await fail("Coding retry budget exhausted."); return; }
-        if (limits && lane.round > limits.max_review_rounds) { await fail("Review round budget exhausted."); return; }
+        if (limits && ((task.attempts ?? 0) > limits.max_task_retries || lane.round > limits.max_review_rounds)) {
+          if (!await repairOrContinue("Coding retry or review round budget exhausted.")) return;
+          continue;
+        }
         await mutate(config, record, "tasks.assign", { task_id: lane.task_id, assignee: lane.coder_actor_id }, laneKey(lane, `assign:${lane.round}`));
       } else if (task.status !== "assigned" && task.status !== "coding") {
         throw new Error(`Unexpected coder task status ${task.status}; inspect run before continuing.`);
@@ -678,11 +718,15 @@ async function superviseLane(config: Config, record: RunRecord, lane: TaskLane,
       const ids = (await listed<ReviewState>(config, config.supervisor_credential_file, "reviews.list", { task_id: lane.task_id }))
         .filter(r => r.round_id === lane.round_id).flatMap(r => r.findings.map(f => f.id));
       if (ids.length) {
-        if (limits && lane.round >= limits.max_review_rounds) { await fail("Review round budget exhausted with unresolved findings."); return; }
-        if (limits && (task.attempts ?? 0) > limits.max_task_retries) { await fail("Coding retry budget exhausted with unresolved findings."); return; }
         await mutate(config, record, "reviews.disposition", { task_id: lane.task_id,
           dispositions: ids.map(id => ({ finding_id: id, disposition: "fixed", reason: "Requires a new commit and independent review round." })) }, laneKey(lane, `disposition:${lane.round}`));
         lane.previous_finding_ids.push(...ids);
+        if (limits && (lane.round >= limits.max_review_rounds || (task.attempts ?? 0) > limits.max_task_retries)) {
+          if (!await repairOrContinue("Review round or coding retry budget exhausted with unresolved findings.")) return;
+          lane.round++;
+          save(record, config);
+          continue;
+        }
         lane.round++; lane.phase = "revision"; lane.commit_refs = undefined; lane.round_id = undefined;
       } else {
         const count = reviewerCount(record);
@@ -806,6 +850,11 @@ async function integrate(config: Config, record: RunRecord): Promise<void> {
 
 async function supervise(config: Config, record: RunRecord, ui: UIOps): Promise<RunRecord> {
   if (record.phase === "done") return record;
+  if (!record.comparison && !record.limits) {
+    const current = (await listed<RunSummary>(config, config.supervisor_credential_file, "runs.list",
+      { project_id: record.project_id, page: { limit: 50, after: null } })).find(run => run.id === record.run_id);
+    if (current?.limits) { record.limits = current.limits; save(record, config); }
+  }
   let heartbeat: NodeJS.Timeout | undefined;
   let statusHeartbeat: NodeJS.Timeout | undefined;
   let heartbeatError: unknown;
@@ -846,7 +895,7 @@ async function supervise(config: Config, record: RunRecord, ui: UIOps): Promise<
     }, 40_000);
     if (record.comparison) {
       const outcomes = await Promise.allSettled(record.comparison.lanes.map(async lane => {
-        try { await superviseLane(config, record, lane, leased, checkHeartbeat); }
+        try { await superviseLane(config, record, lane, leased, checkHeartbeat, ui); }
         finally { leased.delete(lane); }
       }));
       const errors = outcomes.flatMap((outcome, i) => outcome.status === "rejected" ?
@@ -854,7 +903,7 @@ async function supervise(config: Config, record: RunRecord, ui: UIOps): Promise<
       if (errors.length) throw new Error(errors.join("\n"));
       checkHeartbeat();
       if (!await compareCandidates(config, record, record.comparison, ui)) return record;
-    } else await superviseLane(config, record, record, leased, checkHeartbeat);
+    } else await superviseLane(config, record, record, leased, checkHeartbeat, ui);
     checkHeartbeat();
     await integrate(config, record);
   } catch (error) {
@@ -916,6 +965,7 @@ async function createRun(config: Config, repo: string, requested: Spec, workerMo
       { ...emptyLane(), slot: "A", task_id: a }, { ...emptyLane(), slot: "B", task_id: b },
     ] };
   }
+  if (run.limits) record.limits = run.limits;
   if (record.repository !== repo || record.base !== intent.base || record.branch !== branch) throw new Error("Run handoff disagrees with its durable intent.");
   if (workerModel) record.worker_model = workerModel;
   save(record, config);

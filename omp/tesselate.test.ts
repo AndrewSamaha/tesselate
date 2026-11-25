@@ -3,8 +3,9 @@ import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
-import { pathToFileURL } from "node:url";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
+const here = dirname(fileURLToPath(import.meta.url));
 
 // A fake CLI and fake OMP process, but real Git worktrees/commits. Never calls a model.
 const fakeCli = String.raw`#!/usr/bin/env node
@@ -44,7 +45,8 @@ else if (command === 'runs.create') {
     if(db.runKey !== key) throw Error('attempted duplicate run');
     reply({value:db.run});
   } else {
-    db.run={id:id(),project_id:params.project_id,goal:params.goal,status:'active'};
+    db.run={id:id(),project_id:params.project_id,goal:params.goal,status:'active',
+      limits:{max_task_retries:2,max_review_rounds:process.env.FIXTURE_LOW_REVIEW_BUDGET==='1'?1:3}};
     db.runKey=key;db.runCreateCount=1;
     fs.writeFileSync(dbPath,JSON.stringify(db)); // Simulated crash after durable coordinator commit.
     if(process.env.FIXTURE_FAIL_AFTER_RUN_CREATE==='1') process.exit(79);
@@ -94,6 +96,12 @@ else if (command === 'reviews.submit') {
   const review={...params,id:id(),reviewer:actor};db.reviews.push(review);reply({value:review});
 }
 else if (command === 'reviews.disposition') { db.dispositions=params.dispositions;db.task.status='revision_required';reply({value:db.task}); }
+else if (command === 'tasks.repair') {
+  db.repairs=(db.repairs??0)+1;
+  db.task.status='revision_required';
+  db.run.limits={max_task_retries:Math.max(db.run.limits.max_task_retries,db.task.attempts??0),max_review_rounds:Math.max(db.run.limits.max_review_rounds,2)};
+  reply({value:{run:db.run,task:db.task}});
+}
 else if (command === 'tasks.disposition') {db.task.status='completed';reply({value:db.task});}
 else if (command === 'runs.complete') {db.run.status='completed';reply({value:db.run});}
 else throw Error('unsupported fixture operation '+command+' '+a.join(' '));
@@ -146,7 +154,7 @@ function git(repo: string, ...args: string[]): string {
   return execFileSync("git", ["-C", repo, ...args], { encoding: "utf8" }).trim();
 }
 
-export async function runSmoke(trackIgnored = false, trailingReview = false, retryReview = false, workerModel = ""): Promise<void> {
+export async function runSmoke(trackIgnored = false, trailingReview = false, retryReview = false, workerModel = "", repairReview = false): Promise<void> {
   const root = mkdtempSync(join(tmpdir(), "tesselate-omp-fixture-"));
   const previousPath = process.env.PATH;
   const previousRepo = process.env.FIXTURE_REPO;
@@ -157,6 +165,8 @@ export async function runSmoke(trackIgnored = false, trailingReview = false, ret
   const previousTracked = process.env.FIXTURE_TRACK_IGNORED;
   const previousTrailing = process.env.FIXTURE_TRAILING_REVIEW;
   const previousRetry = process.env.FIXTURE_RETRY_REVIEW;
+  const previousLowBudget = process.env.FIXTURE_LOW_REVIEW_BUDGET;
+  if (repairReview) process.env.FIXTURE_LOW_REVIEW_BUDGET = "1";
   try {
     const home = join(root, "home"), workspace_root = join(home, "Development"), repo = join(workspace_root, "sample"), state_dir = join(workspace_root, ".tesselate");
     const ext = join(home, ".omp", "agent", "extensions");
@@ -179,7 +189,7 @@ export async function runSmoke(trackIgnored = false, trailingReview = false, ret
     process.env.FIXTURE_REPO = repo; process.env.FIXTURE_STATE = state_dir;
     const supervisor_credential_file = join(state_dir, "supervisor.token");
     writeFileSync(supervisor_credential_file, "supervisor-token", { mode: 0o600 });
-    copyFileSync(join(import.meta.dir, "tesselate.ts"), join(ext, "tesselate.ts"));
+    copyFileSync(join(here, "tesselate.ts"), join(ext, "tesselate.ts"));
     writeFileSync(join(ext, "tesselate.config.json"), JSON.stringify({ binary, state_dir, workspace_root, supervisor_credential_file }), { mode: 0o600 });
     const canonicalRepo = realpathSync(repo);
     const policyDir = join(state_dir, "projects", createHash("sha256").update(canonicalRepo).digest("hex"));
@@ -192,14 +202,26 @@ export async function runSmoke(trackIgnored = false, trailingReview = false, ret
     let tool: { execute: (...args: unknown[]) => Promise<{ content: Array<{ text: string }> }> } | undefined;
     const messages: string[] = [];
     const notifications: string[] = [];
+    const repairPrompts: string[] = [];
     const ui = { input: async (question: string) => question.startsWith("Acceptance") ? "feature.txt is committed" : "no shared-service tests",
-      select: async (question: string, choices: string[]) => question.startsWith("Which repository") ? "sample" : question.startsWith("Resume") ? choices[0] : "main",
+      select: async (question: string, choices: string[]) => {
+        if (question.includes("stopped:")) {
+          repairPrompts.push(question);
+          if (!repairReview) throw new Error(`Unexpected repair prompt: ${question}`);
+          return choices[0];
+        }
+        return question.startsWith("Which repository") ? "sample" : question.startsWith("Resume") ? choices[0] : "main";
+      },
       confirm: async () => true, notify: () => {} };
     let featureCommand: ((args: string, ctx: { cwd: string; ui: typeof ui }) => Promise<void>) | undefined;
     const resumeUi = { ...ui, input: async () => { throw new Error("Resume must not ask for a new specification."); },
       select: async (question: string, choices: string[]) => {
         if (question.startsWith("Which repository")) return "sample";
         if (question.startsWith("Which Tesselate feature")) return choices[0];
+        if (question.includes("stopped:")) {
+          repairPrompts.push(question);
+          return choices[0];
+        }
         throw new Error(`Unexpected resume selection: ${question}`);
       }, notify: (message: string) => { notifications.push(message); } };
     const pi = { zod: { object: () => ({}), string: () => ({ optional: () => ({}) }) }, on: (event: string, handler: typeof inputHandler) => { if (event === "input") inputHandler = handler; },
@@ -334,6 +356,12 @@ export async function runSmoke(trackIgnored = false, trailingReview = false, ret
     const database = JSON.parse(readFileSync(join(state_dir, "fixture-db.json"), "utf8"));
     assert.equal(database.rounds.length, 2);
     assert.equal(database.dispositions[0].disposition, "fixed");
+    if (repairReview) {
+      assert.equal(repairPrompts.length, 1);
+      assert.match(repairPrompts[0], /Review round or coding retry budget exhausted/);
+      assert.equal(database.repairs, 1);
+      assert.equal(database.run.limits.max_review_rounds, 2);
+    } else assert.equal(database.repairs, undefined);
     assert.equal(database.task.submitted_commits[0].commit_id, record.last_head);
     assert.equal(new Set(database.reviews.map((review: { reviewer: string }) => review.reviewer)).size, 2);
     // Reopening a completed run reads the durable handoff; no worker starts again.
@@ -352,6 +380,7 @@ export async function runSmoke(trackIgnored = false, trailingReview = false, ret
     if (previousTracked === undefined) delete process.env.FIXTURE_TRACK_IGNORED; else process.env.FIXTURE_TRACK_IGNORED = previousTracked;
     if (previousTrailing === undefined) delete process.env.FIXTURE_TRAILING_REVIEW; else process.env.FIXTURE_TRAILING_REVIEW = previousTrailing;
     if (previousRetry === undefined) delete process.env.FIXTURE_RETRY_REVIEW; else process.env.FIXTURE_RETRY_REVIEW = previousRetry;
+    if (previousLowBudget === undefined) delete process.env.FIXTURE_LOW_REVIEW_BUDGET; else process.env.FIXTURE_LOW_REVIEW_BUDGET = previousLowBudget;
     rmSync(root, { recursive: true, force: true });
   }
 }
@@ -389,7 +418,7 @@ command = "${rejectA ? "git status --short" : validation}"
     const cli = (...args: string[]) => execFileSync(binary, ["--state-dir", state_dir, ...args], { encoding: "utf8" });
     const { credential_file } = JSON.parse(cli("credential", "bootstrap", "--actor-name", "test-supervisor"));
     const extPath = join(root, "tesselate.ts");
-    copyFileSync(join(import.meta.dir, "tesselate.ts"), extPath);
+    copyFileSync(join(here, "tesselate.ts"), extPath);
     writeFileSync(join(root, "tesselate.config.json"), JSON.stringify({ binary, state_dir, workspace_root: root, supervisor_credential_file: credential_file }));
     const ext = (await import(pathToFileURL(extPath).href)).default;
     const ui = {
