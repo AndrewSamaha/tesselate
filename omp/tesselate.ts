@@ -201,7 +201,7 @@ async function chooseRepo(cwd: string, config: Config, ui: UIOps): Promise<strin
   }
 }
 
-type WorkflowPresets = { defaultName: string; workflows: Map<string, Workflow> };
+type RepoSettings = { defaultName: string; workflows: Map<string, Workflow>; validationCommand?: string };
 const workflowNamePattern = /^[A-Za-z0-9_-]+$/;
 
 function tomlTable(value: unknown): value is Record<string, unknown> {
@@ -209,7 +209,7 @@ function tomlTable(value: unknown): value is Record<string, unknown> {
     (Object.getPrototypeOf(value) === Object.prototype || Object.getPrototypeOf(value) === null);
 }
 
-function readWorkflows(repo: string): WorkflowPresets {
+function readRepoSettings(repo: string): RepoSettings {
   const path = join(repo, ".tesselate.toml");
   const workflows = new Map<string, Workflow>([
     ["standard", { candidates: 1, reviewers_per_candidate: 2 }],
@@ -224,8 +224,17 @@ function readWorkflows(repo: string): WorkflowPresets {
   } catch (error) {
     throw new Error(`Cannot read ${path}: ${cleanError(error)}`);
   }
-  if (!tomlTable(raw) || Object.keys(raw).some(key => key !== "default_workflow" && key !== "workflows")) {
-    throw new Error(`Invalid ${path}: expected only default_workflow and workflows.`);
+  if (!tomlTable(raw) || Object.keys(raw).some(key => !["default_workflow", "workflows", "validation"].includes(key))) {
+    throw new Error(`Invalid ${path}: expected only default_workflow, workflows, and validation.`);
+  }
+  let validationCommand: string | undefined;
+  if (raw.validation !== undefined) {
+    const validation = raw.validation;
+    if (!tomlTable(validation) || Object.keys(validation).some(key => key !== "command") ||
+        typeof validation.command !== "string" || !validation.command.trim()) {
+      throw new Error(`Invalid ${path} [validation]: command must be a non-empty string, with no additional settings.`);
+    }
+    validationCommand = validation.command.trim();
   }
   if (raw.workflows !== undefined) {
     if (!tomlTable(raw.workflows)) throw new Error(`Invalid ${path}: workflows must be a table of presets.`);
@@ -260,10 +269,10 @@ function readWorkflows(repo: string): WorkflowPresets {
   if (typeof defaultName !== "string" || !workflows.has(defaultName)) {
     throw new Error(`Invalid ${path}: default_workflow must name a workflow preset.`);
   }
-  return { defaultName, workflows };
+  return { defaultName, workflows, validationCommand };
 }
 
-function resolveWorkflow(presets: WorkflowPresets, requested?: string): Workflow {
+function resolveWorkflow(presets: RepoSettings, requested?: string): Workflow {
   const name = requested?.trim() || presets.defaultName;
   const workflow = presets.workflows.get(name);
   if (!workflow) throw new Error(`Unknown workflow preset "${name}". Available presets: ${[...presets.workflows.keys()].join(", ")}.`);
@@ -570,16 +579,20 @@ async function performReviews(config: Config, record: RunRecord, lane: TaskLane)
   }
   return reviews;
 }
-class ValidationFailed extends Error {}
-async function validate(record: RunRecord, config: Config, state: ValidationState = record,
-                        cwd = record.integration_dir, label = "validation"): Promise<void> {
-  const command = record.spec.validation_command.trim();
+function checkValidationCommand(command: string): void {
   if (!command || /[;&|`$<>\n\r]/.test(command) ||
       /\b(?:git\s+(?:push|merge|checkout|switch|reset)|redis-cli|pnpm\s+dev|docker\s+compose\s+up)\b/i.test(command) ||
       (/^git\s/i.test(command) && !/^git\s+(?:diff|status|log|show|rev-parse)\b/i.test(command)) ||
       /^(?:gh|hub|workmux|ssh|rsync|curl|wget|docker|bash|sh)\b/i.test(command)) {
     throw new Error("Choose one safe, explicit validation command (no shell chaining, push, merge, or shared services).");
   }
+}
+
+class ValidationFailed extends Error {}
+async function validate(record: RunRecord, config: Config, state: ValidationState = record,
+                        cwd = record.integration_dir, label = "validation"): Promise<void> {
+  const command = record.spec.validation_command.trim();
+  checkValidationCommand(command);
   if (state.validation_passed) return;
   if (state.validation_log) throw new Error(`Previous validation was interrupted or failed. Inspect ${state.validation_log} and explicitly approve a retry before resuming.`);
   const root = join(config.state_dir, "omp-runs", record.run_id);
@@ -1201,7 +1214,7 @@ export async function startFeature(config: Config, cwd: string, spec: Spec, ui: 
     const match = existingRun.find(x => selected.startsWith(`Resume ${x.run.id}:`));
     if (match) return resumeRecord(config, match.record, ui, workerModel);
   }
-  workflow ??= resolveWorkflow(readWorkflows(repo));
+  workflow ??= resolveWorkflow(readRepoSettings(repo));
   const base = await selectBase(repo, ui);
   spec.base_branch = base.branch;
   const approved = await approveProvisioning(config, repo, ui);
@@ -1218,24 +1231,27 @@ export async function startFeature(config: Config, cwd: string, spec: Spec, ui: 
 export default function tesselateExtension(pi: ExtensionAPI): void {
   if (process.env.TESSELATE_WORKER === "1") return;
   const configPath = join(dirname(new URL(import.meta.url).pathname), "tesselate.config.json");
-  let pending: { cwd: string; source_cwd: string; presets: WorkflowPresets; workflowName?: string } | undefined;
+  let pending: { cwd: string; source_cwd: string; settings: RepoSettings; workflowName?: string } | undefined;
   function configured(): Config { return configAt(configPath); }
   async function kickoff(goal: string, cwd: string, ui: UIOps, workflowName?: string): Promise<void> {
     pending = undefined;
     try {
       const source_cwd = cwd;
       cwd = await chooseRepo(cwd, configured(), ui);
-      const presets = readWorkflows(cwd);
-      if (workflowName) resolveWorkflow(presets, workflowName);
+      const settings = readRepoSettings(cwd);
+      if (workflowName) resolveWorkflow(settings, workflowName);
       const acceptance = await ui.input("Acceptance criteria (observable result; required)");
       if (!acceptance?.trim()) return ui.notify("Feature cancelled: acceptance criteria are required.", "warning");
       const constraints = await ui.input("Constraints / prohibited actions (blank if none)");
       if (constraints === undefined) return;
-      pending = { cwd, source_cwd, presets, workflowName };
+      pending = { cwd, source_cwd, settings, workflowName };
       const workflowInstruction = workflowName
         ? `The user selected workflow "${workflowName}" via /feature; omit the workflow parameter.`
         : `If the user explicitly requests two independent implementations, propose workflow: "compare". Otherwise omit workflow to use the repository default.`;
-      pi.sendUserMessage(`Draft a clear, concise feature specification from this user request. Goal: ${goal}\nAcceptance criteria: ${acceptance}\nConstraints: ${constraints || "None specified"}\nAsk clarifying questions if needed. Inspect repository test instructions and propose a safe validation_command for non-agent worktrees; comparison also runs it in dedicated candidate validation worktrees. Then call tesselate_feature_start with the agreed goal, acceptance_criteria, constraints, and proposed validation_command. ${workflowInstruction} If the tool asks for a missing command, inspect the repository and retry. Do not start coding in this main session; the tool will confirm the branch and workflow before launching separate OMP sessions.`, { attribution: "agent" });
+      const validationInstruction = settings.validationCommand
+        ? "This repository has a default validation command. Omit validation_command; set validation_override only if the user explicitly requests a different command."
+        : "Inspect the repository's build instructions and scripts. Set validation_command to the existing build command for the affected target when it is clear and safe. If the user explicitly requests a different command, set validation_override. If the target or command is ambiguous, omit both to let the user choose; don't guess.";
+      pi.sendUserMessage(`Draft a clear, concise feature specification from this user request. Goal: ${goal}\nAcceptance criteria: ${acceptance}\nConstraints: ${constraints || "None specified"}\nAsk clarifying questions if needed. Call tesselate_feature_start with the agreed goal, acceptance_criteria, and constraints. ${workflowInstruction} ${validationInstruction} Validation never runs in agent worktrees. Do not start coding in this main session; the tool will confirm the branch, workflow, and exact validation command before launching separate OMP sessions.`, { attribution: "agent" });
     } catch (error) { ui.notify(cleanError(error), "error"); }
   }
   pi.on("input", async (event, ctx) => {
@@ -1272,21 +1288,28 @@ export default function tesselateExtension(pi: ExtensionAPI): void {
     if (requestedGoal?.trim()) await kickoff(requestedGoal.trim(), ctx.cwd, ctx.ui, workflowName);
   } });
   pi.registerTool({ name: "tesselate_feature_start", label: "Start Tesselate feature", description: "After agreeing on a specification, launch role-separated OMP processes in Tesselate workspaces. Requires a user-initiated /feature or feature input.",
-    parameters: pi.zod.object({ goal: pi.zod.string(), acceptance_criteria: pi.zod.string(), constraints: pi.zod.string(), validation_command: pi.zod.string(), workflow: pi.zod.string().optional() }),
+    parameters: pi.zod.object({
+      goal: pi.zod.string(), acceptance_criteria: pi.zod.string(), constraints: pi.zod.string(),
+      validation_command: pi.zod.string().optional(), validation_override: pi.zod.string().optional(), workflow: pi.zod.string().optional(),
+    }),
     async execute(_id, params, _signal, _update, ctx) {
       if (!pending || pending.source_cwd !== ctx.cwd) return { content: [{ type: "text", text: "Use /feature or submit a feature request first; no workflow started." }] };
       const request = pending;
       if (!params.goal.trim() || !params.acceptance_criteria.trim()) return { content: [{ type: "text", text: "Goal and acceptance criteria are required." }] };
       let workflow: Workflow;
-      try { workflow = resolveWorkflow(request.presets, request.workflowName ?? params.workflow); }
+      try { workflow = resolveWorkflow(request.settings, request.workflowName ?? params.workflow); }
       catch (error) {
         return { content: [{ type: "text", text: `${cleanError(error)} No run started.` }], isError: true };
       }
-      const proposed = params.validation_command.trim();
-      const entered = await ctx.ui.input(`Validation command for ${validationLocation(workflow)} (press Enter to use agent proposal: ${proposed || "none"})`);
-      if (entered === undefined) return { content: [{ type: "text", text: "Validation selection cancelled; no run started." }] };
-      const validation = entered.trim() || proposed;
-      if (!validation) return { content: [{ type: "text", text: "No validation command proposed. Inspect repository test instructions, choose a safe validation command, and call tesselate_feature_start again; no run started." }] };
+      const configuredCommand = params.validation_override?.trim() || request.settings.validationCommand || params.validation_command?.trim();
+      const selected = configuredCommand || await ctx.ui.input(`No default or proposed build command. Which validation command should run in ${validationLocation(workflow)}?`);
+      if (selected === undefined) return { content: [{ type: "text", text: "Validation selection cancelled; no run started." }] };
+      const validation = selected.trim();
+      if (!validation) return { content: [{ type: "text", text: "No validation command selected. Clarify the build target or ask which check to run, then retry; no run started." }] };
+      try { checkValidationCommand(validation); }
+      catch (error) {
+        return { content: [{ type: "text", text: `${cleanError(error)} No run started.` }], isError: true };
+      }
       pending = undefined;
       try {
         const result = await startFeature(configured(), request.cwd, { goal: params.goal, acceptance_criteria: params.acceptance_criteria, constraints: params.constraints, validation_command: validation, base_branch: "" }, ctx.ui, selectedModel(ctx), workflow);

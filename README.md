@@ -234,10 +234,22 @@ worktrees nor executes workmux `post_create`, `pre_merge`, or `pre_remove` hooks
 which can run arbitrary commands. Symlinks, tracked paths, and changed
 destinations stop provisioning for inspection; file contents are never logged.
 
-The agent proposes a validation command from repository instructions. At the
-validation prompt, press Enter to use that proposal or type an override; start
-confirmation shows the exact command and where it will run. If no command was
-proposed, the agent must investigate rather than starting without validation.
+Set a repository-wide validation default in `.tesselate.toml` at the repo root.
+For example, to use a Bitwars engine build:
+
+```toml
+[validation]
+command = "cargo build -p rts-engine"
+```
+
+OMP includes that command in the normal start confirmation without a separate
+command prompt. To override it for one run, include the exact command in your
+feature request (for example, “For this run, validate with `cargo test -p
+rts-engine --lib`”). With no default, OMP proposes an existing build command
+for the affected target when clear, and asks for a command only when it has
+no proposal. `/feature resume` uses the approved command saved with the run.
+A successful build verifies compilation, not feature behavior; choose a
+targeted test when the acceptance criteria need it.
 
 The extension launches separate OMP processes for coders and reviewers using
 the initiating session's selected model. Select the model before starting or

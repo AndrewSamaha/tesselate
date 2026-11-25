@@ -220,16 +220,21 @@ export async function runSmoke(trackIgnored = false, trailingReview = false, ret
     const missing = await tool!.execute("call", { ...proposal, validation_command: "" }, undefined, undefined, { cwd: workspace_root, ui: {
       ...ui, input: async () => "", confirm: async () => { throw new Error("Unproposed validation must not start a run"); }
     } });
-    assert.match(missing.content[0].text, /Inspect repository test instructions/);
-    const cancelled = await tool!.execute("call", proposal, undefined, undefined, { cwd: workspace_root, ui: {
+    assert.match(missing.content[0].text, /No validation command selected/);
+    const cancelled = await tool!.execute("call", { ...proposal, validation_command: undefined }, undefined, undefined, { cwd: workspace_root, ui: {
       ...ui, input: async () => undefined, confirm: async () => { throw new Error("Cancelled validation must not start a run"); }
     } });
     assert.match(cancelled.content[0].text, /cancelled; no run started/);
+    const unsafe = await tool!.execute("call", { ...proposal, validation_command: "git push" }, undefined, undefined, { cwd: workspace_root, ui: {
+      ...ui, input: async () => { throw new Error("A proposed build should not prompt for a command"); },
+      confirm: async () => { throw new Error("Rejected validation must not start a run"); },
+    } });
+    assert.match(unsafe.content[0].text, /no shell chaining, push, merge, or shared services.*No run started/);
     const confirmations: string[] = [];
     process.env.FIXTURE_FAIL_AFTER_RUN_CREATE = "1";
     const modelContext = workerModel ? { model: { provider: workerModel.split("/")[0], id: workerModel.split("/").slice(1).join("/") } } : {};
     const interrupted = await tool!.execute("call", proposal, undefined, undefined, { cwd: workspace_root, ...modelContext, ui: {
-      ...ui, input: async () => "", confirm: async (question: string) => {
+      ...ui, input: async () => { throw new Error("A proposed build should not prompt for a command"); }, confirm: async (question: string) => {
         confirmations.push(question);
         return true;
       }
@@ -367,12 +372,16 @@ export async function runComparisonSmoke(binary: string, rejectA = false): Promi
     writeFileSync(join(repo, "README.md"), "Original\n");
     writeFileSync(join(repo, ".gitignore"), ".workmux-local/\n");
     const presets = join(repo, ".tesselate.toml");
+    const validation = "git diff --exit-code main HEAD -- README.md";
     writeFileSync(presets, `default_workflow = "standard"
 [workflows.experiment]
 candidates = 2
 reviewers_per_candidate = 2
 comparison_reviewers = 1
 winner_approval = "human"
+
+[validation]
+command = "${rejectA ? "git status --short" : validation}"
 `);
     git(repo, "add", ".");
     git(repo, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "Base");
@@ -384,7 +393,11 @@ winner_approval = "human"
     writeFileSync(join(root, "tesselate.config.json"), JSON.stringify({ binary, state_dir, workspace_root: root, supervisor_credential_file: credential_file }));
     const ext = (await import(pathToFileURL(extPath).href)).default;
     const ui = {
-      input: async (question: string) => question.startsWith("Acceptance") ? "feature.txt is committed" : "",
+      input: async (question: string) => {
+        if (question.startsWith("Acceptance")) return "feature.txt is committed";
+        if (question.startsWith("Constraints")) return "";
+        throw new Error(`A configured build should not prompt for a command: ${question}`);
+      },
       select: async (question: string, choices: string[]) => {
         if (question.startsWith("Use a local")) return "main";
         if (question.includes("Which candidate")) {
@@ -395,7 +408,10 @@ winner_approval = "human"
         if (choices.includes("main")) return "main";
         throw new Error(`Unexpected selection: ${question}`);
       },
-      confirm: async () => true,
+      confirm: async (question: string) => {
+        assert.ok(question.includes(`: ${validation}\n`), question);
+        return true;
+      },
       notify: (message: string, level: string) => { if (level === "error") throw new Error(message); },
     };
     type Feature = (args: string, ctx: { cwd: string; ui: typeof ui }) => Promise<void>;
@@ -413,7 +429,8 @@ winner_approval = "human"
     const session = register();
     await session.feature("--workflow experiment Write feature.txt", { cwd: repo, ui });
     const result = await session.start("call", { goal: "Write feature.txt", acceptance_criteria: "feature.txt is committed",
-      constraints: "", validation_command: `git diff --exit-code ${base} HEAD -- README.md` }, undefined, undefined, { cwd: repo, ui });
+      constraints: "", validation_command: "false", ...(rejectA ? { validation_override: validation } : {}) },
+      undefined, undefined, { cwd: repo, ui });
     assert.match(result.content[0].text, /run ([0-9a-f-]+): comparing/);
     const runId = result.content[0].text.match(/run ([0-9a-f-]+): comparing/)![1];
     const handoff = join(state_dir, "omp-runs", runId, "record.json");
@@ -432,7 +449,7 @@ winner_approval = "human"
     assert.equal(workers.filter(worker => worker.role === "comparison").length, rejectA ? 0 : 1);
     assert.ok(workers.filter(worker => worker.role !== "coder").every(worker => worker.readOnly));
     assert.match(cli("status"), /paused · nothing integrated/);
-    writeFileSync(presets, "invalid for future runs"); // Resume uses the persisted plan, not current repo config.
+    writeFileSync(presets, '[validation]\ncommand = "false"\n'); // Resuming must validate integration with the approved command.
     await register().feature(`resume ${runId}`, { cwd: repo, ui: {
       ...ui, input: async () => { throw new Error("Resume asked for a new spec"); },
       select: async (_question, choices) => choices.find(choice => choice.startsWith("Integrate candidate B"))!,
