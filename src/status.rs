@@ -4,7 +4,9 @@
 //! This module renders those heartbeats, falling back to recorded worker state and
 //! OMP session activity when a run predates heartbeat support.
 
+use crate::core::RunStatus;
 use chrono::{DateTime, Local, Utc};
+use rusqlite::{Connection, OpenFlags};
 use serde::Deserialize;
 use std::{
     collections::BTreeMap,
@@ -19,6 +21,12 @@ const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "�
 const FRESH_SECONDS: i64 = 15;
 const ACTIVE_MS: u64 = 45_000;
 const TAIL_BYTES: u64 = 128 * 1024;
+
+#[derive(Debug, Deserialize)]
+struct CoordinatorRun {
+    id: String,
+    status: RunStatus,
+}
 
 #[derive(Debug, Default, Deserialize)]
 struct RunRecord {
@@ -123,12 +131,12 @@ struct Activity {
 }
 
 /// Run a one-shot snapshot or continuously refresh until interrupted.
-pub fn run(state_dir: &Path, watch: bool, interval_ms: u64) -> io::Result<()> {
+pub fn run(state_dir: &Path, watch: bool, interval_ms: u64, all: bool) -> io::Result<()> {
     let interval = Duration::from_millis(interval_ms.clamp(80, 5_000));
     let stdout = io::stdout();
     let mut frame = 0usize;
     loop {
-        let runs = snapshot(state_dir);
+        let runs = snapshot(state_dir, all);
         let body = render(&runs, frame, terminal_width());
         let mut out = stdout.lock();
         if watch {
@@ -152,11 +160,12 @@ pub fn run(state_dir: &Path, watch: bool, interval_ms: u64) -> io::Result<()> {
     }
 }
 
-fn snapshot(state_dir: &Path) -> Vec<RunView> {
+fn snapshot(state_dir: &Path, all: bool) -> Vec<RunView> {
     let root = state_dir.join("omp-runs");
     let Ok(entries) = fs::read_dir(&root) else {
         return Vec::new();
     };
+    let statuses = coordinator_statuses(state_dir);
     let mut runs = Vec::new();
     for entry in entries.flatten() {
         let dir = entry.path();
@@ -173,10 +182,44 @@ fn snapshot(state_dir: &Path) -> Vec<RunView> {
         if record.run_id.is_empty() {
             continue;
         }
+        if !all && !is_active(&record, statuses.get(&record.run_id)) {
+            continue;
+        }
         runs.push(build_run(&dir, record));
     }
     runs.sort_by_key(|run| std::cmp::Reverse(run.updated));
     runs
+}
+
+fn is_active(record: &RunRecord, status: Option<&RunStatus>) -> bool {
+    // Fall back to the old behavior when the coordinator database is unavailable
+    // (for example, a handoff copied without its state database).
+    if let Some(status) = status {
+        if *status != RunStatus::Active {
+            return false;
+        }
+    }
+    !record
+        .comparison
+        .as_ref()
+        .is_some_and(|comparison| comparison.waiting.is_some())
+}
+
+fn coordinator_statuses(state_dir: &Path) -> BTreeMap<String, RunStatus> {
+    let path = state_dir.join("coordinator.sqlite3");
+    let Ok(connection) = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY) else {
+        return BTreeMap::new();
+    };
+    let Ok(mut statement) = connection.prepare("SELECT payload_json FROM runs") else {
+        return BTreeMap::new();
+    };
+    let Ok(rows) = statement.query_map([], |row| row.get::<_, String>(0)) else {
+        return BTreeMap::new();
+    };
+    rows.flatten()
+        .filter_map(|payload| serde_json::from_str::<CoordinatorRun>(&payload).ok())
+        .map(|run| (run.id, run.status))
+        .collect()
 }
 
 fn build_run(dir: &Path, record: RunRecord) -> RunView {
@@ -667,7 +710,7 @@ mod tests {
             heartbeat("coder", "revise return behavior · round 2", "editing files · 2s ago", "working", true, &now),
         )
         .unwrap();
-        let runs = snapshot(&temp.0);
+        let runs = snapshot(&temp.0, true);
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].phase, "coding");
         assert!(runs[0].supervisor.working);
@@ -712,7 +755,7 @@ mod tests {
             heartbeat("supervisor", "Make idle units return after combat", "coding · round 2", "working", true, &stale),
         )
         .unwrap();
-        let runs = snapshot(&temp.0);
+        let runs = snapshot(&temp.0, true);
         assert!(runs[0].supervisor_stale);
         assert!(!runs[0].supervisor.working);
         assert_eq!(runs[0].supervisor.status, "no supervisor heartbeat");
@@ -722,9 +765,52 @@ mod tests {
     }
 
     #[test]
+    fn active_filter_hides_stopped_and_paused_runs() {
+        let temp = TempDir::new();
+        let active = "12345678-90ab-4cde-8f01-234567890abc";
+        let paused = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+        let stopped = "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff";
+        for id in [active, paused, stopped] {
+            fs::create_dir_all(temp.0.join("omp-runs").join(id)).unwrap();
+        }
+        write_record(&temp.0.join("omp-runs").join(active), "");
+        fs::write(
+            temp.0.join("omp-runs").join(paused).join("record.json"),
+            format!(
+                r#"{{"version":1,"run_id":"{paused}","repository":"/tmp/demo","phase":"comparing","spec":{{"goal":"paused"}},"workers":{{}},"comparison":{{"waiting":"paused · nothing integrated","lanes":[]}}}}"#
+            ),
+        )
+        .unwrap();
+        fs::write(
+            temp.0.join("omp-runs").join(stopped).join("record.json"),
+            format!(
+                r#"{{"version":1,"run_id":"{stopped}","repository":"/tmp/demo","phase":"revision","spec":{{"goal":"stopped"}},"workers":{{}},"error":"task retry limit reached"}}"#
+            ),
+        )
+        .unwrap();
+        let connection = Connection::open(temp.0.join("coordinator.sqlite3")).unwrap();
+        connection
+            .execute_batch("CREATE TABLE runs(id TEXT PRIMARY KEY, payload_json TEXT NOT NULL);")
+            .unwrap();
+        for (id, status) in [(active, "active"), (paused, "active"), (stopped, "stopped")] {
+            connection
+                .execute(
+                    "INSERT INTO runs(id,payload_json) VALUES (?1,?2)",
+                    rusqlite::params![id, format!(r#"{{"id":"{id}","status":"{status}"}}"#)],
+                )
+                .unwrap();
+        }
+
+        let active_only = snapshot(&temp.0, false);
+        assert_eq!(active_only.len(), 1);
+        assert_eq!(active_only[0].short, "12345678");
+        assert_eq!(snapshot(&temp.0, true).len(), 3);
+    }
+
+    #[test]
     fn missing_state_is_empty() {
         let temp = TempDir::new();
-        assert!(snapshot(&temp.0).is_empty());
+        assert!(snapshot(&temp.0, true).is_empty());
         let rendered = render(&[], 3, 80);
         assert!(rendered.contains("No OMP runs"));
         assert!(rendered.contains("0 runs"));

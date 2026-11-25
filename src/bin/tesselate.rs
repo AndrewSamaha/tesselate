@@ -15,8 +15,13 @@ async fn main() -> ExitCode {
         Ok(path) => path,
         Err(error) => return report(error),
     };
-    if let Command::Status { watch, interval_ms } = &cli.command {
-        return match tesselate::status::run(&state_dir, *watch, *interval_ms) {
+    if let Command::Status {
+        watch,
+        interval_ms,
+        all,
+    } = &cli.command
+    {
+        return match tesselate::status::run(&state_dir, *watch, *interval_ms, *all) {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => report(error),
         };

@@ -96,13 +96,16 @@ pub enum Command {
         #[command(subcommand)]
         action: ArtifactAction,
     },
-    /// Show live OMP run and agent status (read-only).
+    /// Show live active OMP run and agent status (read-only).
     Status {
         /// Refresh continuously until interrupted.
         #[arg(long)]
         watch: bool,
         #[arg(long, default_value_t = 150)]
         interval_ms: u64,
+        /// Include completed, stopped, paused, and other inactive runs.
+        #[arg(long)]
+        all: bool,
     },
     /// Start the one shared coordinator for MCP harness sessions.
     Serve,

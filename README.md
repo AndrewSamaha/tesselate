@@ -272,11 +272,14 @@ No automatic push, PR creation, or merge into local `main`.
 
 ## Live status
 
-Watch every OMP-coordinated run, grouped by `run_id`, with one line per agent:
+Watch active OMP-coordinated runs, grouped by `run_id`, with one line per agent:
 
 ```sh
 tesselate status --watch
 ```
+
+Completed, stopped, and paused runs are hidden; use `tesselate status --all` or
+`tesselate status --watch --all` to include them.
 
 Each line shows the role, its assignment, and current status. Active agents show
 an animated cursor. The OMP bridge writes supervisor and worker heartbeats every
