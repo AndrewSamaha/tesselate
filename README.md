@@ -177,6 +177,13 @@ reopens the task, and records a `task.repaired` event. Manual repair leaves the
 run stopped or the comparison candidate failed; use `/feature resume` after
 resolving the cause outside Tesselate.
 
+When a resumed run completes, the extension writes
+`omp-runs/<run-id>/completion.json` and injects a short completion message into
+the OMP session so the agent and user see the result instead of only a transient
+notification. Use `/feature status` for the latest run in the current repository,
+or `/feature status <full-run-UUID>` for a specific run. Status works for active,
+paused, stopped, and completed runs.
+
 ### Compare two implementations
 
 In OMP, use `/feature --workflow compare <goal>`, or explicitly ask for two

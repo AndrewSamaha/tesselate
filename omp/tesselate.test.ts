@@ -323,6 +323,13 @@ export async function runSmoke(trackIgnored = false, trailingReview = false, ret
     if (retryReview) assert.ok(readdirSync(join(state_dir, "omp-runs", interruptedRun)).some(name => name.startsWith("reviewer-0-round-1.log.attempt-")));
     const record = JSON.parse(readFileSync(join(state_dir, "omp-runs", interruptedRun, "record.json"), "utf8"));
     assert.equal(record.phase, "done");
+    const completion = JSON.parse(readFileSync(join(state_dir, "omp-runs", interruptedRun, "completion.json"), "utf8"));
+    assert.equal(completion.phase, "done");
+    assert.match(completion.summary, /Tesselate run .*: done/);
+    assert.ok(messages.some(message => message.includes(`Tesselate run ${interruptedRun}: done`)));
+    notifications.length = 0;
+    await featureCommand!("status", { cwd: workspace_root, ui: resumeUi });
+    assert.ok(notifications.some(message => message.includes(`Tesselate run ${interruptedRun}: done`)));
     assert.equal(git(repo, "rev-parse", "main"), mainHead);
     assert.equal(git(record.integration_dir, "rev-parse", "HEAD"), record.last_head);
     assert.equal(statSync(integrationEnv).mode & 0o077, 0);
@@ -451,7 +458,10 @@ command = "${rejectA ? "git status --short" : validation}"
         zod: { object: () => ({}), string: () => ({ optional: () => ({}) }) },
         on: () => {}, registerCommand: (_: string, definition: { handler: Feature }) => { feature = definition.handler; },
         registerTool: (definition: { execute: Start }) => { start = definition.execute; },
-        sendUserMessage: (message: string) => assert.match(message, /selected workflow "experiment"/),
+        sendUserMessage: (message: string) => {
+          if (/selected workflow "experiment"/.test(message)) return;
+          assert.match(message, /Tesselate run .*: (done|paused)/);
+        },
       } as unknown as Parameters<typeof ext>[0]);
       return { feature, start };
     };

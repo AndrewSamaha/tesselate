@@ -45,6 +45,8 @@ type RunRecord = TaskLane & ValidationState & {
   provisioning?: Provisioning; worker_model?: string; workflow?: Workflow; comparison?: Comparison;
 };
 type RunIntent = { version: 1; repository: string; project_id: string; repository_id: string; spec: Spec; base: string; key: string; supervisor_credential_file: string; run_id?: string; worker_model?: string; workflow?: Workflow };
+type Completion = { version: 1; run_id: string; phase: string; recorded_at: string; repository: string; branch: string;
+  integration_dir: string; head?: string; validation_passed?: boolean; error?: string; summary: string };
 type UIOps = { input(question: string): Promise<string | undefined>; select(question: string, choices: string[]): Promise<string | undefined>; confirm(question: string): Promise<boolean>; notify(message: string, level: "info" | "warning" | "error"): void };
 
 function configAt(path: string): Config {
@@ -849,7 +851,10 @@ async function integrate(config: Config, record: RunRecord): Promise<void> {
 }
 
 async function supervise(config: Config, record: RunRecord, ui: UIOps): Promise<RunRecord> {
-  if (record.phase === "done") return record;
+  if (record.phase === "done") {
+    writeCompletion(config, record);
+    return record;
+  }
   if (!record.comparison && !record.limits) {
     const current = (await listed<RunSummary>(config, config.supervisor_credential_file, "runs.list",
       { project_id: record.project_id, page: { limit: 50, after: null } })).find(run => run.id === record.run_id);
@@ -908,6 +913,7 @@ async function supervise(config: Config, record: RunRecord, ui: UIOps): Promise<
     await integrate(config, record);
   } catch (error) {
     record.error = cleanError(error); save(record, config);
+    writeCompletion(config, record);
     throw error;
   } finally {
     clearInterval(heartbeat);
@@ -915,6 +921,7 @@ async function supervise(config: Config, record: RunRecord, ui: UIOps): Promise<
     writeHeartbeats(config, record, true);
     supervisorStarts.delete(record.run_id);
   }
+  writeCompletion(config, record);
   return record;
 }
 function emptyLane(): TaskLane {
@@ -1202,19 +1209,52 @@ async function verifyProvisioningIgnored(record: RunRecord): Promise<void> {
   }
 }
 
-async function resumableRuns(config: Config, repo: string): Promise<Array<{ run: RunSummary; record: RunRecord }>> {
+function completionSummary(record: RunRecord): string {
+  if (record.phase === "done") {
+    const head = record.last_head ? ` at ${record.last_head}` : "";
+    const validation = record.validation_passed ? "validation passed" : "validation not verified";
+    return `Tesselate run ${record.run_id}: done. Integration branch ${record.branch}${head}; ${validation}. No push or main merge.`;
+  }
+  if (record.error) return `Tesselate run ${record.run_id} paused: ${record.error}`;
+  return `Tesselate run ${record.run_id}: ${record.phase}${record.round ? ` round ${record.round}` : ""}.`;
+}
+function completionPath(config: Config, runId: string): string {
+  return join(config.state_dir, "omp-runs", runId, "completion.json");
+}
+function recordUpdated(config: Config, runId: string): number {
+  try { return statSync(join(config.state_dir, "omp-runs", runId, "record.json")).mtimeMs; }
+  catch { return 0; }
+}
+function writeCompletion(config: Config, record: RunRecord): void {
+  const completion: Completion = {
+    version: 1, run_id: record.run_id, phase: record.phase, recorded_at: new Date().toISOString(),
+    repository: record.repository, branch: record.branch, integration_dir: record.integration_dir,
+    head: record.last_head, validation_passed: record.validation_passed, error: record.error,
+    summary: completionSummary(record),
+  };
+  writeFileSync(completionPath(config, record.run_id), JSON.stringify(completion, null, 2) + "\n", { mode: 0o600 });
+}
+function readCompletion(config: Config, runId: string): Completion | undefined {
+  try { return JSON.parse(readFileSync(completionPath(config, runId), "utf8")) as Completion; }
+  catch { return undefined; }
+}
+async function runsForRepo(config: Config, repo: string): Promise<Array<{ run: RunSummary; record: RunRecord }>> {
   const ensured = await cli<{ project_id: string }>(config, config.supervisor_credential_file, ["project", "ensure", "--repo", repo]);
   const runs = await listed<RunSummary>(config, config.supervisor_credential_file, "runs.list", { project_id: ensured.project_id });
-  return runs.filter(run => run.status === "active" || run.status === "completed").flatMap(run => {
+  return runs.flatMap(run => {
     const record = load(config, run.id);
     return record?.repository === repo ? [{ run, record }] : [];
   });
 }
+async function resumableRuns(config: Config, repo: string): Promise<Array<{ run: RunSummary; record: RunRecord }>> {
+  return (await runsForRepo(config, repo)).filter(item => item.run.status === "active" || item.run.status === "completed");
+}
 async function resumeRecord(config: Config, record: RunRecord, ui: UIOps, workerModel?: string): Promise<RunRecord> {
-  if (record.phase === "done") return record;
+  if (record.phase === "done") { writeCompletion(config, record); return record; }
   record.error = undefined;
   if (workerModel) record.worker_model = workerModel;
   save(record, config);
+  try { unlinkSync(completionPath(config, record.run_id)); } catch { /* No stale completion report. */ }
   await provisionRun(config, record, ui);
   if (record.phase === "integrating" && record.validation_log && !record.validation_passed) {
     if (!await ui.confirm(`Prior integration validation may have failed or been interrupted. Inspect ${record.validation_log}; retry the same approved command on ${record.integration_dir}?`)) {
@@ -1313,14 +1353,40 @@ export default function tesselateExtension(pi: ExtensionAPI): void {
   });
   pi.registerCommand("feature", { description: "Start a Tesselate feature (optionally --workflow <preset>) or resume a run", handler: async (args, ctx) => {
     const request = args.trim();
+    if (request === "status" || request.startsWith("status ")) {
+      const id = request.slice("status".length).trim();
+      if (id && !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)) {
+        ctx.ui.notify("Use /feature status or /feature status <full-run-UUID>.", "error");
+        return;
+      }
+      try {
+        const config = configured();
+        const repo = await chooseRepo(ctx.cwd, config, ctx.ui);
+        const runs = await runsForRepo(config, repo);
+        const chosen = id ? runs.find(item => item.run.id === id)
+          : runs.slice().sort((a, b) => recordUpdated(config, a.run.id) - recordUpdated(config, b.run.id)).at(-1);
+        if (!chosen) {
+          ctx.ui.notify(`No Tesselate run found for ${repo}${id ? ` matching ${id}` : ""}.`, "warning");
+          return;
+        }
+        const summary = readCompletion(config, chosen.record.run_id)?.summary ?? completionSummary(chosen.record);
+        ctx.ui.notify(summary, chosen.record.phase === "done" ? "info" : "warning");
+      } catch (error) {
+        ctx.ui.notify(`Tesselate status unavailable: ${cleanError(error)}`, "error");
+      }
+      return;
+    }
     if (request === "resume" || request.startsWith("resume ")) {
       try {
         const id = request.slice("resume".length).trim();
         if (id && !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)) {
           throw new Error("Use /feature resume or /feature resume <full-run-UUID>.");
         }
-        const result = await resumeFeature(configured(), ctx.cwd, ctx.ui, id || undefined, selectedModel(ctx));
-        ctx.ui.notify(`Tesselate run ${result.run_id}: ${result.phase}. Integration branch ${result.branch}; no push or main merge.`, "info");
+        const config = configured();
+        const result = await resumeFeature(config, ctx.cwd, ctx.ui, id || undefined, selectedModel(ctx));
+        const summary = readCompletion(config, result.run_id)?.summary ?? completionSummary(result);
+        ctx.ui.notify(summary, "info");
+        pi.sendUserMessage(`${summary}\nReport this result to the user. Do not start another run or modify files unless the user asks.`, { attribution: "agent" });
       } catch (error) { ctx.ui.notify(`Tesselate paused: ${cleanError(error)}`, "error"); }
       return;
     }
