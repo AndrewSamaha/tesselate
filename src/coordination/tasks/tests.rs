@@ -1027,3 +1027,178 @@ fn comparison_selects_only_a_review_complete_tip_and_preserves_both_submissions(
         losing_refs
     );
 }
+
+struct ZeroBudgetPolicy;
+impl ProjectWorkflowPolicy for ZeroBudgetPolicy {
+    fn workflow_limits(&self, _: ProjectId) -> CoreResult<WorkflowLimits> {
+        Ok(WorkflowLimits {
+            max_duration_hours: 24,
+            max_concurrent_assignments: 2,
+            max_task_retries: 0,
+            max_review_rounds: 1,
+        })
+    }
+
+    fn comparison_policies(&self, project_id: ProjectId) -> CoreResult<(WorkflowLimits, u32)> {
+        Ok((self.workflow_limits(project_id)?, 2))
+    }
+}
+
+fn zero_engine(db: Database) -> TaskEngine {
+    TaskEngine::new(
+        db,
+        Arc::new(ZeroBudgetPolicy),
+        Arc::new(Reviews),
+        Arc::new(Human::default()),
+        Arc::new(Leases),
+    )
+}
+
+fn failed_candidate(
+    engine: &TaskEngine,
+    db: &Database,
+    supervisor: &SessionContext,
+) -> (Run, TaskId) {
+    let run = engine
+        .create_comparison_run(
+            supervisor,
+            CreateComparisonRun {
+                project_id: seed_project(db, supervisor),
+                goal: "repair".into(),
+                workflow: ComparisonWorkflow {
+                    candidates: 2,
+                    reviewers_per_candidate: 2,
+                    comparison_reviewers: 1,
+                    winner_approval: WinnerApproval::Human,
+                },
+            },
+            IdempotencyKey("create".into()),
+        )
+        .unwrap()
+        .value;
+    let candidate = run.comparison.as_ref().unwrap().candidates[0];
+    let coder = seed_coder(db, supervisor);
+    let coder = SessionContext::validated(SessionId::new(), coder.id, Role::Coder);
+    engine
+        .assign_task(
+            supervisor,
+            AssignTask {
+                task_id: candidate,
+                assignee: coder.actor_id(),
+            },
+            IdempotencyKey("assign".into()),
+        )
+        .unwrap();
+    engine
+        .claim_task(
+            &coder,
+            ClaimTask { task_id: candidate },
+            IdempotencyKey("claim".into()),
+        )
+        .unwrap();
+    engine
+        .record_task_disposition(
+            supervisor,
+            FinalTaskDisposition {
+                task_id: candidate,
+                outcome: FinalTaskOutcome::Failed,
+                reason: "budget".into(),
+            },
+            IdempotencyKey("fail".into()),
+        )
+        .unwrap();
+    (run, candidate)
+}
+
+#[test]
+fn repair_retry_once_extends_zero_budget_and_reopens_task() {
+    let temp = TempDb::new();
+    let db = Database::open(&temp.0).unwrap();
+    let supervisor = context(Role::Supervisor);
+    let engine = zero_engine(db.clone());
+    let (run, task_id) = failed_candidate(&engine, &db, &supervisor);
+    let repaired = engine
+        .repair_task(
+            &supervisor,
+            RepairTask {
+                run_id: run.id,
+                task_id,
+                mode: RepairMode::RetryOnce,
+                reason: "one more round".into(),
+            },
+            IdempotencyKey("repair-retry".into()),
+        )
+        .unwrap()
+        .value;
+    assert_eq!(repaired.task.status, TaskStatus::RevisionRequired);
+    assert_eq!(repaired.task.attempts, 1);
+    assert_eq!(repaired.run.status, RunStatus::Active);
+    assert_eq!(repaired.run.limits.max_task_retries, 1);
+    assert_eq!(repaired.run.limits.max_review_rounds, 1);
+    let coder = seed_coder(&db, &supervisor);
+    let coder = SessionContext::validated(SessionId::new(), coder.id, Role::Coder);
+    engine
+        .assign_task(
+            &supervisor,
+            AssignTask {
+                task_id,
+                assignee: coder.actor_id(),
+            },
+            IdempotencyKey("assign-again".into()),
+        )
+        .unwrap();
+    let claimed = engine
+        .claim_task(
+            &coder,
+            ClaimTask { task_id },
+            IdempotencyKey("claim-again".into()),
+        )
+        .unwrap()
+        .value;
+    assert_eq!(claimed.attempts, 2);
+}
+
+#[test]
+fn repair_reset_attempts_restores_a_fresh_attempt_budget() {
+    let temp = TempDb::new();
+    let db = Database::open(&temp.0).unwrap();
+    let supervisor = context(Role::Supervisor);
+    let engine = zero_engine(db.clone());
+    let (run, task_id) = failed_candidate(&engine, &db, &supervisor);
+    let repaired = engine
+        .repair_task(
+            &supervisor,
+            RepairTask {
+                run_id: run.id,
+                task_id,
+                mode: RepairMode::ResetAttempts,
+                reason: "reset and retry".into(),
+            },
+            IdempotencyKey("repair-reset".into()),
+        )
+        .unwrap()
+        .value;
+    assert_eq!(repaired.task.attempts, 0);
+    assert_eq!(repaired.task.status, TaskStatus::RevisionRequired);
+    let coder = seed_coder(&db, &supervisor);
+    let coder = SessionContext::validated(SessionId::new(), coder.id, Role::Coder);
+    engine
+        .assign_task(
+            &supervisor,
+            AssignTask {
+                task_id,
+                assignee: coder.actor_id(),
+            },
+            IdempotencyKey("assign-after-reset".into()),
+        )
+        .unwrap();
+    let claimed = engine
+        .claim_task(
+            &coder,
+            ClaimTask { task_id },
+            IdempotencyKey("claim-after-reset".into()),
+        )
+        .unwrap()
+        .value;
+    assert_eq!(claimed.attempts, 1);
+}
