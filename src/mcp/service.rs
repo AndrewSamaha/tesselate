@@ -3,11 +3,12 @@ use crate::{
     coordination::Coordination,
     core::{
         AssignTask, CaptureWorkspaceCommits, ClaimTask, CleanupWorkspace, CompleteRun, CoreError,
-        CoreResult, CreateRun, CreateTask, CreateTaskWithDependencies, DispositionFindings,
-        EventScope, FinalTaskDisposition, HumanRequest, IdempotencyKey, InspectWorkspace,
-        ListHumanRequests, ListReviewRounds, ListReviews, PageRequest, ReadMessages, ReleaseTask,
-        ResolveHumanRequest, ReviewRequest, SendMessage, SessionAuthenticator, SessionContext,
-        SubmitReview, SubmitTask, TaskId, UpdateProgress, WorkspaceRequest,
+        CoreResult, CreateComparisonRun, CreateRun, CreateTask, CreateTaskWithDependencies,
+        DispositionFindings, EventScope, FinalTaskDisposition, HumanRequest, IdempotencyKey,
+        InspectWorkspace, ListHumanRequests, ListReviewRounds, ListReviews, PageRequest,
+        ReadMessages, ReleaseTask, ResolveHumanRequest, ReviewRequest, SelectCandidate,
+        SendMessage, SessionAuthenticator, SessionContext, SubmitReview, SubmitTask, TaskId,
+        UpdateProgress, WorkspaceRequest,
     },
 };
 use rmcp::{
@@ -398,6 +399,14 @@ fn invoke(
         }
         "tesselate.v1.runs.create" => mutation!(CreateRun, |s: &dyn Coordination, c, r, k| s
             .create_run(c, r, k)),
+        "tesselate.v1.runs.create_comparison" => mutation!(
+            CreateComparisonRun,
+            |s: &dyn Coordination, c, r, k| s.create_comparison_run(c, r, k)
+        ),
+        "tesselate.v1.runs.select_candidate" => mutation!(
+            SelectCandidate,
+            |s: &dyn Coordination, c, r, k| s.select_candidate(c, r, k)
+        ),
         "tesselate.v1.work.available" => {
             let r = decode::<ProjectPage>(params)?;
             encode(service.available_work(ctx, r.project_id, r.page)?)
@@ -766,6 +775,30 @@ fn params_schema(tool: &str) -> Value {
         "tesselate.v1.runs.create" => object_schema(
             json!({"project_id":project_id,"goal":string_schema()}),
             &["project_id", "goal"],
+        ),
+        "tesselate.v1.runs.create_comparison" => {
+            let workflow = object_schema(
+                json!({
+                    "candidates":{"type":"integer","const":2},
+                    "reviewers_per_candidate":{"type":"integer","minimum":2,"maximum":u32::MAX},
+                    "comparison_reviewers":{"type":"integer","const":1},
+                    "winner_approval":{"type":"string","const":"human"}
+                }),
+                &[
+                    "candidates",
+                    "reviewers_per_candidate",
+                    "comparison_reviewers",
+                    "winner_approval",
+                ],
+            );
+            object_schema(
+                json!({"project_id":project_id,"goal":string_schema(),"workflow":workflow}),
+                &["project_id", "goal", "workflow"],
+            )
+        }
+        "tesselate.v1.runs.select_candidate" => object_schema(
+            json!({"run_id":id_schema(),"task_id":task_id,"commit_id":string_schema(),"reason":string_schema()}),
+            &["run_id", "task_id", "commit_id", "reason"],
         ),
         "tesselate.v1.tasks.list" => run_page_schema(),
         "tesselate.v1.tasks.create" => object_schema(

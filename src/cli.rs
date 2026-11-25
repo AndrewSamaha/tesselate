@@ -691,6 +691,14 @@ fn dispatch(
         "tesselate.v1.runs.create" => {
             mutation!(CreateRun, |a: &Application, c, r, k| a.create_run(c, r, k))
         }
+        "tesselate.v1.runs.create_comparison" => mutation!(
+            CreateComparisonRun,
+            |a: &Application, c, r, k| a.create_comparison_run(c, r, k)
+        ),
+        "tesselate.v1.runs.select_candidate" => mutation!(
+            SelectCandidate,
+            |a: &Application, c, r, k| a.select_candidate(c, r, k)
+        ),
         "tesselate.v1.work.available" => {
             #[derive(Deserialize)]
             struct Request {

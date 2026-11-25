@@ -36,6 +36,26 @@ struct RunRecord {
     workers: BTreeMap<String, WorkerRecord>,
     #[serde(default)]
     error: Option<String>,
+    #[serde(default)]
+    comparison: Option<ComparisonRecord>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ComparisonRecord {
+    waiting: Option<String>,
+    winner: Option<CandidateWinner>,
+    lanes: Vec<CandidateRecord>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CandidateWinner {
+    task_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CandidateRecord {
+    task_id: String,
+    slot: String,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -184,19 +204,28 @@ fn build_run(dir: &Path, record: RunRecord) -> RunView {
         }
         None => {
             let done = record.phase == "done";
+            let comparison = record.comparison.as_ref();
+            let selected = comparison.and_then(|state| {
+                let winner = state.winner.as_ref()?;
+                state.lanes.iter().find(|lane| lane.task_id == winner.task_id)
+            });
+            let waiting = comparison.and_then(|state| state.waiting.as_deref());
+            let paused = waiting.is_some_and(|status| status != "awaiting winner approval");
             (
                 AgentView {
                     role: "supervisor".into(),
                     assignment: supervisor_assignment,
-                    status: if done {
+                    status: if let Some(candidate) = selected.filter(|_| done) {
+                        format!("complete · selected {}", candidate.slot)
+                    } else if done {
                         "complete".into()
                     } else {
-                        "no supervisor heartbeat".into()
+                        waiting.unwrap_or("no supervisor heartbeat").into()
                     },
                     working: false,
                     order: (0, 0, 0),
                 },
-                !done,
+                !done && !paused,
             )
         }
     };
@@ -379,6 +408,9 @@ fn pid_alive(pid: Option<u32>) -> bool {
 }
 
 fn display_role(label: &str, role: &str) -> String {
+    let label = label.strip_prefix("candidate-a-")
+        .or_else(|| label.strip_prefix("candidate-b-"))
+        .unwrap_or(label);
     if let Some(rest) = label.strip_prefix("reviewer-") {
         if let Some((index, _)) = rest.split_once("-round-") {
             if let Ok(index) = index.parse::<u32>() {
@@ -388,6 +420,9 @@ fn display_role(label: &str, role: &str) -> String {
     }
     if label.starts_with("coder-") {
         return "coder".into();
+    }
+    if label == "comparison-reviewer" {
+        return "comparison".into();
     }
     nonempty(role).unwrap_or_else(|| label.into())
 }
@@ -406,15 +441,22 @@ fn fallback_assignment(label: &str) -> String {
 }
 
 fn label_order(label: &str) -> (u8, u32, u32) {
+    let (lane, label) = if let Some(label) = label.strip_prefix("candidate-a-") {
+        (0, label)
+    } else if let Some(label) = label.strip_prefix("candidate-b-") {
+        (2, label)
+    } else {
+        (0, label)
+    };
     if let Some(round) = label.strip_prefix("coder-round-") {
-        return (0, round.parse().unwrap_or(0), 0);
+        return (lane, round.parse().unwrap_or(0), 0);
     }
     if let Some(rest) = label.strip_prefix("reviewer-") {
         if let Some((index, round)) = rest.split_once("-round-") {
-            return (1, round.parse().unwrap_or(0), index.parse().unwrap_or(0));
+            return (lane + 1, round.parse().unwrap_or(0), index.parse().unwrap_or(0));
         }
     }
-    (2, 0, 0)
+    (4, 0, 0)
 }
 
 fn read_heartbeat(path: &Path) -> Option<Heartbeat> {

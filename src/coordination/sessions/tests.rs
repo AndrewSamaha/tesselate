@@ -127,6 +127,10 @@ impl ProjectWorkflowPolicy for Workflow {
             max_review_rounds: 3,
         })
     }
+
+    fn comparison_policies(&self, project_id: ProjectId) -> CoreResult<(WorkflowLimits, u32)> {
+        Ok((self.workflow_limits(project_id)?, 2))
+    }
 }
 struct Human;
 impl HumanTransitionGate for Human {

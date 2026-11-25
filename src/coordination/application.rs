@@ -457,6 +457,24 @@ impl Coordination for Application {
         self.tasks.create_run(ctx, request, key)
     }
 
+    fn create_comparison_run(
+        &self,
+        ctx: &SessionContext,
+        request: CreateComparisonRun,
+        key: IdempotencyKey,
+    ) -> CoreResult<Mutation<Run>> {
+        self.tasks.create_comparison_run(ctx, request, key)
+    }
+
+    fn select_candidate(
+        &self,
+        ctx: &SessionContext,
+        request: SelectCandidate,
+        key: IdempotencyKey,
+    ) -> CoreResult<Mutation<Run>> {
+        self.tasks.select_candidate(ctx, request, key)
+    }
+
     fn create_task(
         &self,
         ctx: &SessionContext,
@@ -727,6 +745,14 @@ impl ProjectPolicies {
 impl ProjectWorkflowPolicy for ProjectPolicies {
     fn workflow_limits(&self, project_id: ProjectId) -> CoreResult<WorkflowLimits> {
         Ok(self.project_config(project_id)?.workflow_limits)
+    }
+
+    fn comparison_policies(&self, project_id: ProjectId) -> CoreResult<(WorkflowLimits, u32)> {
+        let config = self.project_config(project_id)?;
+        Ok((
+            config.workflow_limits,
+            config.review_policy.min_independent_reviewers,
+        ))
     }
 }
 

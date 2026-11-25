@@ -95,6 +95,7 @@ fn seed_run(db: &Database, ctx: &SessionContext, run_id: RunId) -> ProjectId {
         reviewed_commits: Vec::new(),
         outstanding_integration_steps: Vec::new(),
         outcome: None,
+        comparison: None,
     };
     let changes = vec![
         StateChange::insert(

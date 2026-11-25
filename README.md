@@ -18,8 +18,8 @@ The MVP is local and Unix-only. It uses a single SQLite database and does not ho
 Tesselate is the coordination layer; an agent harness runs the agents. In the
 [OMP integration](#omp-integration), the extension inside the parent OMP session
 acts as the supervisor: it gathers the feature specification and launches
-separate `omp -p` processes for the coder and two reviewers. Those workers use
-Tesselate-created worktrees and role-specific credentials.
+separate `omp -p` processes. The standard workflow uses one coder and two
+reviewers with separate worktrees and role-specific credentials.
 
 ```mermaid
 flowchart TD
@@ -168,6 +168,50 @@ or validation command; `/feature resume <run-UUID>` targets one run directly.
 The existing provisioning approval and validation-log retry safeguards still
 apply. Restart OMP after `install omp` to load an updated extension.
 
+### Compare two implementations
+
+In OMP, use `/feature --workflow compare <goal>`, or explicitly ask for two
+independent implementations in a feature request. OMP proposes a preset; the
+start confirmation shows the agent counts and validation command. `standard`
+remains the default unless the repository opts in.
+
+Both coders start at the same base commit in separate worktrees. Each candidate
+gets its own reviews and revisions. The same approved command validates each
+reviewed candidate in a dedicated detached checkout, then validates the winner
+again on the integration branch. Candidate validation checkouts do not receive
+provisioned files. Use a command that can run without those files for `compare`.
+
+If both pass, a fresh read-only reviewer compares the two commits and recommends
+`A`, `B`, or `neither`. You choose which candidate to integrate, if any. If
+only one qualifies, Tesselate asks before integrating it and does not run a
+head-to-head review. Neither passing means nothing is integrated. The winning
+commit alone advances the integration branch; both lanes' histories stay in
+the same run. `/feature resume` uses the saved preset and review progress, not
+the current repo config.
+
+To set a repository default or define named presets, add `.tesselate.toml` at
+the repo root. A file is not required to use either built-in preset.
+
+```toml
+default_workflow = "standard"
+
+[workflows.standard]
+candidates = 1
+reviewers_per_candidate = 2
+
+[workflows.compare]
+candidates = 2
+reviewers_per_candidate = 2
+comparison_reviewers = 1
+winner_approval = "human"
+```
+
+The per-candidate reviewer count cannot be below the project's minimum.
+Comparison requires two assignment slots, exactly one comparison reviewer,
+and human approval.
+
+### Provisioning and validation
+
 To opt into copying ignored local files for a repository, configure an
 integration-only policy once. Bitwars' existing `.workmux.yaml` lists these paths:
 
@@ -190,18 +234,17 @@ worktrees nor executes workmux `post_create`, `pre_merge`, or `pre_remove` hooks
 which can run arbitrary commands. Symlinks, tracked paths, and changed
 destinations stop provisioning for inspection; file contents are never logged.
 
-The agent proposes an integration-only validation command from repository
-instructions. At the validation prompt, press Enter to use that proposal or
-type an override; a separate confirmation displays the exact command before
-the run starts. If no command was proposed, the agent must investigate and
-retry rather than starting without validation.
+The agent proposes a validation command from repository instructions. At the
+validation prompt, press Enter to use that proposal or type an override; start
+confirmation shows the exact command and where it will run. If no command was
+proposed, the agent must investigate rather than starting without validation.
 
-The extension launches separate OMP processes for the coder and two reviewers
-using the initiating session's selected model. Select the model in the OMP
-session before starting or resuming; an in-flight worker is not switched.
+The extension launches separate OMP processes for coders and reviewers using
+the initiating session's selected model. Select the model before starting or
+resuming; an in-flight worker is not switched.
 Ordinary OMP subagents share their parent's MCP connection and cannot represent
 independent Tesselate roles. A task worktree is not the integration branch.
-Confirm an integration-only validation command explicitly; do not run shared
+Validation never runs in a coder or reviewer checkout. Do not run shared
 services in task worktrees. Bitwars' configured ignored files are copied into
 the integration checkout only after approval; absent optional files are skipped.
 No automatic push, PR creation, or merge into local `main`.
@@ -223,11 +266,10 @@ not require a credential.
 
 Reviewer workers may print progress before their final JSON response. Tesselate
 parses only a final JSON object or fenced JSON response and rejects trailing
-non-JSON output; after a parse pause, `/feature resume` reuses the finished
-worker's saved log rather than launching that reviewer again. If a worker
-process died before producing a final response, resume archives its old log as
-`<label>.log.attempt-<timestamp>` and launches a fresh attempt for that role.
-Provider failures such as usage limits are included in the pause message.
+non-JSON output. If a worker ended without a valid final response, `/feature
+resume` archives the old log as `<label>.log.attempt-<timestamp>` and starts a
+fresh attempt for that role. Provider failures such as usage limits are included
+in the pause message.
 
 Workspace inspection reports both `capture_ready` and `clean`. Committed work
 can be captured when branch/HEAD identity matches and there are no tracked

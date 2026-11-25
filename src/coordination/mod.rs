@@ -46,6 +46,18 @@ pub trait Coordination: Send + Sync {
         request: CreateRun,
         key: IdempotencyKey,
     ) -> CoreResult<Mutation<Run>>;
+    fn create_comparison_run(
+        &self,
+        ctx: &SessionContext,
+        request: CreateComparisonRun,
+        key: IdempotencyKey,
+    ) -> CoreResult<Mutation<Run>>;
+    fn select_candidate(
+        &self,
+        ctx: &SessionContext,
+        request: SelectCandidate,
+        key: IdempotencyKey,
+    ) -> CoreResult<Mutation<Run>>;
     fn create_task(
         &self,
         ctx: &SessionContext,

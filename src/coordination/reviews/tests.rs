@@ -46,11 +46,19 @@ impl ProjectWorkflowPolicy for Workflow {
             max_review_rounds: 3,
         })
     }
+
+    fn comparison_policies(&self, project_id: ProjectId) -> CoreResult<(WorkflowLimits, u32)> {
+        Ok((self.workflow_limits(project_id)?, 2))
+    }
 }
 struct Authors(HashSet<ActorId>);
 impl CommitAuthorLookup for Authors {
     fn authors(&self, _: &[CommitRef]) -> CoreResult<HashSet<ActorId>> {
         Ok(self.0.clone())
+    }
+
+    fn ensure_comparison_capture(&self, _: TaskId, _: &[CommitRef]) -> CoreResult<()> {
+        Err(CoreError::Invalid("fixture has no comparison captures".into()))
     }
 }
 struct Human;
@@ -169,6 +177,7 @@ impl Fixture {
             reviewed_commits: Vec::new(),
             outstanding_integration_steps: Vec::new(),
             outcome: None,
+            comparison: None,
         };
         insert(
             &db,

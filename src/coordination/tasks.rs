@@ -88,6 +88,7 @@ pub struct TransitionContext {
 /// F01 supplies validated policy from project configuration; callers cannot put limits in CreateRun.
 pub trait ProjectWorkflowPolicy: Send + Sync {
     fn workflow_limits(&self, project_id: ProjectId) -> CoreResult<WorkflowLimits>;
+    fn comparison_policies(&self, project_id: ProjectId) -> CoreResult<(WorkflowLimits, u32)>;
 }
 
 /// F06 decides whether a submitted task or run has satisfied review policy and derives reviewed SHAs.
@@ -168,30 +169,79 @@ impl TaskEngine {
         request: CreateRun,
         key: IdempotencyKey,
     ) -> CoreResult<Mutation<Run>> {
-        const OP: &str = "runs.create";
-        if let Some(prior) = self.prior_run(ctx, OP, &key, &request)? {
+        self.create_run_inner(
+            ctx,
+            "runs.create",
+            &request,
+            request.project_id,
+            &request.goal,
+            None,
+            key,
+        )
+    }
+
+    pub fn create_comparison_run(
+        &self,
+        ctx: &SessionContext,
+        request: CreateComparisonRun,
+        key: IdempotencyKey,
+    ) -> CoreResult<Mutation<Run>> {
+        self.create_run_inner(
+            ctx,
+            "runs.create_comparison",
+            &request,
+            request.project_id,
+            &request.goal,
+            Some(request.workflow.clone()),
+            key,
+        )
+    }
+
+    fn create_run_inner<Q: Serialize>(
+        &self,
+        ctx: &SessionContext,
+        operation: &str,
+        request: &Q,
+        project_id: ProjectId,
+        goal: &str,
+        workflow: Option<ComparisonWorkflow>,
+        key: IdempotencyKey,
+    ) -> CoreResult<Mutation<Run>> {
+        if let Some(prior) = self.prior_run(ctx, operation, &key, request)? {
             return Ok(prior);
         }
         require_role(ctx, Role::Supervisor)?;
-        if request.goal.trim().is_empty() {
+        if goal.trim().is_empty() {
             return Err(CoreError::Invalid("run goal is required".into()));
         }
         self.db
-            .load::<Project>(EntityKind::Project, &request.project_id.0.to_string())
+            .load::<Project>(EntityKind::Project, &project_id.0.to_string())
             .map_err(storage_error)?
             .ok_or(CoreError::NotFound)?;
-        let limits = self.policy.workflow_limits(request.project_id)?;
+        let (limits, comparison) = if let Some(workflow) = workflow {
+            let (limits, min_independent_reviewers) = self.policy.comparison_policies(project_id)?;
+            validate_comparison(&workflow, &limits, min_independent_reviewers)?;
+            let comparison = RunComparison {
+                workflow,
+                candidates: [TaskId::new(), TaskId::new()],
+                winner: None,
+            };
+            (limits, Some(comparison))
+        } else {
+            (self.policy.workflow_limits(project_id)?, None)
+        };
         validate_limits(&limits)?;
         let run = Run {
             id: RunId::new(),
-            project_id: request.project_id,
-            goal: request.goal.clone(),
+            project_id,
+            goal: goal.to_owned(),
             started_at: Utc::now(),
             limits,
             status: RunStatus::Active,
             reviewed_commits: Vec::new(),
             outstanding_integration_steps: Vec::new(),
             outcome: None,
+            comparison,
         };
         self.ensure_transition(
             ctx,
@@ -209,15 +259,44 @@ impl TaskEngine {
             &run,
         )
         .map_err(storage_error)?;
+        let mut changes = vec![change];
+        let mut payload = json!({"goal":run.goal});
+        if let Some(comparison) = &run.comparison {
+            for (id, title) in comparison
+                .candidates
+                .into_iter()
+                .zip(["Candidate A", "Candidate B"])
+            {
+                let record = TaskRecord {
+                    task: Task {
+                        id,
+                        run_id: run.id,
+                        title: title.into(),
+                        goal: run.goal.clone(),
+                        status: TaskStatus::Ready,
+                        owner: None,
+                        progress: None,
+                        attempts: 0,
+                        submitted_commits: Vec::new(),
+                        result: None,
+                    },
+                    dependencies: Vec::new(),
+                    waiting_on_dependencies: false,
+                    final_disposition: None,
+                };
+                changes.push(self.prepare_task_creation(ctx, &run, &record)?);
+            }
+            payload["comparison"] = json!(comparison);
+        }
         let event = event_for(
             ctx,
             Some(run.project_id),
             Some(run.id),
             None,
             "run.created",
-            json!({"goal":run.goal}),
+            payload,
         );
-        self.commit_run(ctx, OP, &key, &request, &run, vec![change], event)
+        self.commit_run(ctx, operation, &key, request, &run, changes, Vec::new(), event)
     }
 
     pub fn list_tasks(
@@ -409,6 +488,11 @@ impl TaskEngine {
         }
         let (mut run, run_revision) = self.load_run(run_id)?;
         self.ensure_run_active(ctx, &mut run, run_revision)?;
+        if run.comparison.is_some() {
+            return Err(CoreError::Invalid(
+                "comparison runs may only contain their two independent candidates".into(),
+            ));
+        }
         let mut waiting = false;
         for dependency in &dependencies {
             let prerequisite = self.load_task(*dependency)?.0;
@@ -444,28 +528,13 @@ impl TaskEngine {
             result: None,
         };
         let record = TaskRecord {
-            task: task.clone(),
-            dependencies: dependencies.clone(),
+            task,
+            dependencies,
             waiting_on_dependencies: waiting,
             final_disposition: None,
         };
-        self.ensure_transition(
-            ctx,
-            run.project_id,
-            run.id,
-            Some(task.id),
-            None,
-            Some(LifecycleState::Task(task.status)),
-            TransitionIdentity::TaskCreation,
-        )?;
-        let task_change = StateChange::insert(
-            EntityKind::Task,
-            task.id.0.to_string(),
-            scope_for_task(&run, &task),
-            &record,
-        )
-        .map_err(storage_error)?
-        .with_dependencies(dependencies);
+        let task = &record.task;
+        let task_change = self.prepare_task_creation(ctx, &run, &record)?;
         let changes = vec![self.bump_run(&mut run, run_revision)?, task_change];
         let event = event_for(
             ctx,
@@ -475,7 +544,33 @@ impl TaskEngine {
             "task.created",
             json!({"title":task.title,"dependency_count":record.dependencies.len()}),
         );
-        self.commit_task(ctx, operation, &key, request, &task, changes, event)
+        self.commit_task(ctx, operation, &key, request, task, changes, event)
+    }
+
+    fn prepare_task_creation(
+        &self,
+        ctx: &SessionContext,
+        run: &Run,
+        record: &TaskRecord,
+    ) -> CoreResult<StateChange> {
+        let task = &record.task;
+        self.ensure_transition(
+            ctx,
+            run.project_id,
+            run.id,
+            Some(task.id),
+            None,
+            Some(LifecycleState::Task(task.status)),
+            TransitionIdentity::TaskCreation,
+        )?;
+        Ok(StateChange::insert(
+            EntityKind::Task,
+            task.id.0.to_string(),
+            scope_for_task(run, task),
+            record,
+        )
+        .map_err(storage_error)?
+        .with_dependencies(record.dependencies.clone()))
     }
 
     pub fn assign_task(
@@ -674,6 +769,11 @@ impl TaskEngine {
             ));
         }
         if record.task.attempts > run.limits.max_task_retries {
+            if run.comparison.is_some() {
+                return Err(CoreError::Recoverable(
+                    "task retry limit reached; comparison candidate must be failed".into(),
+                ));
+            }
             self.stop_for_limit(
                 ctx,
                 &run,
@@ -682,6 +782,23 @@ impl TaskEngine {
             )?;
             return Err(CoreError::Recoverable(
                 "task retry limit reached; run stopped".into(),
+            ));
+        }
+        if run.comparison.is_some()
+            && self
+                .all_entities::<AssignmentRecord>(
+                    EntityKind::Assignment,
+                    EntityScope {
+                        run_id: Some(run.id.0.to_string()),
+                        owner_id: Some(assignee.0.to_string()),
+                        ..Default::default()
+                    },
+                )?
+                .iter()
+                .any(|assignment| assignment.task_id != task_id)
+        {
+            return Err(CoreError::Invalid(
+                "comparison candidates must use independent coders".into(),
             ));
         }
         let (from, previous_assignment) = if was_active {
@@ -1017,6 +1134,11 @@ impl TaskEngine {
             FinalTaskOutcome::Failed => TaskStatus::Failed,
             FinalTaskOutcome::Cancelled => TaskStatus::Cancelled,
         };
+        if run.comparison.is_some() && target == TaskStatus::Blocked {
+            return Err(CoreError::Invalid(
+                "a comparison candidate must complete, fail, or be cancelled".into(),
+            ));
+        }
         if !transition_allowed(record.task.status, target) {
             return Err(CoreError::Invalid("illegal final task disposition".into()));
         }
@@ -1080,6 +1202,82 @@ impl TaskEngine {
         )
     }
 
+    pub fn select_candidate(
+        &self,
+        ctx: &SessionContext,
+        request: SelectCandidate,
+        key: IdempotencyKey,
+    ) -> CoreResult<Mutation<Run>> {
+        const OP: &str = "runs.select_candidate";
+        if let Some(prior) = self.prior_run(ctx, OP, &key, &request)? {
+            return Ok(prior);
+        }
+        require_role(ctx, Role::Supervisor)?;
+        if request.commit_id.trim().is_empty() || request.reason.trim().is_empty() {
+            return Err(CoreError::Invalid(
+                "a comparison selection requires a commit ID and approval reason".into(),
+            ));
+        }
+        let (mut run, run_revision) = self.load_run(request.run_id)?;
+        let comparison = run.comparison.as_ref().ok_or_else(|| {
+            CoreError::Invalid("only comparison runs can select a candidate".into())
+        })?;
+        if let Some(winner) = &comparison.winner {
+            if winner.task_id == request.task_id
+                && winner.commit_id == request.commit_id
+                && winner.reason == request.reason
+            {
+                return Ok(Mutation {
+                    event_id: winner.event_id,
+                    value: run,
+                    replayed: true,
+                });
+            }
+            return Err(CoreError::Invalid(
+                "the comparison winner selection is immutable".into(),
+            ));
+        }
+        let [first, second] = comparison.candidates;
+        let other_id = if first == request.task_id {
+            second
+        } else if second == request.task_id {
+            first
+        } else {
+            return Err(CoreError::Invalid(
+                "the selected task does not belong to this comparison".into(),
+            ));
+        };
+        self.ensure_run_active(ctx, &mut run, run_revision)?;
+        let selected = self.load_task(request.task_id)?.0.task;
+        let other = self.load_task(other_id)?.0.task;
+        ensure_comparison_candidate(&selected, &request.commit_id)?;
+        if !matches!(
+            other.status,
+            TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled
+        ) {
+            return Err(CoreError::Recoverable(
+                "both comparison candidates must be terminal before selection".into(),
+            ));
+        }
+        let review_guards = self.reviews.ensure_task_complete(selected.id)?;
+        let event = event_for(
+            ctx,
+            Some(run.project_id),
+            Some(run.id),
+            Some(selected.id),
+            "run.candidate_selected",
+            json!({"task_id":selected.id,"commit_id":request.commit_id,"reason":request.reason}),
+        );
+        run.comparison.as_mut().unwrap().winner = Some(ComparisonWinner {
+            task_id: selected.id,
+            commit_id: request.commit_id.clone(),
+            reason: request.reason.clone(),
+            event_id: event.event_id,
+        });
+        let changes = vec![self.bump_run(&mut run, run_revision)?];
+        self.commit_run(ctx, OP, &key, &request, &run, changes, review_guards, event)
+    }
+
     pub fn complete_run(
         &self,
         ctx: &SessionContext,
@@ -1093,15 +1291,27 @@ impl TaskEngine {
         require_role(ctx, Role::Supervisor)?;
         let (mut run, run_revision) = self.load_run(request.run_id)?;
         self.ensure_run_active(ctx, &mut run, run_revision)?;
-        let tasks = self.all_tasks(run.id)?;
-        if tasks
-            .iter()
-            .any(|record| record.task.status != TaskStatus::Completed)
-        {
-            return Err(CoreError::Recoverable(
-                "all tasks must be completed before the run".into(),
-            ));
-        }
+        let selected = if let Some(comparison) = &run.comparison {
+            let winner = comparison.winner.as_ref().ok_or_else(|| {
+                CoreError::Recoverable(
+                    "select the comparison winner before completing the run".into(),
+                )
+            })?;
+            let selected = self.load_task(winner.task_id)?.0.task;
+            ensure_comparison_candidate(&selected, &winner.commit_id)?;
+            Some(selected)
+        } else {
+            let tasks = self.all_tasks(run.id)?;
+            if tasks
+                .iter()
+                .any(|record| record.task.status != TaskStatus::Completed)
+            {
+                return Err(CoreError::Recoverable(
+                    "all tasks must be completed before the run".into(),
+                ));
+            }
+            None
+        };
         self.ensure_transition(
             ctx,
             run.project_id,
@@ -1111,7 +1321,13 @@ impl TaskEngine {
             Some(LifecycleState::Run(RunStatus::Completed)),
             TransitionIdentity::RunCompletion,
         )?;
-        run.reviewed_commits = self.reviews.reviewed_commits_for_run(run.id)?;
+        let (reviewed_commits, review_guards) = if let Some(selected) = selected {
+            let review_guards = self.reviews.ensure_task_complete(selected.id)?;
+            (selected.submitted_commits, review_guards)
+        } else {
+            (self.reviews.reviewed_commits_for_run(run.id)?, Vec::new())
+        };
+        run.reviewed_commits = reviewed_commits;
         run.outstanding_integration_steps = request.outstanding_integration_steps.clone();
         run.status = RunStatus::Completed;
         run.outcome = None;
@@ -1124,7 +1340,7 @@ impl TaskEngine {
             "run.completed",
             json!({"reviewed_commits":run.reviewed_commits,"outstanding_integration_steps":run.outstanding_integration_steps}),
         );
-        self.commit_run(ctx, OP, &key, &request, &run, changes, event)
+        self.commit_run(ctx, OP, &key, &request, &run, changes, review_guards, event)
     }
 
     fn ensure_run_active(
@@ -1189,6 +1405,7 @@ impl TaskEngine {
             &request,
             &stopped,
             changes,
+            Vec::new(),
             event,
         )?;
         Ok(())
@@ -1497,6 +1714,7 @@ impl TaskEngine {
         request: &Q,
         run: &Run,
         changes: Vec<StateChange>,
+        preconditions: Vec<StatePrecondition>,
         event: NewEvent,
     ) -> CoreResult<Mutation<Run>> {
         match self.db.commit_mutation(MutationInput {
@@ -1504,7 +1722,7 @@ impl TaskEngine {
             operation,
             idempotency_key: key,
             request,
-            preconditions: Vec::new(),
+            preconditions,
             result: run,
             changes,
             event,
@@ -1542,6 +1760,49 @@ fn validate_limits(limits: &WorkflowLimits) -> CoreResult<()> {
     }
     if limits.max_duration_hours > i64::MAX as u64 / 3600 {
         return Err(CoreError::Invalid("max_duration_hours is too large".into()));
+    }
+    Ok(())
+}
+
+fn validate_comparison(
+    workflow: &ComparisonWorkflow,
+    limits: &WorkflowLimits,
+    min_independent_reviewers: u32,
+) -> CoreResult<()> {
+    if workflow.candidates != 2 || workflow.comparison_reviewers != 1 {
+        return Err(CoreError::Invalid(
+            "comparison requires two candidates and one comparison reviewer".into(),
+        ));
+    }
+    if limits.max_concurrent_assignments < 2 {
+        return Err(CoreError::Invalid(
+            "comparison requires at least two concurrent assignments".into(),
+        ));
+    }
+    if workflow.reviewers_per_candidate < min_independent_reviewers.max(2) {
+        return Err(CoreError::Invalid(
+            "comparison reviewers per candidate must meet the project review quorum".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_comparison_candidate(task: &Task, commit_id: &str) -> CoreResult<()> {
+    if task.status != TaskStatus::Completed {
+        return Err(CoreError::Recoverable(
+            "the selected comparison candidate must be review-complete".into(),
+        ));
+    }
+    // Commit capture orders a candidate's submission from base to tip; only the tip can win.
+    if task
+        .submitted_commits
+        .last()
+        .map(|commit| commit.commit_id.as_str())
+        != Some(commit_id)
+    {
+        return Err(CoreError::Invalid(
+            "the selected commit must match the comparison candidate's exact submitted tip".into(),
+        ));
     }
     Ok(())
 }

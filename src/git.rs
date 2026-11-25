@@ -394,12 +394,22 @@ impl GitWorkspaceManager {
             }
         }
         let run = self.task_run(workspace.task_id)?;
+        let mut payload =
+            json!({"workspace_id":workspace.id,"head":expected,"commit_count":commits.len()});
+        if run.comparison.is_some() {
+            if commits.last().is_some_and(|tip| tip.commit_id != expected) {
+                return Err(CoreError::Internal(
+                    "comparison commit capture did not end at the observed workspace tip".into(),
+                ));
+            }
+            payload["commits"] = json!(commits);
+        }
         let event = self.event(
             ctx,
             &run,
             workspace.task_id,
             "workspace.commits_captured",
-            json!({"workspace_id":workspace.id,"head":expected,"commit_count":commits.len()}),
+            payload,
         );
         self.db
             .commit_mutation(MutationInput {
@@ -1513,6 +1523,38 @@ impl GitWorkspaceManager {
 impl CommitAuthorLookup for GitWorkspaceManager {
     fn authors(&self, commits: &[CommitRef]) -> CoreResult<HashSet<ActorId>> {
         self.commit_authors(commits)
+    }
+
+    fn ensure_comparison_capture(&self, task_id: TaskId, commits: &[CommitRef]) -> CoreResult<()> {
+        let expected = json!(commits);
+        let mut cursor = None;
+        loop {
+            let page = self
+                .db
+                .events_after(
+                    EventScope {
+                        project_id: None,
+                        run_id: None,
+                        task_id: Some(task_id),
+                    },
+                    cursor.as_ref(),
+                    PAGE_SIZE,
+                )
+                .map_err(storage_error)?;
+            if page.items.iter().any(|event| {
+                event.event_type == "workspace.commits_captured"
+                    && event.payload.get("commits") == Some(&expected)
+            }) {
+                return Ok(());
+            }
+            if page.items.len() < PAGE_SIZE as usize {
+                break;
+            }
+            cursor = page.next_cursor.map(EventCursor);
+        }
+        Err(CoreError::Invalid(
+            "comparison candidate commits must match a capture from its own workspace in base-to-tip order".into(),
+        ))
     }
 }
 

@@ -27,6 +27,10 @@ impl ProjectWorkflowPolicy for Policy {
             max_review_rounds: 3,
         })
     }
+
+    fn comparison_policies(&self, project_id: ProjectId) -> CoreResult<(WorkflowLimits, u32)> {
+        Ok((self.workflow_limits(project_id)?, 2))
+    }
 }
 struct Reviews;
 impl ReviewCompletionGate for Reviews {
@@ -862,4 +866,164 @@ fn coder_cannot_create_run() {
         ),
         Err(CoreError::Forbidden)
     ));
+}
+
+#[test]
+fn comparison_selects_only_a_review_complete_tip_and_preserves_both_submissions() {
+    let temp = TempDb::new();
+    let db = Database::open(&temp.0).unwrap();
+    let supervisor = context(Role::Supervisor);
+    let engine = engine(db.clone());
+    let key = |name: &str| IdempotencyKey(name.into());
+    let request = CreateComparisonRun {
+        project_id: seed_project(&db, &supervisor),
+        goal: "ship feature".into(),
+        workflow: ComparisonWorkflow {
+            candidates: 2,
+            reviewers_per_candidate: 2,
+            comparison_reviewers: 1,
+            winner_approval: WinnerApproval::Human,
+        },
+    };
+    let created = engine
+        .create_comparison_run(&supervisor, request.clone(), key("create"))
+        .unwrap();
+    let replayed = engine
+        .create_comparison_run(&supervisor, request.clone(), key("create"))
+        .unwrap();
+    assert!(replayed.replayed);
+    assert_eq!(created.value, replayed.value);
+    let [first, second] = created.value.comparison.as_ref().unwrap().candidates;
+    assert_ne!(first, second);
+    for candidate in [first, second] {
+        let record = engine.load_task(candidate).unwrap().0;
+        assert_eq!(record.task.goal, request.goal);
+        assert!(record.dependencies.is_empty());
+    }
+    let run_id = created.value.id;
+    let completion = CompleteRun {
+        run_id,
+        outstanding_integration_steps: Vec::new(),
+    };
+    assert!(matches!(
+        engine.complete_run(&supervisor, completion.clone(), key("complete")),
+        Err(CoreError::Recoverable(_))
+    ));
+    assert!(matches!(
+        engine.create_task(
+            &supervisor,
+            CreateTask {
+                run_id,
+                title: "third".into(),
+                goal: "not a candidate".into(),
+            },
+            key("third"),
+        ),
+        Err(CoreError::Invalid(_))
+    ));
+
+    let repo = RepositoryId::new();
+    let commit = |sha: &str| CommitRef {
+        repository_id: repo,
+        commit_id: sha.into(),
+    };
+    let winning_refs = vec![commit("first-older"), commit("first-tip")];
+    let losing_refs = vec![commit("second-tip")];
+    let submit = |task_id: TaskId, commits: Vec<CommitRef>| {
+        let actor = seed_coder(&db, &supervisor);
+        let coder = SessionContext::validated(SessionId::new(), actor.id, Role::Coder);
+        engine
+            .claim_task(&coder, ClaimTask { task_id }, key("assign"))
+            .unwrap();
+        engine
+            .claim_task(&coder, ClaimTask { task_id }, key("claim"))
+            .unwrap();
+        engine
+            .submit_task(
+                &coder,
+                SubmitTask {
+                    task_id,
+                    commits,
+                    summary: "submitted".into(),
+                },
+                key("submit"),
+            )
+            .unwrap();
+    };
+    submit(first, winning_refs.clone());
+    submit(second, losing_refs.clone());
+
+    let selection = SelectCandidate {
+        run_id,
+        task_id: first,
+        commit_id: "first-tip".into(),
+        reason: "approved after comparison".into(),
+    };
+    assert!(matches!(
+        engine.select_candidate(&supervisor, selection.clone(), key("select")),
+        Err(CoreError::Recoverable(_))
+    ));
+    let dispose = |task_id, outcome, name: &str| {
+        engine
+            .record_task_disposition(
+                &supervisor,
+                FinalTaskDisposition {
+                    task_id,
+                    outcome,
+                    reason: name.into(),
+                },
+                key(name),
+            )
+            .unwrap();
+    };
+    dispose(first, FinalTaskOutcome::Completed, "review complete");
+    assert!(matches!(
+        engine.select_candidate(&supervisor, selection.clone(), key("select")),
+        Err(CoreError::Recoverable(_))
+    ));
+    dispose(second, FinalTaskOutcome::Failed, "review retries exhausted");
+    assert!(matches!(
+        engine.select_candidate(
+            &supervisor,
+            SelectCandidate {
+                commit_id: "first-older".into(),
+                ..selection.clone()
+            },
+            key("select"),
+        ),
+        Err(CoreError::Invalid(_))
+    ));
+    let selected = engine
+        .select_candidate(&supervisor, selection.clone(), key("select"))
+        .unwrap();
+    assert!(matches!(
+        engine.select_candidate(
+            &supervisor,
+            SelectCandidate {
+                task_id: second,
+                commit_id: "second-tip".into(),
+                ..selection.clone()
+            },
+            key("replacement"),
+        ),
+        Err(CoreError::Invalid(_))
+    ));
+    let replayed = engine
+        .select_candidate(
+            &context(Role::Supervisor),
+            selection,
+            key("recovered selection"),
+        )
+        .unwrap();
+    assert!(replayed.replayed);
+    assert_eq!(selected.event_id, replayed.event_id);
+    let completed = engine
+        .complete_run(&supervisor, completion, key("complete"))
+        .unwrap();
+    assert_eq!(completed.value.status, RunStatus::Completed);
+    assert_eq!(completed.value.reviewed_commits, winning_refs);
+    assert_eq!(
+        engine.load_task(second).unwrap().0.task.submitted_commits,
+        losing_refs
+    );
 }

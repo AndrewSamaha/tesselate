@@ -691,6 +691,10 @@ mod tests {
                 max_review_rounds: 3,
             })
         }
+
+        fn comparison_policies(&self, project_id: ProjectId) -> CoreResult<(WorkflowLimits, u32)> {
+            Ok((self.workflow_limits(project_id)?, 2))
+        }
     }
 
     struct Reviews;
@@ -766,6 +770,7 @@ mod tests {
             reviewed_commits: Vec::new(),
             outstanding_integration_steps: Vec::new(),
             outcome: None,
+            comparison: None,
         };
         insert(
             &db,

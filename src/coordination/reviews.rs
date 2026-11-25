@@ -39,6 +39,7 @@ pub trait ProjectReviewPolicy: Send + Sync {
 /// F03 maps durable submitted commit references to their authoring Tesselate actors.
 pub trait CommitAuthorLookup: Send + Sync {
     fn authors(&self, commits: &[CommitRef]) -> CoreResult<HashSet<ActorId>>;
+    fn ensure_comparison_capture(&self, task_id: TaskId, commits: &[CommitRef]) -> CoreResult<()>;
 }
 
 /// F07 enforces approval when project policy gates a high-severity deferral.
@@ -119,10 +120,20 @@ impl ReviewCoordinator {
             return Err(CoreError::Invalid("run is not active".into()));
         }
         validate_commit_refs(&self.db, run.project_id, &request.commit_refs)?;
-        if !same_refs(&task_record.task.submitted_commits, &request.commit_refs) {
+        let submitted = &task_record.task.submitted_commits;
+        let matches_submission = if run.comparison.is_some() {
+            submitted == &request.commit_refs
+        } else {
+            same_refs(submitted, &request.commit_refs)
+        };
+        if !matches_submission {
             return Err(CoreError::Invalid(
                 "review refs must match the task's submitted commits".into(),
             ));
+        }
+        if run.comparison.is_some() {
+            self.authors
+                .ensure_comparison_capture(request.task_id, submitted)?;
         }
         let rounds = self.rounds_for_task(request.task_id)?;
         let next_round = rounds.iter().map(|round| round.round).max().unwrap_or(0) + 1;
@@ -139,12 +150,17 @@ impl ReviewCoordinator {
             commit_refs: request.commit_refs.clone(),
             previous_finding_ids: request.previous_finding_ids.clone(),
         };
-        let (_, mut changes) = tasks.prepare_review_transition(
+        let (prepared, mut changes) = tasks.prepare_review_transition(
             ctx,
             request.task_id,
             TaskStatus::InReview,
             "review requested",
         )?;
+        if run.comparison.is_some() && prepared.submitted_commits != round.commit_refs {
+            return Err(CoreError::Recoverable(
+                "comparison candidate submission changed; retry review request".into(),
+            ));
+        }
         changes.push(
             StateChange::insert(
                 EntityKind::ReviewRound,
@@ -696,7 +712,11 @@ impl ReviewCompletionGate for ReviewCoordinator {
         let (task_record, _) = self.load_task(task_id)?;
         let task = task_record.task;
         let (run, _) = self.load_run(task.run_id)?;
-        let policy = self.project_policy(run.project_id)?;
+        let min_independent_reviewers = if let Some(comparison) = &run.comparison {
+            comparison.workflow.reviewers_per_candidate
+        } else {
+            self.project_policy(run.project_id)?.min_independent_reviewers
+        };
         if task.submitted_commits.is_empty() {
             return Err(CoreError::Recoverable(
                 "task has no submitted commits to review".into(),
@@ -705,7 +725,13 @@ impl ReviewCompletionGate for ReviewCoordinator {
         let rounds = self.rounds_for_task(task_id)?;
         let current = rounds
             .iter()
-            .filter(|round| same_refs(&round.commit_refs, &task.submitted_commits))
+            .filter(|round| {
+                if run.comparison.is_some() {
+                    round.commit_refs == task.submitted_commits
+                } else {
+                    same_refs(&round.commit_refs, &task.submitted_commits)
+                }
+            })
             .max_by_key(|round| round.round)
             .ok_or_else(|| {
                 CoreError::Recoverable("current submitted commits have no review round".into())
@@ -719,7 +745,7 @@ impl ReviewCompletionGate for ReviewCoordinator {
         if reviewers.iter().any(|reviewer| authors.contains(reviewer)) {
             return Err(CoreError::Forbidden);
         }
-        if reviewers.len() < policy.min_independent_reviewers as usize {
+        if reviewers.len() < min_independent_reviewers as usize {
             return Err(CoreError::Recoverable(
                 "insufficient independent reviewers".into(),
             ));

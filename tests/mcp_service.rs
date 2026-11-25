@@ -138,6 +138,7 @@ impl Coordination for PersistedCoordination {
             reviewed_commits: vec![],
             outstanding_integration_steps: vec![],
             outcome: None,
+            comparison: None,
         };
         self.db
             .commit_mutation(MutationInput {
@@ -260,6 +261,8 @@ impl Coordination for PersistedCoordination {
         list_repositories(ctx: &SessionContext, project: ProjectId, page: PageRequest) -> CoreResult<Page<Repository>>;
         list_agents(ctx: &SessionContext, project: ProjectId, page: PageRequest) -> CoreResult<Page<Agent>>;
         available_work(ctx: &SessionContext, project: ProjectId, page: PageRequest) -> CoreResult<Page<Task>>;
+        create_comparison_run(ctx: &SessionContext, request: CreateComparisonRun, key: IdempotencyKey) -> CoreResult<Mutation<Run>>;
+        select_candidate(ctx: &SessionContext, request: SelectCandidate, key: IdempotencyKey) -> CoreResult<Mutation<Run>>;
         create_task(ctx: &SessionContext, request: CreateTask, key: IdempotencyKey) -> CoreResult<Mutation<Task>>;
         create_task_with_dependencies(ctx: &SessionContext, request: CreateTaskWithDependencies, key: IdempotencyKey) -> CoreResult<Mutation<Task>>;
         assign_task(ctx: &SessionContext, request: AssignTask, key: IdempotencyKey) -> CoreResult<Mutation<Task>>;
@@ -269,6 +272,8 @@ impl Coordination for PersistedCoordination {
         submit_task(ctx: &SessionContext, request: SubmitTask, key: IdempotencyKey) -> CoreResult<Mutation<Task>>;
         record_task_disposition(ctx: &SessionContext, request: FinalTaskDisposition, key: IdempotencyKey) -> CoreResult<Mutation<Task>>;
         complete_run(ctx: &SessionContext, request: CompleteRun, key: IdempotencyKey) -> CoreResult<Mutation<Run>>;
+        renew_session(ctx: &SessionContext, key: IdempotencyKey) -> CoreResult<Mutation<chrono::DateTime<Utc>>>;
+        renew_assignment_lease(ctx: &SessionContext, task_id: TaskId, key: IdempotencyKey) -> CoreResult<Mutation<tesselate::coordination::sessions::AssignmentLeaseRecord>>;
         request_workspace(ctx: &SessionContext, request: WorkspaceRequest, key: IdempotencyKey) -> CoreResult<Mutation<Workspace>>;
         request_review(ctx: &SessionContext, request: ReviewRequest, key: IdempotencyKey) -> CoreResult<Mutation<ReviewRound>>;
         submit_review(ctx: &SessionContext, request: SubmitReview, key: IdempotencyKey) -> CoreResult<Mutation<Review>>;

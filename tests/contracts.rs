@@ -214,6 +214,7 @@ fn run_request_and_snapshot_contract_include_goal_and_limits() {
             reason: "duration limit reached".into(),
             remaining_task_ids: vec![TaskId::new()],
         }),
+        comparison: None,
     };
     let value = serde_json::to_value(run).unwrap();
     assert_eq!(value["limits"]["max_task_retries"], 2);

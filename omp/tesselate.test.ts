@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
 // A fake CLI and fake OMP process, but real Git worktrees/commits. Never calls a model.
@@ -101,11 +101,19 @@ else throw Error('unsupported fixture operation '+command+' '+a.join(' '));
 const fakeOmp = String.raw`#!/usr/bin/env node
 const fs=require('node:fs'),cp=require('node:child_process'),path=require('node:path');
 const a=process.argv.slice(2),cwd=a[a.indexOf('--cwd')+1],prompt=a[a.length-1];
-const role=prompt.startsWith('Independent reviewer')?'reviewer':'coder';
-fs.appendFileSync(path.join(process.env.FIXTURE_STATE,'worker-launches.jsonl'),JSON.stringify({role,cwd,readOnly:a.includes('--tools=read,grep,glob'),workerEnv:process.env.TESSELATE_WORKER,model:a[a.indexOf('--model')+1]})+'\n');
+const role=prompt.startsWith('Compare alternate')?'comparison':prompt.startsWith('Independent reviewer')?'reviewer':'coder';
+const session=a[a.indexOf('--session-dir')+1];
+const slot=path.basename(session).match(/^session-candidate-([ab])-/)?.[1];
+const start=cp.execFileSync('git',['-C',cwd,'rev-parse','HEAD'],{encoding:'utf8'}).trim();
+fs.appendFileSync(path.join(process.env.FIXTURE_STATE,'worker-launches.jsonl'),JSON.stringify({role,cwd,slot,start,readOnly:a.includes('--tools=read,grep,glob'),workerEnv:process.env.TESSELATE_WORKER,model:a[a.indexOf('--model')+1]})+'\n');
 const round = Number(prompt.match(/round (\d+)/)?.[1] ?? 1);
 if(role==='coder') {
   fs.writeFileSync(path.join(cwd,'feature.txt'),round===1?'implemented in task worktree\n':'feature.txt is committed (review correction)\n');
+  if(slot) fs.appendFileSync(path.join(cwd,'feature.txt'),'Candidate '+slot+'\n');
+  if(slot==='a' && process.env.FIXTURE_REJECT_CANDIDATE_A==='1') {
+    fs.appendFileSync(path.join(cwd,'README.md'),'Out-of-scope candidate change\n');
+    cp.execFileSync('git',['-C',cwd,'add','README.md']);
+  }
   cp.execFileSync('git',['-C',cwd,'add','feature.txt']);
   if(process.env.FIXTURE_TRACK_IGNORED==='1') {
     fs.writeFileSync(path.join(cwd,'.env'),'worker-dummy-not-the-source-secret\n');
@@ -115,6 +123,9 @@ if(role==='coder') {
   fs.mkdirSync(path.join(cwd,'.workmux-local'),{recursive:true});
   fs.writeFileSync(path.join(cwd,'.workmux-local','completion.md'),'Coder completion handoff\n');
   process.stdout.write('Committed implementation.\n');
+} else if(role==='comparison') {
+  if(!prompt.includes('"candidate":"A"')||!prompt.includes('"candidate":"B"')) throw Error('Comparison needs both reviewed candidates.');
+  process.stdout.write('Working...\n'+JSON.stringify({recommendation:'A',reason:'Fixture recommends A over B.'})+'\n');
 } else {
   const marker = path.join(process.env.FIXTURE_STATE,'retry-review.marker');
   if(process.env.FIXTURE_RETRY_REVIEW==='1' && !fs.existsSync(marker)) {
@@ -122,7 +133,7 @@ if(role==='coder') {
     process.stdout.write('Working...\nCodex error event: usage limit reached (code=usage_limit_reached)\n');
     process.exit(1);
   }
-  const review = round===1 && prompt.startsWith('Independent reviewer 1')
+  const review = slot!=='b' && round===1 && prompt.startsWith('Independent reviewer 1')
     ? {passed:false,summary:'Missing explicit acceptance text',findings:[{severity:'medium',location:'feature.txt:1',evidence:'Expected acceptance phrase absent',proposed_correction:'Include acceptance phrase'}]}
     : {passed:true,summary:'Reviewed committed change independently',findings:[]};
   process.stdout.write('Working...\n');
@@ -191,7 +202,7 @@ export async function runSmoke(trackIgnored = false, trailingReview = false, ret
         if (question.startsWith("Which Tesselate feature")) return choices[0];
         throw new Error(`Unexpected resume selection: ${question}`);
       }, notify: (message: string) => { notifications.push(message); } };
-    const pi = { zod: { object: () => ({}), string: () => ({}) }, on: (event: string, handler: typeof inputHandler) => { if (event === "input") inputHandler = handler; },
+    const pi = { zod: { object: () => ({}), string: () => ({ optional: () => ({}) }) }, on: (event: string, handler: typeof inputHandler) => { if (event === "input") inputHandler = handler; },
       registerCommand: (name: string, definition: { handler: NonNullable<typeof featureCommand> }) => { if (name === "feature") featureCommand = definition.handler; },
       registerTool: (definition: typeof tool) => { tool = definition; },
       sendUserMessage: (message: string) => { messages.push(message); } };
@@ -224,7 +235,7 @@ export async function runSmoke(trackIgnored = false, trailingReview = false, ret
       }
     } });
     assert.match(interrupted.content[0].text, /paused/);
-    assert.match(confirmations[0], /Validation in the integration worktree: git diff --exit-code HEAD -- README\.md/);
+    assert.ok(confirmations.some(question => /Validation in the integration worktree: git diff --exit-code HEAD -- README\.md/.test(question)));
     assert.ok(confirmations.some(question => /Copy Git-ignored local paths into the integration worktree only/.test(question) && /Missing optional: .env.local/.test(question)));
     assert.ok(existsSync(join(state_dir, "omp-runs", "intents")), interrupted.content[0].text);
     assert.equal(readdirSync(join(state_dir, "omp-runs", "intents")).length, 1);
@@ -336,6 +347,115 @@ export async function runSmoke(trackIgnored = false, trailingReview = false, ret
     if (previousTracked === undefined) delete process.env.FIXTURE_TRACK_IGNORED; else process.env.FIXTURE_TRACK_IGNORED = previousTracked;
     if (previousTrailing === undefined) delete process.env.FIXTURE_TRAILING_REVIEW; else process.env.FIXTURE_TRAILING_REVIEW = previousTrailing;
     if (previousRetry === undefined) delete process.env.FIXTURE_RETRY_REVIEW; else process.env.FIXTURE_RETRY_REVIEW = previousRetry;
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+// Real coordinator and Git; only the model subprocesses have deterministic fixture answers.
+export async function runComparisonSmoke(binary: string, rejectA = false): Promise<void> {
+  binary = resolve(binary);
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "tesselate-compare-")));
+  const repo = join(root, "sample"), state_dir = join(root, "state"), bin = join(root, "bin");
+  const env = { PATH: `${bin}:${process.env.PATH}`, TESSELATE_WORKSPACE_ROOT: root, FIXTURE_STATE: state_dir,
+    FIXTURE_REJECT_CANDIDATE_A: rejectA ? "1" : "0" };
+  const previous = Object.fromEntries(Object.keys(env).map(key => [key, process.env[key]]));
+  Object.assign(process.env, env);
+  try {
+    mkdirSync(bin); mkdirSync(state_dir);
+    writeFileSync(join(bin, "omp"), fakeOmp, { mode: 0o755 });
+    execFileSync("git", ["init", "-q", "-b", "main", repo]);
+    writeFileSync(join(repo, "README.md"), "Original\n");
+    writeFileSync(join(repo, ".gitignore"), ".workmux-local/\n");
+    const presets = join(repo, ".tesselate.toml");
+    writeFileSync(presets, `default_workflow = "standard"
+[workflows.experiment]
+candidates = 2
+reviewers_per_candidate = 2
+comparison_reviewers = 1
+winner_approval = "human"
+`);
+    git(repo, "add", ".");
+    git(repo, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "Base");
+    const base = git(repo, "rev-parse", "HEAD");
+    const cli = (...args: string[]) => execFileSync(binary, ["--state-dir", state_dir, ...args], { encoding: "utf8" });
+    const { credential_file } = JSON.parse(cli("credential", "bootstrap", "--actor-name", "test-supervisor"));
+    const extPath = join(root, "tesselate.ts");
+    copyFileSync(join(import.meta.dir, "tesselate.ts"), extPath);
+    writeFileSync(join(root, "tesselate.config.json"), JSON.stringify({ binary, state_dir, workspace_root: root, supervisor_credential_file: credential_file }));
+    const ext = (await import(pathToFileURL(extPath).href)).default;
+    const ui = {
+      input: async (question: string) => question.startsWith("Acceptance") ? "feature.txt is committed" : "",
+      select: async (question: string, choices: string[]) => {
+        if (question.startsWith("Use a local")) return "main";
+        if (question.includes("Which candidate")) {
+          assert.match(question, rejectA ? /Only candidate B passed/ : /Comparison recommends A: Fixture recommends A over B/);
+          assert.equal(choices.some(choice => choice.startsWith("Integrate candidate A")), !rejectA);
+          return choices[0]; // Leave both commits unintegrated until a later OMP session approves one.
+        }
+        if (choices.includes("main")) return "main";
+        throw new Error(`Unexpected selection: ${question}`);
+      },
+      confirm: async () => true,
+      notify: (message: string, level: string) => { if (level === "error") throw new Error(message); },
+    };
+    type Feature = (args: string, ctx: { cwd: string; ui: typeof ui }) => Promise<void>;
+    type Start = (...args: unknown[]) => Promise<{ content: Array<{ text: string }> }>;
+    const register = () => {
+      let feature!: Feature, start!: Start;
+      ext({
+        zod: { object: () => ({}), string: () => ({ optional: () => ({}) }) },
+        on: () => {}, registerCommand: (_: string, definition: { handler: Feature }) => { feature = definition.handler; },
+        registerTool: (definition: { execute: Start }) => { start = definition.execute; },
+        sendUserMessage: (message: string) => assert.match(message, /selected workflow "experiment"/),
+      } as unknown as Parameters<typeof ext>[0]);
+      return { feature, start };
+    };
+    const session = register();
+    await session.feature("--workflow experiment Write feature.txt", { cwd: repo, ui });
+    const result = await session.start("call", { goal: "Write feature.txt", acceptance_criteria: "feature.txt is committed",
+      constraints: "", validation_command: `git diff --exit-code ${base} HEAD -- README.md` }, undefined, undefined, { cwd: repo, ui });
+    assert.match(result.content[0].text, /run ([0-9a-f-]+): comparing/);
+    const runId = result.content[0].text.match(/run ([0-9a-f-]+): comparing/)![1];
+    const handoff = join(state_dir, "omp-runs", runId, "record.json");
+    const before = JSON.parse(readFileSync(handoff, "utf8"));
+    assert.equal(git(before.integration_dir, "rev-parse", "HEAD"), base);
+    const launchesPath = join(state_dir, "worker-launches.jsonl");
+    const launches = readFileSync(launchesPath, "utf8");
+    const workers = launches.trim().split("\n").map(line => JSON.parse(line));
+    const coderA = workers.filter(worker => worker.role === "coder" && worker.slot === "a");
+    const coderB = workers.filter(worker => worker.role === "coder" && worker.slot === "b");
+    assert.equal(coderA.length, 2); // A alone needs a revision.
+    assert.equal(coderB.length, 1);
+    assert.equal(coderA[0].start, base);
+    assert.equal(coderB[0].start, base);
+    assert.notEqual(coderA[0].cwd, coderB[0].cwd);
+    assert.equal(workers.filter(worker => worker.role === "comparison").length, rejectA ? 0 : 1);
+    assert.ok(workers.filter(worker => worker.role !== "coder").every(worker => worker.readOnly));
+    assert.match(cli("status"), /paused · nothing integrated/);
+    writeFileSync(presets, "invalid for future runs"); // Resume uses the persisted plan, not current repo config.
+    await register().feature(`resume ${runId}`, { cwd: repo, ui: {
+      ...ui, input: async () => { throw new Error("Resume asked for a new spec"); },
+      select: async (_question, choices) => choices.find(choice => choice.startsWith("Integrate candidate B"))!,
+    } });
+    const after = JSON.parse(readFileSync(handoff, "utf8"));
+    assert.equal(after.phase, "done");
+    assert.equal(git(after.integration_dir, "rev-parse", "HEAD"), before.comparison.lanes[1].last_head);
+    assert.equal(git(repo, "rev-parse", "main"), base);
+    assert.equal(readFileSync(launchesPath, "utf8"), launches);
+    const runs = JSON.parse(cli("--credential-file", credential_file, "call", "tesselate.v1.runs.list",
+      "--params", JSON.stringify({ project_id: after.project_id, page: { limit: 20, after: null } })).trim());
+    const completed = runs.items.find((run: { id: string }) => run.id === runId);
+    assert.equal(completed.status, "completed");
+    assert.equal(completed.comparison.winner.task_id, before.comparison.lanes[1].task_id);
+    assert.deepEqual(completed.reviewed_commits.map((commit: { commit_id: string }) => commit.commit_id), [before.comparison.lanes[1].last_head]);
+    const status = cli("status");
+    assert.match(status, /complete · selected B/);
+    if (!rejectA) assert.match(status, /comparison\s+compare candidates A and B/);
+    console.log(status.trimEnd());
+  } finally {
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    }
     rmSync(root, { recursive: true, force: true });
   }
 }

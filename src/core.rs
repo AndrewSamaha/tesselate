@@ -131,7 +131,41 @@ pub struct Run {
     pub reviewed_commits: Vec<CommitRef>,
     pub outstanding_integration_steps: Vec<String>,
     pub outcome: Option<RunOutcome>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comparison: Option<RunComparison>,
 }
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ComparisonWorkflow {
+    pub candidates: u32,
+    pub reviewers_per_candidate: u32,
+    pub comparison_reviewers: u32,
+    pub winner_approval: WinnerApproval,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WinnerApproval {
+    Human,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RunComparison {
+    pub workflow: ComparisonWorkflow,
+    /// Stable task IDs in candidate A, candidate B order.
+    pub candidates: [TaskId; 2],
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub winner: Option<ComparisonWinner>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ComparisonWinner {
+    pub task_id: TaskId,
+    pub commit_id: String,
+    pub reason: String,
+    pub event_id: EventId,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct WorkflowLimits {
@@ -391,6 +425,21 @@ pub struct ListHumanRequests {
 pub struct CreateRun {
     pub project_id: ProjectId,
     pub goal: String,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct CreateComparisonRun {
+    pub project_id: ProjectId,
+    pub goal: String,
+    pub workflow: ComparisonWorkflow,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SelectCandidate {
+    pub run_id: RunId,
+    pub task_id: TaskId,
+    pub commit_id: String,
+    pub reason: String,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CreateTaskWithDependencies {

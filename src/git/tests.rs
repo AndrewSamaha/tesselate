@@ -23,6 +23,10 @@ impl ProjectWorkflowPolicy for TestPolicy {
             max_review_rounds: 4,
         })
     }
+
+    fn comparison_policies(&self, project_id: ProjectId) -> CoreResult<(WorkflowLimits, u32)> {
+        Ok((self.workflow_limits(project_id)?, 2))
+    }
 }
 struct TestReviews;
 impl ReviewCompletionGate for TestReviews {
@@ -189,6 +193,7 @@ fn fixture(repo_count: usize) -> Fixture {
         reviewed_commits: vec![],
         outstanding_integration_steps: vec![],
         outcome: None,
+        comparison: None,
     };
     insert(
         &db,
