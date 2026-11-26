@@ -109,13 +109,27 @@ else throw Error('unsupported fixture operation '+command+' '+a.join(' '));
 const fakeOmp = String.raw`#!/usr/bin/env node
 const fs=require('node:fs'),cp=require('node:child_process'),path=require('node:path');
 const a=process.argv.slice(2),cwd=a[a.indexOf('--cwd')+1],prompt=a[a.length-1];
-const role=prompt.startsWith('Compare alternate')?'comparison':prompt.startsWith('Independent reviewer')?'reviewer':'coder';
+const role=prompt.startsWith('Independent planner')?'planner':prompt.startsWith('Select a Tesselate plan')?'plan selector':
+  prompt.startsWith('Compare alternate')?'comparison':prompt.startsWith('Independent reviewer')?'reviewer':'coder';
 const session=a[a.indexOf('--session-dir')+1];
 const slot=path.basename(session).match(/^session-candidate-([ab])-/)?.[1];
 const start=cp.execFileSync('git',['-C',cwd,'rev-parse','HEAD'],{encoding:'utf8'}).trim();
 fs.appendFileSync(path.join(process.env.FIXTURE_STATE,'worker-launches.jsonl'),JSON.stringify({role,cwd,slot,start,readOnly:a.includes('--tools=read,grep,glob'),workerEnv:process.env.TESSELATE_WORKER,model:a[a.indexOf('--model')+1]})+'\n');
 const round = Number(prompt.match(/round (\d+)/)?.[1] ?? 1);
-if(role==='coder') {
+if(role==='planner') {
+  const proposal=prompt.match(/^Independent planner ([AB])/)[1];
+  if(proposal==='B' && process.env.FIXTURE_BAD_PLANNER==='1') {
+    process.stdout.write('Incomplete proposal.\n');
+  } else {
+    process.stdout.write(JSON.stringify({approach:'Proposal '+proposal,steps:['Write feature.txt'],verification:['Assert feature.txt is committed'],risks:[]})+'\n');
+  }
+} else if(role==='plan selector') {
+  if(!prompt.includes('Proposal A')||!prompt.includes('Proposal B')) throw Error('Plan selection needs both proposals.');
+  process.stdout.write(JSON.stringify({recommendation:'B',reason:'Plan B directly verifies the acceptance criterion.'})+'\n');
+} else if(role==='coder') {
+  if(!prompt.includes('Supervisor-selected implementation plan: {"approach":"Proposal B"')||prompt.includes('Proposal A')) {
+    throw Error('Expected only the selected proposal in the coder brief.');
+  }
   fs.writeFileSync(path.join(cwd,'feature.txt'),round===1?'implemented in task worktree\n':'feature.txt is committed (review correction)\n');
   if(slot) fs.appendFileSync(path.join(cwd,'feature.txt'),'Candidate '+slot+'\n');
   if(slot==='a' && process.env.FIXTURE_REJECT_CANDIDATE_A==='1') {
@@ -166,6 +180,7 @@ export async function runSmoke(trackIgnored = false, trailingReview = false, ret
   const previousTrailing = process.env.FIXTURE_TRAILING_REVIEW;
   const previousRetry = process.env.FIXTURE_RETRY_REVIEW;
   const previousLowBudget = process.env.FIXTURE_LOW_REVIEW_BUDGET;
+  const previousBadPlanner = process.env.FIXTURE_BAD_PLANNER;
   if (repairReview) process.env.FIXTURE_LOW_REVIEW_BUDGET = "1";
   try {
     const home = join(root, "home"), workspace_root = join(home, "Development"), repo = join(workspace_root, "sample"), state_dir = join(workspace_root, ".tesselate");
@@ -267,6 +282,18 @@ export async function runSmoke(trackIgnored = false, trailingReview = false, ret
     assert.ok(existsSync(join(state_dir, "omp-runs", "intents")), interrupted.content[0].text);
     assert.equal(readdirSync(join(state_dir, "omp-runs", "intents")).length, 1);
     delete process.env.FIXTURE_FAIL_AFTER_RUN_CREATE;
+    const interruptedRun = JSON.parse(readFileSync(join(state_dir, "fixture-db.json"), "utf8")).run.id;
+    const workerLog = join(state_dir, "worker-launches.jsonl");
+    const readLaunches = () => readFileSync(workerLog, "utf8").trim().split("\n").map(line => JSON.parse(line));
+    process.env.FIXTURE_BAD_PLANNER = "1";
+    await featureCommand!("resume", { cwd: workspace_root, ui: resumeUi });
+    assert.ok(notifications.some(message => /Planner B did not produce a valid proposal/.test(message)));
+    const proposals = readLaunches();
+    assert.deepEqual(proposals.map(worker => worker.role), ["planner", "planner"]);
+    assert.equal(new Set(proposals.map(worker => worker.cwd)).size, 2);
+    assert.ok(proposals.every(worker => worker.start === mainHead && worker.readOnly));
+    delete process.env.FIXTURE_BAD_PLANNER;
+    notifications.length = 0;
     // A second interruption after role-token persistence replays issuance without the secret.
     const { startFeature } = await import(pathToFileURL(join(ext, "tesselate.ts")).href);
     const config = { binary, state_dir, workspace_root, supervisor_credential_file };
@@ -277,13 +304,12 @@ export async function runSmoke(trackIgnored = false, trailingReview = false, ret
     notifications.length = 0;
     delete process.env.FIXTURE_FAIL_AFTER_CODER_ISSUE;
     process.env.FIXTURE_FAIL_AFTER_CAPTURE = "1";
-    const secondFailure = await startFeature(config, repo, spec, ui).then(() => undefined, (error: Error) => error);
-    const interruptedRun = JSON.parse(readFileSync(join(state_dir, "fixture-db.json"), "utf8")).run.id;
+    await assert.rejects(startFeature(config, repo, spec, ui), /exited 79/);
     const interruptedRecord = JSON.parse(readFileSync(join(state_dir, "omp-runs", interruptedRun, "record.json"), "utf8"));
-    const workerLog = join(state_dir, "worker-launches.jsonl");
     const heartbeatDir = join(state_dir, "omp-runs", interruptedRun, "heartbeat");
-    assert.ok(existsSync(workerLog), secondFailure?.message ?? interruptedRecord.error);
-    assert.equal(readFileSync(workerLog, "utf8").trim().split("\n").length, 1);
+    assert.deepEqual(readLaunches().slice(2).map(worker => worker.role), ["planner", "plan selector", "coder"]);
+    assert.equal(interruptedRecord.plan.recommendation, "B");
+    assert.equal(interruptedRecord.plan.reason, "Plan B directly verifies the acceptance criterion.");
     const integrationEnv = join(state_dir, "omp-runs", interruptedRun, "integration", ".env");
     assert.equal(readFileSync(integrationEnv, "utf8"), "fixture-secret=not-for-reviewers\n");
     writeFileSync(integrationEnv, "modified locally\n");
@@ -306,7 +332,7 @@ export async function runSmoke(trackIgnored = false, trailingReview = false, ret
       const paused = JSON.parse(readFileSync(join(state_dir, "omp-runs", interruptedRun, "record.json"), "utf8"));
       assert.equal(paused.phase, "review");
       assert.equal(JSON.parse(readFileSync(join(state_dir, "fixture-db.json"), "utf8")).reviews.length, 0);
-      assert.equal(readFileSync(workerLog, "utf8").trim().split("\n").length, 2);
+      assert.equal(readLaunches().filter(worker => worker.role === "reviewer").length, 1);
       return;
     }
     if (retryReview) {
@@ -335,19 +361,19 @@ export async function runSmoke(trackIgnored = false, trailingReview = false, ret
     assert.equal(statSync(integrationEnv).mode & 0o077, 0);
     assert.equal(readFileSync(join(record.integration_dir, "packages/content/.revisions/snapshot.json"), "utf8"), "{\"id\":1}\n");
     assert.doesNotMatch(readFileSync(join(state_dir, "omp-runs", interruptedRun, "record.json"), "utf8"), /fixture-secret/);
-    const launches = readFileSync(join(state_dir, "worker-launches.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
-    assert.deepEqual(launches.map(item => item.role), retryReview
+    const launches = readLaunches();
+    assert.deepEqual(launches.slice(4).map(item => item.role), retryReview
       ? ["coder", "reviewer", "reviewer", "reviewer", "coder", "reviewer", "reviewer"]
       : ["coder", "reviewer", "reviewer", "coder", "reviewer", "reviewer"]);
-    const revisionCoder = launches.findIndex((item, index) => index > 0 && item.role === "coder");
-    assert.notEqual(launches[0].cwd, launches[revisionCoder].cwd);
-    assert.equal(launches[revisionCoder].cwd, record.workspace_dir);
+    const [initialCoder, revisionCoder] = launches.filter(worker => worker.role === "coder");
+    assert.notEqual(initialCoder.cwd, revisionCoder.cwd);
+    assert.equal(revisionCoder.cwd, record.workspace_dir);
     assert.ok(launches.filter(item => item.role === "reviewer").every(item => item.readOnly && item.cwd !== record.workspace_dir && item.workerEnv === "1"));
     assert.ok(launches.every(item => !existsSync(join(item.cwd, ".env")) && !existsSync(join(item.cwd, "packages/content/.revisions"))));
     if (workerModel) assert.ok(launches.every(item => item.model === workerModel));
     assert.ok(existsSync(join(record.workspace_dir, ".workmux-local", "completion.md")));
     const heartbeatNames = readdirSync(heartbeatDir).filter(name => name.endsWith(".json")).sort();
-    assert.deepEqual(heartbeatNames, ["coder-round-1.json", "coder-round-2.json", "reviewer-0-round-1.json", "reviewer-0-round-2.json", "reviewer-1-round-1.json", "reviewer-1-round-2.json", "supervisor.json"]);
+    assert.deepEqual(heartbeatNames, ["coder-round-1.json", "coder-round-2.json", "plan-selector.json", "planner-a.json", "planner-b.json", "reviewer-0-round-1.json", "reviewer-0-round-2.json", "reviewer-1-round-1.json", "reviewer-1-round-2.json", "supervisor.json"]);
     const supervisorHeartbeat = JSON.parse(readFileSync(join(heartbeatDir, "supervisor.json"), "utf8"));
     assert.equal(supervisorHeartbeat.state, "finished");
     assert.equal(supervisorHeartbeat.role, "supervisor");
@@ -375,7 +401,7 @@ export async function runSmoke(trackIgnored = false, trailingReview = false, ret
     const resumed = await startFeature({ binary, state_dir, workspace_root, supervisor_credential_file }, repo,
       { goal: "Write feature.txt", acceptance_criteria: "feature.txt is committed", constraints: "", validation_command: "git diff --exit-code HEAD -- README.md", base_branch: "" }, ui);
     assert.equal(resumed.run_id, record.run_id);
-    assert.equal(readFileSync(join(state_dir, "worker-launches.jsonl"), "utf8").trim().split("\n").length, retryReview ? 7 : 6);
+    assert.deepEqual(readLaunches(), launches);
     assert.equal(database.runCreateCount, 1);
   } finally {
     if (previousPath === undefined) delete process.env.PATH; else process.env.PATH = previousPath;
@@ -388,6 +414,7 @@ export async function runSmoke(trackIgnored = false, trailingReview = false, ret
     if (previousTrailing === undefined) delete process.env.FIXTURE_TRAILING_REVIEW; else process.env.FIXTURE_TRAILING_REVIEW = previousTrailing;
     if (previousRetry === undefined) delete process.env.FIXTURE_RETRY_REVIEW; else process.env.FIXTURE_RETRY_REVIEW = previousRetry;
     if (previousLowBudget === undefined) delete process.env.FIXTURE_LOW_REVIEW_BUDGET; else process.env.FIXTURE_LOW_REVIEW_BUDGET = previousLowBudget;
+    if (previousBadPlanner === undefined) delete process.env.FIXTURE_BAD_PLANNER; else process.env.FIXTURE_BAD_PLANNER = previousBadPlanner;
     rmSync(root, { recursive: true, force: true });
   }
 }

@@ -163,6 +163,21 @@ plain-language request is ambiguous. To register a repository directly:
 tesselate project ensure --repo ~/Development/bitwars
 ```
 
+### Plan before coding
+
+After you approve a new run's specification and base, the OMP supervisor starts
+two independent planners in parallel. Each inspects its own detached checkout
+of the same base and proposes ordered implementation steps, verification, and
+risks. The planners and the supervisor's plan selector use read-only OMP tools
+and receive no provisioned files.
+
+The supervisor compares both proposals against the approved specification and
+chooses one without a second approval prompt. It records the plan and rationale
+in `omp-runs/<run-id>/record.json`; the two proposals and selection also have
+separate worker logs. Coding starts only after selection, and coders see only
+the selected plan. `/feature resume` reuses valid planner results and a saved
+selection. Runs created before this stage was added keep their existing flow.
+
 For an interrupted run, use `/feature resume` in OMP. It selects an existing
 run for the chosen repository without asking for a new goal, acceptance criteria,
 or validation command; `/feature resume <run-UUID>` targets one run directly.
@@ -191,11 +206,12 @@ independent implementations in a feature request. OMP proposes a preset; the
 start confirmation shows the agent counts and validation command. `standard`
 remains the default unless the repository opts in.
 
-Both coders start at the same base commit in separate worktrees. Each candidate
-gets its own reviews and revisions. The same approved command validates each
-reviewed candidate in a dedicated detached checkout, then validates the winner
-again on the integration branch. Candidate validation checkouts do not receive
-provisioned files. Use a command that can run without those files for `compare`.
+Both coders start at the same base commit in separate worktrees and implement
+the selected plan independently. Each candidate gets its own reviews and
+revisions. The same approved command validates each reviewed candidate in a
+dedicated detached checkout, then validates the winner again on the integration
+branch. Candidate validation checkouts do not receive provisioned files. Use a
+command that can run without those files for `compare`.
 
 If both pass, a fresh read-only reviewer compares the two commits and recommends
 `A`, `B`, or `neither`. You choose which candidate to integrate, if any. If
