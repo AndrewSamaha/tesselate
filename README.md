@@ -165,18 +165,25 @@ tesselate project ensure --repo ~/Development/bitwars
 
 ### Plan before coding
 
-After you approve a new run's specification and base, the OMP supervisor starts
-two independent planners in parallel. Each inspects its own detached checkout
-of the same base and proposes ordered implementation steps, verification, and
-risks. The planners and the supervisor's plan selector use read-only OMP tools
-and receive no provisioned files.
+At setup, choose **UX design** for changes to user or player flows, decisions,
+or feedback; **UX checklist** for small changes within an existing interaction;
+or **No UX stage** for changes with no user-facing effect.
 
-The supervisor compares both proposals against the approved specification and
-chooses one without a second approval prompt. It records the plan and rationale
-in `omp-runs/<run-id>/record.json`; the two proposals and selection also have
-separate worker logs. Coding starts only after selection, and coders see only
-the selected plan. `/feature resume` reuses valid planner results and a saved
-selection. Runs created before this stage was added keep their existing flow.
+After approval, two independent planners inspect separate detached checkouts
+of the same base and propose implementation steps, verification, and risks.
+In UX design mode, a third, independent designer runs alongside them and
+proposes the interaction, edge states, and observable checks. Planning and
+design workers use read-only OMP tools and receive no provisioned files.
+
+The supervisor selects one architecture proposal and, for UX work, reconciles
+it with the design or writes a short checklist. It can ask one planner or
+designer for one targeted revision. If a conflict remains, no coder starts:
+clarify the requirements and choose **Start new run**.
+
+The supervisor saves the selected plan, rationale, and any agreed UX brief in
+`omp-runs/<run-id>/record.json` before coding. Coders and reviewers see the same
+brief, not the alternatives. `/feature resume` reuses valid planning results and
+the saved brief. Existing runs retain their original planning scope.
 
 For an interrupted run, use `/feature resume` in OMP. It selects an existing
 run for the chosen repository without asking for a new goal, acceptance criteria,

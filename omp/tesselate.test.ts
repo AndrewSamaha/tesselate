@@ -110,11 +110,13 @@ const fakeOmp = String.raw`#!/usr/bin/env node
 const fs=require('node:fs'),cp=require('node:child_process'),path=require('node:path');
 const a=process.argv.slice(2),cwd=a[a.indexOf('--cwd')+1],prompt=a[a.length-1];
 const role=prompt.startsWith('Independent planner')?'planner':prompt.startsWith('Select a Tesselate plan')?'plan selector':
+  prompt.startsWith('Independent UI/UX designer')?'UX designer':prompt.startsWith('Reconcile Tesselate architecture')?'design reconciler':
   prompt.startsWith('Compare alternate')?'comparison':prompt.startsWith('Independent reviewer')?'reviewer':'coder';
 const session=a[a.indexOf('--session-dir')+1];
 const slot=path.basename(session).match(/^session-candidate-([ab])-/)?.[1];
 const start=cp.execFileSync('git',['-C',cwd,'rev-parse','HEAD'],{encoding:'utf8'}).trim();
-fs.appendFileSync(path.join(process.env.FIXTURE_STATE,'worker-launches.jsonl'),JSON.stringify({role,cwd,slot,start,readOnly:a.includes('--tools=read,grep,glob'),workerEnv:process.env.TESSELATE_WORKER,model:a[a.indexOf('--model')+1]})+'\n');
+const brief=prompt.split('\n').find(line=>line.startsWith('Agreed UX brief: '))?.slice('Agreed UX brief: '.length);
+fs.appendFileSync(path.join(process.env.FIXTURE_STATE,'worker-launches.jsonl'),JSON.stringify({role,cwd,slot,start,brief,readOnly:a.includes('--tools=read,grep,glob'),workerEnv:process.env.TESSELATE_WORKER,model:a[a.indexOf('--model')+1]})+'\n');
 const round = Number(prompt.match(/round (\d+)/)?.[1] ?? 1);
 if(role==='planner') {
   const proposal=prompt.match(/^Independent planner ([AB])/)[1];
@@ -126,6 +128,21 @@ if(role==='planner') {
 } else if(role==='plan selector') {
   if(!prompt.includes('Proposal A')||!prompt.includes('Proposal B')) throw Error('Plan selection needs both proposals.');
   process.stdout.write(JSON.stringify({recommendation:'B',reason:'Plan B directly verifies the acceptance criterion.'})+'\n');
+} else if(role==='UX designer') {
+  const revised=prompt.includes('Wait for server acceptance');
+  if(revised && !prompt.includes('Show immediate success')) throw Error('UX revision needs its original brief.');
+  process.stdout.write(JSON.stringify({flow:['Submit the action'],states:[revised?'Show success only after acceptance':'Show immediate success'],verification:['Observe feedback after submitting']})+'\n');
+} else if(role==='design reconciler') {
+  if(!prompt.includes('Proposal A')||!prompt.includes('Proposal B')) throw Error('UX reconciliation needs both plans.');
+  const checklist=prompt.includes('Draft a concise UX checklist');
+  const final=prompt.includes('One revision has been requested');
+  if(final && !prompt.includes('Show success only after acceptance')) throw Error('Final reconciliation needs revised UX.');
+  if(!checklist && !final && !prompt.includes('Show immediate success')) throw Error('Reconciliation needs the initial UX.');
+  const decision=final && prompt.includes('Blocked UI fixture') ? {status:'blocked',reason:'Approved spec leaves acceptance feedback ambiguous'} :
+    !checklist && !final ? {status:'revise',target:'ux',reason:'Wait for server acceptance'} :
+    {status:'ready',recommendation:'B',reason:'Plan B directly verifies the acceptance criterion.',
+      ux:{flow:['Submit the action'],states:[checklist?'Keep existing feedback':'Show success only after acceptance'],verification:['Observe feedback after submitting']}};
+  process.stdout.write(JSON.stringify(decision)+'\n');
 } else if(role==='coder') {
   if(!prompt.includes('Supervisor-selected implementation plan: {"approach":"Proposal B"')||prompt.includes('Proposal A')) {
     throw Error('Expected only the selected proposal in the coder brief.');
@@ -168,7 +185,7 @@ function git(repo: string, ...args: string[]): string {
   return execFileSync("git", ["-C", repo, ...args], { encoding: "utf8" }).trim();
 }
 
-export async function runSmoke(trackIgnored = false, trailingReview = false, retryReview = false, workerModel = "", repairReview = false): Promise<void> {
+export async function runSmoke(trackIgnored = false, trailingReview = false, retryReview = false, workerModel = "", repairReview = false, blockUX = false): Promise<void> {
   const root = mkdtempSync(join(tmpdir(), "tesselate-omp-fixture-"));
   const previousPath = process.env.PATH;
   const previousRepo = process.env.FIXTURE_REPO;
@@ -225,6 +242,7 @@ export async function runSmoke(trackIgnored = false, trailingReview = false, ret
           if (!repairReview) throw new Error(`Unexpected repair prompt: ${question}`);
           return choices[0];
         }
+        if (question.startsWith("What UI/UX")) return choices[0];
         return question.startsWith("Which repository") ? "sample" : question.startsWith("Resume") ? choices[0] : "main";
       },
       confirm: async () => true, notify: () => {} };
@@ -253,7 +271,7 @@ export async function runSmoke(trackIgnored = false, trailingReview = false, ret
     assert.match(messages[0], /no shared-service tests/);
     assert.ok(tool);
     assert.ok(featureCommand);
-    const proposal = { goal: "Write feature.txt", acceptance_criteria: "feature.txt is committed", constraints: "no shared-service tests", validation_command: "git diff --exit-code HEAD -- README.md" };
+    const proposal = { goal: blockUX ? "Blocked UI fixture" : "Write feature.txt", acceptance_criteria: "feature.txt is committed", constraints: "no shared-service tests", validation_command: "git diff --exit-code HEAD -- README.md" };
     const missing = await tool!.execute("call", { ...proposal, validation_command: "" }, undefined, undefined, { cwd: workspace_root, ui: {
       ...ui, input: async () => "", confirm: async () => { throw new Error("Unproposed validation must not start a run"); }
     } });
@@ -287,12 +305,20 @@ export async function runSmoke(trackIgnored = false, trailingReview = false, ret
     const readLaunches = () => readFileSync(workerLog, "utf8").trim().split("\n").map(line => JSON.parse(line));
     process.env.FIXTURE_BAD_PLANNER = "1";
     await featureCommand!("resume", { cwd: workspace_root, ui: resumeUi });
-    assert.ok(notifications.some(message => /Planner B did not produce a valid proposal/.test(message)));
+    assert.ok(notifications.some(message => /Planner B did not produce a valid result/.test(message)));
     const proposals = readLaunches();
-    assert.deepEqual(proposals.map(worker => worker.role), ["planner", "planner"]);
-    assert.equal(new Set(proposals.map(worker => worker.cwd)).size, 2);
+    assert.deepEqual(proposals.map(worker => worker.role).sort(), ["UX designer", "planner", "planner"]);
+    assert.equal(new Set(proposals.map(worker => worker.cwd)).size, 3);
     assert.ok(proposals.every(worker => worker.start === mainHead && worker.readOnly));
     delete process.env.FIXTURE_BAD_PLANNER;
+    if (blockUX) {
+      notifications.length = 0;
+      await featureCommand!("resume", { cwd: workspace_root, ui: resumeUi });
+      assert.ok(notifications.some(message => /Planning blocked: Approved spec leaves acceptance feedback ambiguous\. No coder was started/.test(message)));
+      assert.ok(readLaunches().every(worker => worker.role !== "coder"));
+      assert.equal(JSON.parse(readFileSync(join(state_dir, "fixture-db.json"), "utf8")).task.status, "ready");
+      return;
+    }
     notifications.length = 0;
     // A second interruption after role-token persistence replays issuance without the secret.
     const { startFeature } = await import(pathToFileURL(join(ext, "tesselate.ts")).href);
@@ -307,9 +333,11 @@ export async function runSmoke(trackIgnored = false, trailingReview = false, ret
     await assert.rejects(startFeature(config, repo, spec, ui), /exited 79/);
     const interruptedRecord = JSON.parse(readFileSync(join(state_dir, "omp-runs", interruptedRun, "record.json"), "utf8"));
     const heartbeatDir = join(state_dir, "omp-runs", interruptedRun, "heartbeat");
-    assert.deepEqual(readLaunches().slice(2).map(worker => worker.role), ["planner", "plan selector", "coder"]);
+    assert.deepEqual(readLaunches().slice(proposals.length).map(worker => worker.role),
+      ["planner", "design reconciler", "UX designer", "design reconciler", "coder"]);
     assert.equal(interruptedRecord.plan.recommendation, "B");
     assert.equal(interruptedRecord.plan.reason, "Plan B directly verifies the acceptance criterion.");
+    assert.deepEqual(interruptedRecord.plan.ux.states, ["Show success only after acceptance"]);
     const integrationEnv = join(state_dir, "omp-runs", interruptedRun, "integration", ".env");
     assert.equal(readFileSync(integrationEnv, "utf8"), "fixture-secret=not-for-reviewers\n");
     writeFileSync(integrationEnv, "modified locally\n");
@@ -362,9 +390,11 @@ export async function runSmoke(trackIgnored = false, trailingReview = false, ret
     assert.equal(readFileSync(join(record.integration_dir, "packages/content/.revisions/snapshot.json"), "utf8"), "{\"id\":1}\n");
     assert.doesNotMatch(readFileSync(join(state_dir, "omp-runs", interruptedRun, "record.json"), "utf8"), /fixture-secret/);
     const launches = readLaunches();
-    assert.deepEqual(launches.slice(4).map(item => item.role), retryReview
+    const implementation = launches.filter(worker => worker.role === "coder" || worker.role === "reviewer");
+    assert.deepEqual(implementation.map(item => item.role), retryReview
       ? ["coder", "reviewer", "reviewer", "reviewer", "coder", "reviewer", "reviewer"]
       : ["coder", "reviewer", "reviewer", "coder", "reviewer", "reviewer"]);
+    assert.ok(implementation.every(worker => worker.brief === JSON.stringify(interruptedRecord.plan.ux)));
     const [initialCoder, revisionCoder] = launches.filter(worker => worker.role === "coder");
     assert.notEqual(initialCoder.cwd, revisionCoder.cwd);
     assert.equal(revisionCoder.cwd, record.workspace_dir);
@@ -373,7 +403,7 @@ export async function runSmoke(trackIgnored = false, trailingReview = false, ret
     if (workerModel) assert.ok(launches.every(item => item.model === workerModel));
     assert.ok(existsSync(join(record.workspace_dir, ".workmux-local", "completion.md")));
     const heartbeatNames = readdirSync(heartbeatDir).filter(name => name.endsWith(".json")).sort();
-    assert.deepEqual(heartbeatNames, ["coder-round-1.json", "coder-round-2.json", "plan-selector.json", "planner-a.json", "planner-b.json", "reviewer-0-round-1.json", "reviewer-0-round-2.json", "reviewer-1-round-1.json", "reviewer-1-round-2.json", "supervisor.json"]);
+    assert.deepEqual(heartbeatNames, ["coder-round-1.json", "coder-round-2.json", "design-reconciler-final.json", "design-reconciler.json", "planner-a.json", "planner-b.json", "reviewer-0-round-1.json", "reviewer-0-round-2.json", "reviewer-1-round-1.json", "reviewer-1-round-2.json", "supervisor.json", "ux-designer-revision.json", "ux-designer.json"]);
     const supervisorHeartbeat = JSON.parse(readFileSync(join(heartbeatDir, "supervisor.json"), "utf8"));
     assert.equal(supervisorHeartbeat.state, "finished");
     assert.equal(supervisorHeartbeat.role, "supervisor");
@@ -463,6 +493,7 @@ command = "${rejectA ? "git status --short" : validation}"
       },
       select: async (question: string, choices: string[]) => {
         if (question.startsWith("Use a local")) return "main";
+        if (question.startsWith("What UI/UX")) return choices[rejectA ? 2 : 1];
         if (question.includes("Which candidate")) {
           assert.match(question, rejectA ? /Only candidate B passed/ : /Comparison recommends A: Fixture recommends A over B/);
           assert.equal(choices.some(choice => choice.startsWith("Integrate candidate A")), !rejectA);
@@ -514,6 +545,15 @@ command = "${rejectA ? "git status --short" : validation}"
     assert.notEqual(coderA[0].cwd, coderB[0].cwd);
     assert.equal(workers.filter(worker => worker.role === "comparison").length, rejectA ? 0 : 1);
     assert.ok(workers.filter(worker => worker.role !== "coder").every(worker => worker.readOnly));
+    assert.ok(workers.every(worker => worker.role !== "UX designer"));
+    if (rejectA) {
+      assert.equal(before.plan.ux, undefined);
+      assert.ok(workers.every(worker => worker.brief === undefined));
+    } else {
+      assert.deepEqual(before.plan.ux.states, ["Keep existing feedback"]);
+      assert.ok(workers.filter(worker => ["coder", "reviewer", "comparison"].includes(worker.role))
+        .every(worker => worker.brief === JSON.stringify(before.plan.ux)));
+    }
     assert.match(cli("status"), /paused · nothing integrated/);
     writeFileSync(presets, '[validation]\ncommand = "false"\n'); // Resuming must validate integration with the approved command.
     await register().feature(`resume ${runId}`, { cwd: repo, ui: {
