@@ -6,7 +6,10 @@ use omp_install::ensure_project;
 
 use crate::{
     config::load_project_config,
-    coordination::{application::Application, Coordination},
+    coordination::{
+        application::{Application, RecordOmpEvent},
+        Coordination,
+    },
     core::*,
     mcp::TOOLS,
 };
@@ -22,6 +25,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 const DEFAULT_PAGE_SIZE: u32 = 100;
+const RECORD_OMP_EVENT: &str = "tesselate.v1.omp.events.record";
 
 fn parse_uuid(field: &str, value: &str) -> Result<Uuid, CliError> {
     Uuid::parse_str(value).map_err(|_| CoreError::Invalid(format!("{field} must be a UUID")).into())
@@ -505,7 +509,7 @@ pub fn execute(
             idempotency_key,
         } => {
             let ctx = authenticated_context(app, credential_file)?;
-            if !TOOLS.contains(&tool.as_str()) {
+            if tool != RECORD_OMP_EVENT && !TOOLS.contains(&tool.as_str()) {
                 return Err(
                     CoreError::Invalid(format!("unknown coordination tool {tool:?}")).into(),
                 );
@@ -745,6 +749,8 @@ fn dispatch(
             .repair_task(c, r, k)),
         "tesselate.v1.runs.complete" => mutation!(CompleteRun, |a: &Application, c, r, k| a
             .complete_run(c, r, k)),
+        RECORD_OMP_EVENT => mutation!(RecordOmpEvent, |a: &Application, c, r, k| a
+            .record_omp_event(c, r, k)),
         "tesselate.v1.messages.send" => mutation!(SendMessage, |a: &Application, c, r, k| a
             .send_message(c, r, k)),
         "tesselate.v1.messages.read" => {

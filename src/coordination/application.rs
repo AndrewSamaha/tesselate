@@ -43,6 +43,88 @@ struct CredentialSummary {
     expires_at: Option<DateTime<Utc>>,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RecordOmpEvent {
+    run_id: RunId,
+    event: OmpEvent,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum OmpEvent {
+    WorkerAttemptStarted {
+        attempt_id: Uuid,
+        worker: String,
+        role: OmpWorkerRole,
+        model: Option<String>,
+    },
+    WorkerAttemptFinished {
+        attempt_id: Uuid,
+        worker: String,
+        outcome: OmpAttemptOutcome,
+        exit_code: Option<i32>,
+        failure_code: Option<OmpFailureCode>,
+    },
+    RunResumed {
+        phase: OmpRunPhase,
+        round: u32,
+        previous_model: Option<String>,
+        model: Option<String>,
+    },
+    NotificationDelivered {
+        channel: OmpNotificationChannel,
+        omp_session_id: Option<String>,
+    },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum OmpWorkerRole {
+    Planner,
+    UxDesigner,
+    PlanSelector,
+    DesignReconciler,
+    Coder,
+    Reviewer,
+    ComparisonReviewer,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum OmpAttemptOutcome {
+    Succeeded,
+    InvalidOutput,
+    ExitFailure,
+    LaunchFailure,
+    NoFinalResult,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum OmpFailureCode {
+    UsageLimitReached,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum OmpRunPhase {
+    Planning,
+    Coding,
+    Review,
+    Revision,
+    Integrating,
+    Comparing,
+    Failed,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum OmpNotificationChannel {
+    ToolResult,
+    AgentMessage,
+}
+
 /// Concrete runtime composition. Authorization and lifecycle rules stay in their feature owners.
 pub struct Application {
     db: Database,
@@ -286,6 +368,70 @@ impl Application {
         key: IdempotencyKey,
     ) -> CoreResult<Mutation<Workspace>> {
         self.git.cleanup_workspace(ctx, request, key)
+    }
+
+    /// Records a bridge observation, without changing coordinator run state.
+    pub(crate) fn record_omp_event(
+        &self,
+        ctx: &SessionContext,
+        request: RecordOmpEvent,
+        key: IdempotencyKey,
+    ) -> CoreResult<Mutation<()>> {
+        if ctx.role() != Role::Supervisor {
+            return Err(CoreError::Forbidden);
+        }
+        let run = self.load_run(request.run_id)?;
+        let (event_type, payload) = match &request.event {
+            OmpEvent::WorkerAttemptStarted {
+                attempt_id,
+                worker,
+                role,
+                model,
+            } => (
+                "worker.attempt_started",
+                json!({"attempt_id":attempt_id,"worker":worker,"role":role,"model":model}),
+            ),
+            OmpEvent::WorkerAttemptFinished {
+                attempt_id,
+                worker,
+                outcome,
+                exit_code,
+                failure_code,
+            } => (
+                "worker.attempt_finished",
+                json!({"attempt_id":attempt_id,"worker":worker,"outcome":outcome,"exit_code":exit_code,"failure_code":failure_code}),
+            ),
+            OmpEvent::RunResumed {
+                phase,
+                round,
+                previous_model,
+                model,
+            } => (
+                "run.resumed",
+                json!({"phase":phase,"round":round,"previous_model":previous_model,"model":model}),
+            ),
+            OmpEvent::NotificationDelivered {
+                channel,
+                omp_session_id,
+            } => (
+                "notification.delivered",
+                json!({"kind":"completion","target":"driving_omp","channel":channel,"omp_session_id":omp_session_id}),
+            ),
+        };
+        let event = NewEvent::from_context(
+            ctx,
+            "supervisor",
+            EventScope {
+                project_id: Some(run.project_id),
+                run_id: Some(run.id),
+                task_id: None,
+            },
+            event_type,
+            payload,
+        );
+        self.db
+            .record_observation(ctx, "omp.events.record", &key, &request, event)
+            .map_err(storage_error)
     }
 
     fn load_run(&self, run_id: RunId) -> CoreResult<Run> {

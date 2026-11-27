@@ -3,13 +3,16 @@ import { createHash, randomUUID } from "node:crypto";
 import { closeSync, constants, existsSync, fstatSync, linkSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, readSync, renameSync, statSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
 import type { Stats } from "node:fs";
 import { dirname, isAbsolute, join, relative } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 
 type Config = { binary: string; state_dir: string; workspace_root: string; supervisor_credential_file: string };
 type UXMode = "design" | "checklist" | "none";
 type Spec = { goal: string; acceptance_criteria: string; constraints: string; validation_command: string; base_branch: string; ux?: UXMode };
 type Workflow = { candidates: 1 | 2; reviewers_per_candidate: number; comparison_reviewers?: 1; winner_approval?: "human" };
-type Worker = { role: "planner" | "UX designer" | "plan selector" | "design reconciler" | "coder" | "reviewer" | "comparison reviewer"; cwd: string; credential_file?: string; log: string; session_dir: string; pid?: number; finished?: boolean; assignment?: string; started_at?: string };
+type AttemptResult = { outcome: "succeeded" | "invalid_output" | "exit_failure" | "launch_failure" | "no_final_result"; exit_code?: number; failure_code?: "usage_limit_reached" };
+type WorkerAttempt = { id: string; model?: string; result?: AttemptResult };
+type Worker = { role: "planner" | "UX designer" | "plan selector" | "design reconciler" | "coder" | "reviewer" | "comparison reviewer"; cwd: string; credential_file?: string; log: string; session_dir: string; pid?: number; finished?: boolean; assignment?: string; started_at?: string; attempt?: WorkerAttempt };
 type Heartbeat = { version: 1; run_id: string; agent: string; role: string; assignment: string; status: string; state: "working" | "waiting" | "finished" | "failed" | "stopped"; pid?: number; started_at: string; updated_at: string; working: boolean; error?: string };
 type Review = { passed: boolean; summary: string; findings: Array<{ severity: "low" | "medium" | "high" | "critical"; location: string; evidence: string; proposed_correction: string }> };
 type CandidateSlot = "A" | "B";
@@ -185,6 +188,22 @@ async function listed<T = Record<string, unknown>>(config: Config, credential: s
 function mutationKey(record: RunRecord, action: string): string { return `omp:${record.run_id}:${action}`; }
 async function mutate<T = Record<string, unknown>>(config: Config, record: RunRecord, op: string, params: unknown, action: string, credential = config.supervisor_credential_file): Promise<T> {
   return value(await call<{ value: T }>(config, credential, op, params, mutationKey(record, action)));
+}
+type NotificationChannel = "tool_result" | "agent_message";
+type TimelineEvent =
+  | { kind: "worker_attempt_started"; attempt_id: string; worker: string; role: string; model?: string }
+  | ({ kind: "worker_attempt_finished"; attempt_id: string; worker: string } & AttemptResult)
+  | { kind: "run_resumed"; phase: Exclude<RunRecord["phase"], "done">; round: number; previous_model?: string; model?: string }
+  | { kind: "notification_delivered"; channel: NotificationChannel; omp_session_id?: string };
+
+async function recordEvent(config: Config, runId: string, event: TimelineEvent, id: string): Promise<void> {
+  await call(config, config.supervisor_credential_file, "omp.events.record", { run_id: runId, event },
+    `omp:${runId}:${event.kind}:${id}`);
+}
+
+async function recordNotification(config: Config, runId: string, channel: NotificationChannel, id: string, ui: UIOps, ompSessionId?: string): Promise<void> {
+  try { await recordEvent(config, runId, { kind: "notification_delivered", channel, omp_session_id: ompSessionId }, `${channel}:${id}`); }
+  catch { ui.notify(`Tesselate run ${runId}: completion delivered, but the timeline write failed.`, "warning"); }
 }
 async function repoFor(cwd: string, config: Config): Promise<string> {
   const root = await git(cwd, "rev-parse", "--show-toplevel");
@@ -500,64 +519,113 @@ function writeHeartbeats(config: Config, record: RunRecord, final = false): void
     }
   } catch { /* Status is best effort; never fail a run because a heartbeat write failed. */ }
 }
-const liveWorkers = new Map<number, Promise<number | null>>();
+type WorkerExit = { code: number | null } | { error: Error };
+const liveWorkers = new Map<number, Promise<WorkerExit>>();
+
+async function recordAttemptResult(config: Config, record: RunRecord, label: string, worker: Worker): Promise<void> {
+  const attempt = worker.attempt;
+  if (attempt?.result) await recordEvent(config, record.run_id,
+    { kind: "worker_attempt_finished", attempt_id: attempt.id, worker: label, ...attempt.result }, attempt.id);
+}
+
+async function finishAttempt(config: Config, record: RunRecord, label: string, worker: Worker, result: AttemptResult): Promise<void> {
+  if (worker.attempt) worker.attempt.result = result;
+  save(record, config); // Replay the same observation on resume if the coordinator write fails.
+  await recordAttemptResult(config, record, label, worker);
+}
+
 async function launch(record: RunRecord, config: Config, label: string, role: Worker["role"], cwd: string, credential: string | undefined, assignment: string, prompt: string): Promise<string> {
-  const prior = record.workers[label];
-  if (prior?.finished) return workerResult(prior.log);
-  if (prior && !prior.pid) {
-    throw new Error(`Worker ${label} has a persisted launch intent but no PID. Inspect ${prior.session_dir} and ${prior.log}; do not relaunch until its status is reconciled.`);
-  }
-  if (prior && !running(prior)) {
-    const text = existsSync(prior.log) ? readFileSync(prior.log, "utf8").trim() : "";
-    if (validFinal(text, role)) return text;
-    // The prior attempt never produced a final response (for example a provider limit).
-    // Preserve its log and launch a fresh attempt under the same stable worker label.
-    if (existsSync(prior.log)) {
-      const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-      renameSync(prior.log, `${prior.log}.attempt-${stamp}`);
+  let worker: Worker | undefined = record.workers[label];
+  if (worker) {
+    await recordAttemptResult(config, record, label, worker);
+    if (worker.finished) return workerResult(worker.log);
+    if (worker.attempt?.result || (worker.pid && !liveWorkers.has(worker.pid) && !running(worker))) {
+      const text = existsSync(worker.log) ? readFileSync(worker.log, "utf8").trim() : "";
+      const usable = validFinal(text, role);
+      if (worker.attempt && !worker.attempt.result) {
+        await finishAttempt(config, record, label, worker, { outcome: usable ? "succeeded" : "no_final_result" });
+      }
+      if (usable) return text;
+      // Preserve the failed attempt's log before retrying the stable worker label.
+      if (existsSync(worker.log)) {
+        const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+        renameSync(worker.log, `${worker.log}.attempt-${stamp}`);
+      }
+      delete record.workers[label];
+      save(record, config);
+      worker = undefined;
     }
-    delete record.workers[label];
-    save(record, config);
-    writeHeartbeats(config, record);
-    return launch(record, config, label, role, cwd, credential, assignment, prompt);
   }
-  if (!prior) {
+  if (!worker) {
     const root = join(config.state_dir, "omp-runs", record.run_id);
     const session_dir = join(root, `session-${label}`);
     mkdirSync(session_dir, { recursive: true, mode: 0o700 });
-    const log = join(root, `${label}.log`);
-    const worker: Worker = { role, cwd, credential_file: credential, log, session_dir, assignment, started_at: new Date().toISOString() };
+    worker = { role, cwd, credential_file: credential, log: join(root, `${label}.log`), session_dir, assignment,
+      started_at: new Date().toISOString(), attempt: { id: randomUUID(), model: record.worker_model } };
     record.workers[label] = worker;
     save(record, config); // The launch intent precedes both the log and the subprocess.
-    writeHeartbeats(config, record);
-    const fd = openSync(log, "wx", 0o600);
-    const args = ["-p", "--cwd", cwd, "--session-dir", session_dir, "--wait-async", "--max-time", "2h", "--no-extensions", "--no-skills"];
-    if (record.worker_model) args.push("--model", record.worker_model);
+  }
+  if (!worker.pid) {
+    // No log means a new intent never got as far as spawning. Once a log exists,
+    // a missing PID is ambiguous and cannot safely be retried automatically.
+    if (!worker.attempt || existsSync(worker.log)) {
+      throw new Error(`Worker ${label} has a persisted launch intent but no PID. Inspect ${worker.session_dir} and ${worker.log}; do not relaunch until its status is reconciled.`);
+    }
+    const { id, model } = worker.attempt;
+    await recordEvent(config, record.run_id, { kind: "worker_attempt_started",
+      attempt_id: id, worker: label, role: role.toLowerCase().replaceAll(" ", "_"), model }, id);
+    const args = ["-p", "--cwd", cwd, "--session-dir", worker.session_dir, "--wait-async", "--max-time", "2h", "--no-extensions", "--no-skills"];
+    if (model) args.push("--model", model);
     if (role !== "coder") args.push("--tools=read,grep,glob");
     args.push(prompt);
-    const child = spawn("omp", args, { cwd, env: ensureWorkerEnv(), detached: true, stdio: ["ignore", fd, fd] });
-    closeSync(fd);
-    const { promise, resolve: settle, reject } = Promise.withResolvers<number | null>();
-    child.once("error", reject);
-    child.once("close", settle);
-    if (!child.pid) throw new Error("OMP worker failed to spawn.");
-    liveWorkers.set(child.pid, promise);
-    worker.pid = child.pid;
+    const fd = openSync(worker.log, "wx", 0o600);
+    try {
+      const child = spawn("omp", args, { cwd, env: ensureWorkerEnv(), detached: true, stdio: ["ignore", fd, fd] });
+      const { promise, resolve } = Promise.withResolvers<WorkerExit>();
+      child.once("error", error => resolve({ error }));
+      child.once("close", code => resolve({ code }));
+      if (!child.pid) {
+        const exit = await promise;
+        throw "error" in exit ? exit.error : new Error("OMP worker failed to spawn.");
+      }
+      liveWorkers.set(child.pid, promise);
+      worker.pid = child.pid;
+      child.unref();
+    } catch (error) {
+      await finishAttempt(config, record, label, worker, { outcome: "launch_failure" });
+      throw error;
+    } finally {
+      closeSync(fd);
+    }
     save(record, config);
     writeHeartbeats(config, record);
-    child.unref();
   }
-  const worker = record.workers[label];
-  const live = worker.pid && liveWorkers.get(worker.pid);
+  const pid = worker.pid;
+  const live = liveWorkers.get(pid);
   if (live) {
-    const code = await live;
-    liveWorkers.delete(worker.pid!);
-    if (code !== 0) throw new Error(`OMP ${label} exited ${code}${failureHint(worker.log)}; inspect private log ${worker.log} before resuming.`);
+    const exit = await live;
+    liveWorkers.delete(pid);
+    if ("error" in exit) {
+      await finishAttempt(config, record, label, worker, { outcome: "launch_failure" });
+      throw exit.error;
+    }
+    if (exit.code !== 0) {
+      const hint = failureHint(worker.log);
+      await finishAttempt(config, record, label, worker, { outcome: "exit_failure", exit_code: exit.code ?? undefined,
+        failure_code: hint.includes("code=usage_limit_reached") ? "usage_limit_reached" : undefined });
+      throw new Error(`OMP ${label} exited ${exit.code}${hint}; inspect private log ${worker.log} before resuming.`);
+    }
   } else {
-    while (running(worker)) await new Promise(done => setTimeout(done, 3000));
+    while (running(worker)) await delay(3000);
   }
-  const result = workerResult(worker.log);
-  worker.finished = role === "coder" || validFinal(result, role); save(record, config);
+  let result: string;
+  try { result = workerResult(worker.log); }
+  catch (error) {
+    await finishAttempt(config, record, label, worker, { outcome: live ? "invalid_output" : "no_final_result" });
+    throw error;
+  }
+  worker.finished = role === "coder" || validFinal(result, role);
+  await finishAttempt(config, record, label, worker, { outcome: worker.finished ? "succeeded" : "invalid_output" });
   writeHeartbeats(config, record);
   return result;
 }
@@ -1410,7 +1478,6 @@ async function resumableRuns(config: Config, repo: string): Promise<Array<{ run:
 async function resumeRecord(config: Config, record: RunRecord, ui: UIOps, workerModel?: string): Promise<RunRecord> {
   if (record.phase === "done") { writeCompletion(config, record); return record; }
   record.error = undefined;
-  if (workerModel) record.worker_model = workerModel;
   save(record, config);
   try { unlinkSync(completionPath(config, record.run_id)); } catch { /* No stale completion report. */ }
   await provisionRun(config, record, ui);
@@ -1419,6 +1486,14 @@ async function resumeRecord(config: Config, record: RunRecord, ui: UIOps, worker
       throw new Error(`Validation not retried; inspect ${record.validation_log}.`);
     }
     record.validation_log = undefined; save(record, config);
+  }
+  await recordEvent(config, record.run_id, {
+    kind: "run_resumed", phase: record.phase, round: record.round,
+    previous_model: record.worker_model, model: workerModel ?? record.worker_model,
+  }, randomUUID());
+  if (workerModel) {
+    record.worker_model = workerModel;
+    save(record, config);
   }
   ui.notify(`Resuming Tesselate run ${record.run_id} on ${record.branch}; no new run will be created.`, "info");
   return supervise(config, record, ui);
@@ -1492,7 +1567,24 @@ export default function tesselateExtension(pi: ExtensionAPI): void {
   if (process.env.TESSELATE_WORKER === "1") return;
   const configPath = join(dirname(new URL(import.meta.url).pathname), "tesselate.config.json");
   let pending: { cwd: string; source_cwd: string; settings: RepoSettings; workflowName?: string } | undefined;
+  const completionMessages = new Map<string, { config: Config; runId: string; id: string }>();
   function configured(): Config { return configAt(configPath); }
+  pi.on("message_end", async ({ message }, ctx) => {
+    const sessionId = ctx.sessionManager?.getSessionId();
+    if (message.role === "toolResult" && message.toolName === "tesselate_feature_start" && !message.isError) {
+      const runId = (message.details as { completedRunId?: string } | undefined)?.completedRunId;
+      if (runId) await recordNotification(configured(), runId, "tool_result", message.toolCallId, ctx.ui, sessionId);
+    } else if (message.role === "user") {
+      const content = message.content;
+      const text = typeof content === "string" ? content :
+        content.length === 1 && content[0].type === "text" ? content[0].text : undefined;
+      if (!text) return;
+      const delivery = completionMessages.get(text);
+      if (!delivery) return;
+      completionMessages.delete(text);
+      await recordNotification(delivery.config, delivery.runId, "agent_message", delivery.id, ctx.ui, sessionId);
+    }
+  });
   async function kickoff(goal: string, cwd: string, ui: UIOps, workflowName?: string): Promise<void> {
     pending = undefined;
     try {
@@ -1556,7 +1648,12 @@ export default function tesselateExtension(pi: ExtensionAPI): void {
         const result = await resumeFeature(config, ctx.cwd, ctx.ui, id || undefined, selectedModel(ctx));
         const summary = readCompletion(config, result.run_id)?.summary ?? completionSummary(result);
         ctx.ui.notify(summary, "info");
-        pi.sendUserMessage(`${summary}\nReport this result to the user. Do not start another run or modify files unless the user asks.`, { attribution: "agent" });
+        const message = `${summary}\nReport this result to the user. Do not start another run or modify files unless the user asks.`;
+        if (result.phase === "done") completionMessages.set(message, { config, runId: result.run_id, id: randomUUID() });
+        void Promise.resolve(pi.sendUserMessage(message, { attribution: "agent" })).catch(() => {
+          completionMessages.delete(message);
+          ctx.ui.notify(`Tesselate run ${result.run_id}: the driving OMP session did not accept the result message.`, "warning");
+        });
       } catch (error) { ctx.ui.notify(`Tesselate paused: ${cleanError(error)}`, "error"); }
       return;
     }
@@ -1599,7 +1696,10 @@ export default function tesselateExtension(pi: ExtensionAPI): void {
       pending = undefined;
       try {
         const result = await startFeature(configured(), request.cwd, { goal: params.goal, acceptance_criteria: params.acceptance_criteria, constraints: params.constraints, validation_command: validation, base_branch: "" }, ctx.ui, selectedModel(ctx), workflow);
-        return { content: [{ type: "text", text: `Tesselate run ${result.run_id}: ${result.phase}. Integration branch ${result.branch}, ${result.integration_dir}. No push or main merge.` }] };
+        return {
+          content: [{ type: "text", text: `Tesselate run ${result.run_id}: ${result.phase}. Integration branch ${result.branch}, ${result.integration_dir}. No push or main merge.` }],
+          details: result.phase === "done" ? { completedRunId: result.run_id } : undefined,
+        };
       } catch (error) {
         return { content: [{ type: "text", text: `Tesselate paused: ${cleanError(error)}. Use /feature resume after resolving; no push or main merge was attempted.` }], isError: true };
       }

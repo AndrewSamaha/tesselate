@@ -104,6 +104,15 @@ else if (command === 'tasks.repair') {
 }
 else if (command === 'tasks.disposition') {db.task.status='completed';reply({value:db.task});}
 else if (command === 'runs.complete') {db.run.status='completed';reply({value:db.run});}
+else if (command === 'omp.events.record') {
+  if (cred !== path.join(stateDir,'supervisor.token') || params.run_id !== db.run.id) throw Error('wrong OMP timeline scope');
+  db.timeline??=[];
+  const key=opt('--idempotency-key');
+  const prior=db.timeline.find(record=>record.key===key);
+  if(prior && JSON.stringify(prior.event)!==JSON.stringify(params.event)) throw Error('timeline replay changed payload');
+  if(!prior) db.timeline.push({key,event:params.event});
+  reply({value:null});
+}
 else throw Error('unsupported fixture operation '+command+' '+a.join(' '));
 `;
 const fakeOmp = String.raw`#!/usr/bin/env node
@@ -185,6 +194,9 @@ function git(repo: string, ...args: string[]): string {
   return execFileSync("git", ["-C", repo, ...args], { encoding: "utf8" }).trim();
 }
 
+type OmpMessageEnd = (event: { message: { role: "user" | "toolResult"; content: unknown; toolName?: string;
+  toolCallId?: string; isError?: boolean; details?: unknown } }, ctx: unknown) => Promise<void>;
+
 export async function runSmoke(trackIgnored = false, trailingReview = false, retryReview = false, workerModel = "", repairReview = false, blockUX = false): Promise<void> {
   const root = mkdtempSync(join(tmpdir(), "tesselate-omp-fixture-"));
   const previousPath = process.env.PATH;
@@ -231,7 +243,8 @@ export async function runSmoke(trackIgnored = false, trailingReview = false, ret
     }), { mode: 0o600 });
     const extension = (await import(pathToFileURL(join(ext, "tesselate.ts")).href)).default;
     let inputHandler: (event: { text: string; source: string }, ctx: unknown) => Promise<unknown> = async () => undefined;
-    let tool: { execute: (...args: unknown[]) => Promise<{ content: Array<{ text: string }> }> } | undefined;
+    let messageEnd!: OmpMessageEnd;
+    let tool: { execute: (...args: unknown[]) => Promise<{ content: Array<{ text: string }>; details?: unknown }> } | undefined;
     const messages: string[] = [];
     const notifications: string[] = [];
     const repairPrompts: string[] = [];
@@ -257,7 +270,10 @@ export async function runSmoke(trackIgnored = false, trailingReview = false, ret
         }
         throw new Error(`Unexpected resume selection: ${question}`);
       }, notify: (message: string) => { notifications.push(message); } };
-    const pi = { zod: { object: () => ({}), string: () => ({ optional: () => ({}) }) }, on: (event: string, handler: typeof inputHandler) => { if (event === "input") inputHandler = handler; },
+    const pi = { zod: { object: () => ({}), string: () => ({ optional: () => ({}) }) }, on: (event: string, handler: typeof inputHandler | OmpMessageEnd) => {
+      if (event === "input") inputHandler = handler as typeof inputHandler;
+      if (event === "message_end") messageEnd = handler as OmpMessageEnd;
+    },
       registerCommand: (name: string, definition: { handler: NonNullable<typeof featureCommand> }) => { if (name === "feature") featureCommand = definition.handler; },
       registerTool: (definition: typeof tool) => { tool = definition; },
       sendUserMessage: (message: string) => { messages.push(message); } };
@@ -370,7 +386,9 @@ export async function runSmoke(trackIgnored = false, trailingReview = false, ret
       notifications.length = 0;
       delete process.env.FIXTURE_RETRY_REVIEW;
     }
-    await featureCommand!("resume", { cwd: workspace_root, ui: resumeUi });
+    const modelBeforeRetry = readLaunches().length;
+    const retryModel = { provider: "fixture", id: "after-resume" };
+    await featureCommand!("resume", { cwd: workspace_root, ui: resumeUi, ...(retryReview ? { model: retryModel } : {}) });
     assert.ok(notifications.some(message => message.includes(`Resuming Tesselate run ${interruptedRun}`)));
     assert.ok(notifications.some(message => message.includes(`Tesselate run ${interruptedRun}: done`)));
     assert.equal(JSON.parse(readFileSync(join(state_dir, "fixture-db.json"), "utf8")).runCreateCount, 1);
@@ -381,6 +399,29 @@ export async function runSmoke(trackIgnored = false, trailingReview = false, ret
     assert.equal(completion.phase, "done");
     assert.match(completion.summary, /Tesselate run .*: done/);
     assert.ok(messages.some(message => message.includes(`Tesselate run ${interruptedRun}: done`)));
+    const readTimeline = () => JSON.parse(readFileSync(join(state_dir, "fixture-db.json"), "utf8")).timeline.map(
+      (entry: { event: Record<string, string | number> }) => entry.event);
+    const beforeDelivery = readTimeline();
+    assert.ok(!beforeDelivery.some((entry: { kind: string }) => entry.kind === "notification_delivered"));
+    if (retryReview) {
+      const retry = beforeDelivery.filter((entry: { worker?: string }) => entry.worker === "reviewer-0-round-1");
+      assert.deepEqual(retry.map((entry: { kind: string }) => entry.kind),
+        ["worker_attempt_started", "worker_attempt_finished", "worker_attempt_started", "worker_attempt_finished"]);
+      assert.equal(retry[0].attempt_id, retry[1].attempt_id);
+      assert.equal(retry[2].attempt_id, retry[3].attempt_id);
+      assert.notEqual(retry[0].attempt_id, retry[2].attempt_id);
+      assert.equal(retry[1].failure_code, "usage_limit_reached");
+      assert.equal(retry[1].exit_code, 1);
+      assert.equal(retry[2].model, "fixture/after-resume");
+      assert.equal(retry[3].outcome, "succeeded");
+      const resumed = beforeDelivery.slice(beforeDelivery.indexOf(retry[1]) + 1, beforeDelivery.indexOf(retry[2]));
+      assert.deepEqual(resumed, [{ kind: "run_resumed", phase: "review", round: 1,
+        ...(workerModel ? { previous_model: workerModel } : {}), model: "fixture/after-resume" }]);
+    }
+    const observer = { cwd: repo, ui, sessionManager: { getSessionId: () => "fixture-driving-session" } };
+    await messageEnd({ message: { role: "user", content: [{ type: "text", text: messages.at(-1) }] } }, observer);
+    assert.deepEqual(readTimeline().at(-1), { kind: "notification_delivered", channel: "agent_message",
+      omp_session_id: "fixture-driving-session" });
     notifications.length = 0;
     await featureCommand!("status", { cwd: workspace_root, ui: resumeUi });
     assert.ok(notifications.some(message => message.includes(`Tesselate run ${interruptedRun}: done`)));
@@ -400,7 +441,9 @@ export async function runSmoke(trackIgnored = false, trailingReview = false, ret
     assert.equal(revisionCoder.cwd, record.workspace_dir);
     assert.ok(launches.filter(item => item.role === "reviewer").every(item => item.readOnly && item.cwd !== record.workspace_dir && item.workerEnv === "1"));
     assert.ok(launches.every(item => !existsSync(join(item.cwd, ".env")) && !existsSync(join(item.cwd, "packages/content/.revisions"))));
-    if (workerModel) assert.ok(launches.every(item => item.model === workerModel));
+    if (workerModel) assert.ok(launches.slice(0, modelBeforeRetry).every(item => item.model === workerModel));
+    if (retryReview) assert.ok(launches.slice(modelBeforeRetry).every(item => item.model === "fixture/after-resume"));
+    else if (workerModel) assert.ok(launches.slice(modelBeforeRetry).every(item => item.model === workerModel));
     assert.ok(existsSync(join(record.workspace_dir, ".workmux-local", "completion.md")));
     const heartbeatNames = readdirSync(heartbeatDir).filter(name => name.endsWith(".json")).sort();
     assert.deepEqual(heartbeatNames, ["coder-round-1.json", "coder-round-2.json", "design-reconciler-final.json", "design-reconciler.json", "planner-a.json", "planner-b.json", "reviewer-0-round-1.json", "reviewer-0-round-2.json", "reviewer-1-round-1.json", "reviewer-1-round-2.json", "supervisor.json", "ux-designer-revision.json", "ux-designer.json"]);
@@ -428,9 +471,13 @@ export async function runSmoke(trackIgnored = false, trailingReview = false, ret
     assert.equal(database.task.submitted_commits[0].commit_id, record.last_head);
     assert.equal(new Set(database.reviews.map((review: { reviewer: string }) => review.reviewer)).size, 2);
     // Reopening a completed run reads the durable handoff; no worker starts again.
-    const resumed = await startFeature({ binary, state_dir, workspace_root, supervisor_credential_file }, repo,
-      { goal: "Write feature.txt", acceptance_criteria: "feature.txt is committed", constraints: "", validation_command: "git diff --exit-code HEAD -- README.md", base_branch: "" }, ui);
-    assert.equal(resumed.run_id, record.run_id);
+    await featureCommand!("Write feature.txt", { cwd: repo, ui });
+    const reopened = await tool!.execute("reopen-call", proposal, undefined, undefined, { cwd: repo, ui });
+    assert.match(reopened.content[0].text, new RegExp(`${record.run_id}: done`));
+    await messageEnd({ message: { role: "toolResult", toolName: "tesselate_feature_start", toolCallId: "reopen-call",
+      isError: false, content: reopened.content, details: reopened.details } }, observer);
+    assert.deepEqual(readTimeline().slice(beforeDelivery.length).map((entry: { channel?: string }) => entry.channel),
+      ["agent_message", "tool_result"]); // Reopening a completed run is not another resume.
     assert.deepEqual(readLaunches(), launches);
     assert.equal(database.runCreateCount, 1);
   } finally {
@@ -510,15 +557,19 @@ command = "${rejectA ? "git status --short" : validation}"
     };
     type Feature = (args: string, ctx: { cwd: string; ui: typeof ui }) => Promise<void>;
     type Start = (...args: unknown[]) => Promise<{ content: Array<{ text: string }> }>;
+    const delivered: string[] = [];
+    let messageEnd!: OmpMessageEnd;
     const register = () => {
       let feature!: Feature, start!: Start;
       ext({
         zod: { object: () => ({}), string: () => ({ optional: () => ({}) }) },
-        on: () => {}, registerCommand: (_: string, definition: { handler: Feature }) => { feature = definition.handler; },
+        on: (event: string, handler: OmpMessageEnd) => { if (event === "message_end") messageEnd = handler; },
+        registerCommand: (_: string, definition: { handler: Feature }) => { feature = definition.handler; },
         registerTool: (definition: { execute: Start }) => { start = definition.execute; },
         sendUserMessage: (message: string) => {
           if (/selected workflow "experiment"/.test(message)) return;
           assert.match(message, /Tesselate run .*: (done|paused)/);
+          delivered.push(message);
         },
       } as unknown as Parameters<typeof ext>[0]);
       return { feature, start };
@@ -560,6 +611,8 @@ command = "${rejectA ? "git status --short" : validation}"
       ...ui, input: async () => { throw new Error("Resume asked for a new spec"); },
       select: async (_question, choices) => choices.find(choice => choice.startsWith("Integrate candidate B"))!,
     } });
+    await messageEnd({ message: { role: "user", content: delivered[0] } },
+      { cwd: repo, ui, sessionManager: { getSessionId: () => "comparison-driving-session" } });
     const after = JSON.parse(readFileSync(handoff, "utf8"));
     assert.equal(after.phase, "done");
     assert.equal(git(after.integration_dir, "rev-parse", "HEAD"), before.comparison.lanes[1].last_head);
@@ -571,6 +624,24 @@ command = "${rejectA ? "git status --short" : validation}"
     assert.equal(completed.status, "completed");
     assert.equal(completed.comparison.winner.task_id, before.comparison.lanes[1].task_id);
     assert.deepEqual(completed.reviewed_commits.map((commit: { commit_id: string }) => commit.commit_id), [before.comparison.lanes[1].last_head]);
+    const timeline = JSON.parse(cli("--credential-file", credential_file, "call", "tesselate.v1.timeline.read",
+      "--params", JSON.stringify({ scope: { run_id: runId }, page: { limit: 500, after: null } }))).items;
+    const starts = timeline.filter((event: { event_type: string }) => event.event_type === "worker.attempt_started");
+    const finishes = timeline.filter((event: { event_type: string }) => event.event_type === "worker.attempt_finished");
+    assert.equal(starts.length, workers.length);
+    assert.equal(finishes.length, workers.length);
+    for (const start of starts) {
+      const finish = finishes.find((event: { payload: { attempt_id: string } }) => event.payload.attempt_id === start.payload.attempt_id);
+      assert.equal(finish.payload.worker, start.payload.worker);
+      assert.ok(finish.sequence > start.sequence);
+    }
+    const resumed = timeline.find((event: { event_type: string }) => event.event_type === "run.resumed");
+    const completedEvent = timeline.find((event: { event_type: string }) => event.event_type === "run.completed");
+    const delivery = timeline.find((event: { event_type: string }) => event.event_type === "notification.delivered");
+    assert.equal(resumed.payload.phase, "comparing");
+    assert.deepEqual(delivery.payload, { kind: "completion", target: "driving_omp", channel: "agent_message",
+      omp_session_id: "comparison-driving-session" });
+    assert.ok(resumed.sequence < completedEvent.sequence && completedEvent.sequence < delivery.sequence);
     const status = cli("status");
     assert.match(status, /complete · selected B/);
     if (!rejectA) assert.match(status, /comparison\s+compare candidates A and B/);

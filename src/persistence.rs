@@ -271,7 +271,42 @@ impl Database {
         Q: Serialize,
         R: Serialize + DeserializeOwned,
     {
-        validate_mutation(&input)?;
+        if input.changes.is_empty() {
+            return Err(PersistenceError::Invalid(
+                "mutation must contain at least one state change".into(),
+            ));
+        }
+        self.commit(input)
+    }
+
+    /// Append an authenticated observation with the same idempotency guarantees
+    /// as a mutation, without changing entity state.
+    pub(crate) fn record_observation<Q: Serialize>(
+        &self,
+        context: &SessionContext,
+        operation: &str,
+        idempotency_key: &IdempotencyKey,
+        request: &Q,
+        event: NewEvent,
+    ) -> Result<Mutation<()>, PersistenceError> {
+        self.commit(MutationInput {
+            context,
+            operation,
+            idempotency_key,
+            request,
+            preconditions: vec![],
+            result: &(),
+            changes: vec![],
+            event,
+        })
+    }
+
+    fn commit<Q, R>(&self, input: MutationInput<'_, Q, R>) -> Result<Mutation<R>, PersistenceError>
+    where
+        Q: Serialize,
+        R: Serialize + DeserializeOwned,
+    {
+        validate_input(&input)?;
         let request_json = canonical_json(input.request)?;
         let result_json = serde_json::to_string(input.result)?;
         let session_id = input.context.session_id().0.to_string();
@@ -485,7 +520,7 @@ impl Database {
     }
 }
 
-fn validate_mutation<Q, R>(input: &MutationInput<'_, Q, R>) -> Result<(), PersistenceError> {
+fn validate_input<Q, R>(input: &MutationInput<'_, Q, R>) -> Result<(), PersistenceError> {
     if input.operation.is_empty() || input.idempotency_key.0.is_empty() {
         return Err(PersistenceError::Invalid(
             "operation and idempotency key are required".into(),
@@ -496,11 +531,6 @@ fn validate_mutation<Q, R>(input: &MutationInput<'_, Q, R>) -> Result<(), Persis
     {
         return Err(PersistenceError::Invalid(
             "event actor must match the authenticated context".into(),
-        ));
-    }
-    if input.changes.is_empty() {
-        return Err(PersistenceError::Invalid(
-            "mutation must contain at least one state change".into(),
         ));
     }
     let mut seen = std::collections::HashSet::new();

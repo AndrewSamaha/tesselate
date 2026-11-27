@@ -206,6 +206,33 @@ notification. Use `/feature status` for the latest run in the current repository
 or `/feature status <full-run-UUID>` for a specific run. Status works for active,
 paused, stopped, and completed runs.
 
+### Read the OMP run timeline
+
+The coordinator records these bridge events alongside task and review events:
+
+- `worker.attempt_started` records the launch attempt, worker label, role, and
+  requested model. `worker.attempt_finished` records the outcome and any known
+  exit code or recognized failure code. Join them by `payload.attempt_id`;
+  retries of the same worker get a new attempt ID.
+- `run.resumed` records the phase, round, and previous and effective worker
+  models when OMP continues an unfinished run. Reading a completed run is not a
+  resume.
+- `notification.delivered` records a completion observed in the driving OMP
+  session as a `tool_result` or `agent_message`, with its OMP session ID. It
+  does not assert that the assistant replied or the user read it.
+
+Read the events in `sequence` order:
+
+```sh
+tesselate --state-dir "$STATE_DIR" --credential-file "$CREDENTIAL_FILE" \
+  call tesselate.v1.timeline.read \
+  --params "{\"scope\":{\"run_id\":\"$RUN_ID\"},\"page\":{\"limit\":100,\"after\":null}}"
+```
+
+Use `next_cursor` as `page.after` to continue until a page is empty. Older events
+are not backfilled. An interrupted attempt may lack a finish until OMP observes
+its outcome on resume.
+
 ### Compare two implementations
 
 In OMP, use `/feature --workflow compare <goal>`, or explicitly ask for two
