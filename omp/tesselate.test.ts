@@ -242,7 +242,7 @@ export async function runSmoke(trackIgnored = false, trailingReview = false, ret
       version: 1, repository: canonicalRepo, integration: { copy: [".env", ".env.local", "packages/content/.revisions"] }
     }), { mode: 0o600 });
     const extension = (await import(pathToFileURL(join(ext, "tesselate.ts")).href)).default;
-    let inputHandler: (event: { text: string; source: string }, ctx: unknown) => Promise<unknown> = async () => undefined;
+    let inputHandler: ((event: { text: string; source: string }, ctx: unknown) => Promise<unknown>) | undefined;
     let messageEnd!: OmpMessageEnd;
     let tool: { execute: (...args: unknown[]) => Promise<{ content: Array<{ text: string }>; details?: unknown }> } | undefined;
     const messages: string[] = [];
@@ -279,12 +279,12 @@ export async function runSmoke(trackIgnored = false, trailingReview = false, ret
       sendUserMessage: (message: string) => { messages.push(message); } };
     // The test intentionally imports the installed extension by its runtime-selected user path.
     extension(pi as unknown as Parameters<typeof extension>[0]);
-    assert.equal(await inputHandler({ source: "interactive", text: "fix the bug" }, { cwd: workspace_root, ui }), undefined);
-    assert.equal(messages.length, 0);
-    const result = await inputHandler({ source: "interactive", text: "Build a feature for this repo that writes feature.txt" }, { cwd: workspace_root, ui });
-    assert.equal((result as { handled?: boolean } | undefined)?.handled, true);
-    assert.match(messages[0], /feature\.txt is committed/);
-    assert.match(messages[0], /no shared-service tests/);
+    const normalChatUi = { ...ui, input: async () => { throw new Error("Ordinary chat must not open intake forms"); },
+      select: async () => { throw new Error("Ordinary chat must not prompt for a repository"); } };
+    for (const text of ["What do you think of this feature?", "Build a feature for this repo that writes feature.txt"]) {
+      assert.equal(await inputHandler?.({ source: "interactive", text }, { cwd: workspace_root, ui: normalChatUi }), undefined);
+    }
+    assert.deepEqual(messages, []);
     assert.ok(tool);
     assert.ok(featureCommand);
     const proposal = { goal: blockUX ? "Blocked UI fixture" : "Write feature.txt", acceptance_criteria: "feature.txt is committed", constraints: "no shared-service tests", validation_command: "git diff --exit-code HEAD -- README.md" };
@@ -301,6 +301,20 @@ export async function runSmoke(trackIgnored = false, trailingReview = false, ret
       confirm: async () => { throw new Error("Rejected validation must not start a run"); },
     } });
     assert.match(unsafe.content[0].text, /no shell chaining, push, merge, or shared services.*No run started/);
+    const denied = await tool!.execute("denied", proposal, undefined, undefined, { cwd: workspace_root, ui: {
+      ...ui, input: async () => { throw new Error("The agreed spec must not prompt for intake"); },
+      confirm: async (question: string) => {
+        if (!question.startsWith("Start Tesselate feature")) return true;
+        assert.ok(question.includes(`Repository: ${canonicalRepo}\nAcceptance criteria: ${proposal.acceptance_criteria}\nConstraints: ${proposal.constraints}`), question);
+        assert.match(question, /on main@[a-f0-9]+/);
+        assert.match(question, /UX designer.*One coder/s);
+        assert.match(question, /Validation in the integration worktree: git diff --exit-code HEAD -- README\.md/);
+        return false;
+      }
+    } });
+    assert.match(denied.content[0].text, /Feature start cancelled/);
+    assert.equal(JSON.parse(readFileSync(join(state_dir, "fixture-db.json"), "utf8")).run, undefined);
+    assert.ok(!existsSync(join(state_dir, "worker-launches.jsonl")));
     const confirmations: string[] = [];
     process.env.FIXTURE_FAIL_AFTER_RUN_CREATE = "1";
     const modelContext = workerModel ? { model: { provider: workerModel.split("/")[0], id: workerModel.split("/").slice(1).join("/") } } : {};
@@ -575,9 +589,10 @@ command = "${rejectA ? "git status --short" : validation}"
       return { feature, start };
     };
     const session = register();
-    await session.feature("--workflow experiment Write feature.txt", { cwd: repo, ui });
+    if (!rejectA) await session.feature("--workflow experiment Write feature.txt", { cwd: repo, ui });
     const result = await session.start("call", { goal: "Write feature.txt", acceptance_criteria: "feature.txt is committed",
-      constraints: "", validation_command: "false", ...(rejectA ? { validation_override: validation } : {}) },
+      constraints: "", validation_command: "false", workflow: rejectA ? "experiment" : "standard",
+      ...(rejectA ? { validation_override: validation } : {}) },
       undefined, undefined, { cwd: repo, ui });
     assert.match(result.content[0].text, /run ([0-9a-f-]+): comparing/);
     const runId = result.content[0].text.match(/run ([0-9a-f-]+): comparing/)![1];

@@ -1,11 +1,11 @@
 ---
 name: tesselate-feature
-description: Start or resume a reviewed local feature using Tesselate, separate OMP processes, and an integration worktree.
+description: Delegate an agreed feature to Tesselate from the driving OMP conversation, or start or resume a reviewed local run with /feature.
 ---
 
 # Tesselate feature
 
-Open an interactive OMP session from `~/Development` (select a local repo) or inside a repository beneath that workspace root. Request a feature naturally (for example, “Build a feature for this repo that …”), or use `/feature <goal>`. The extension collects acceptance criteria and constraints, then asks OMP to draft a specification. Clarify ambiguities before calling `tesselate_feature_start`. Confirm scope, the local base branch, and an explicit validation command for the worktrees named in the confirmation. Do not code in the initiating session.
+Discuss the feature normally in OMP. Call `tesselate_feature_start` only when the user asks to delegate implementation to Tesselate and the goal, observable acceptance criteria, and constraints are clear. Ask about material ambiguities in chat, then pass the agreed spec directly; no `/feature` command is required. Use the current repository beneath `~/Development`, or let the tool ask which repository to use from the workspace root. The tool confirms the repository, scope, local base branch, workflow, and exact validation command before launching workers. `/feature <goal>` still opens the guided intake. Do not code in the initiating session.
 
 Use `[validation].command` from the repository's `.tesselate.toml` when configured. Set `validation_override` only when the user explicitly requests a different command for this run. Otherwise, if no repo default exists, inspect the repository's build instructions and use a clear, safe build command for the affected target as `validation_command`. When the target or command is ambiguous, omit it so the extension can ask. Never start a run without the user's confirmation of the exact command.
 

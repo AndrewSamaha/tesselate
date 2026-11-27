@@ -1556,7 +1556,8 @@ export async function startFeature(config: Config, cwd: string, spec: Spec, ui: 
   const agents = workflow.candidates === 2
     ? `Two coders implement the agreed plan independently, with ${workflow.reviewers_per_candidate} independent reviewers per candidate and one fresh comparison reviewer. Human approval is required before integrating only the winner.`
     : `One coder implements the agreed plan, with ${workflow.reviewers_per_candidate} independent reviewers.`;
-  if (!await ui.confirm(`Start Tesselate feature "${spec.goal}" on ${base.branch}@${base.base.slice(0, 12)}?\n${planning}\n${agents}\nValidation in ${validationLocation(workflow)}: ${spec.validation_command}\nNo push or main merge will occur.`)) throw new Error("Feature start cancelled.");
+  const scope = `Repository: ${repo}\nAcceptance criteria: ${spec.acceptance_criteria}\nConstraints: ${spec.constraints.trim() || "None specified"}`;
+  if (!await ui.confirm(`Start Tesselate feature "${spec.goal}" on ${base.branch}@${base.base.slice(0, 12)}?\n${scope}\n${planning}\n${agents}\nValidation in ${validationLocation(workflow)}: ${spec.validation_command}\nNo push or main merge will occur.`)) throw new Error("Feature start cancelled.");
   if (await git(repo, "rev-parse", "--verify", `${base.branch}^{commit}`) !== base.base) throw new Error("Selected base moved; restart feature setup.");
   const record = await createRun(config, repo, spec, workerModel, workflow);
   await provisionRun(config, record, ui, approved);
@@ -1566,7 +1567,7 @@ export async function startFeature(config: Config, cwd: string, spec: Spec, ui: 
 export default function tesselateExtension(pi: ExtensionAPI): void {
   if (process.env.TESSELATE_WORKER === "1") return;
   const configPath = join(dirname(new URL(import.meta.url).pathname), "tesselate.config.json");
-  let pending: { cwd: string; source_cwd: string; settings: RepoSettings; workflowName?: string } | undefined;
+  let slashRequest: { cwd: string; sourceCwd: string; workflowName?: string } | undefined;
   const completionMessages = new Map<string, { config: Config; runId: string; id: string }>();
   function configured(): Config { return configAt(configPath); }
   pi.on("message_end", async ({ message }, ctx) => {
@@ -1586,9 +1587,9 @@ export default function tesselateExtension(pi: ExtensionAPI): void {
     }
   });
   async function kickoff(goal: string, cwd: string, ui: UIOps, workflowName?: string): Promise<void> {
-    pending = undefined;
+    slashRequest = undefined;
     try {
-      const source_cwd = cwd;
+      const sourceCwd = cwd;
       cwd = await chooseRepo(cwd, configured(), ui);
       const settings = readRepoSettings(cwd);
       if (workflowName) resolveWorkflow(settings, workflowName);
@@ -1596,7 +1597,7 @@ export default function tesselateExtension(pi: ExtensionAPI): void {
       if (!acceptance?.trim()) return ui.notify("Feature cancelled: acceptance criteria are required.", "warning");
       const constraints = await ui.input("Constraints / prohibited actions (blank if none)");
       if (constraints === undefined) return;
-      pending = { cwd, source_cwd, settings, workflowName };
+      slashRequest = { cwd, sourceCwd, workflowName };
       const workflowInstruction = workflowName
         ? `The user selected workflow "${workflowName}" via /feature; omit the workflow parameter.`
         : `If the user explicitly requests two independent implementations, propose workflow: "compare". Otherwise omit workflow to use the repository default.`;
@@ -1606,13 +1607,6 @@ export default function tesselateExtension(pi: ExtensionAPI): void {
       pi.sendUserMessage(`Draft a clear, concise feature specification from this user request. Goal: ${goal}\nAcceptance criteria: ${acceptance}\nConstraints: ${constraints || "None specified"}\nAsk clarifying questions if needed. Call tesselate_feature_start with the agreed goal, acceptance_criteria, and constraints. ${workflowInstruction} ${validationInstruction} Validation never runs in agent worktrees. Do not start coding in this main session; the tool will confirm the branch, workflow, and exact validation command before launching separate OMP sessions.`, { attribution: "agent" });
     } catch (error) { ui.notify(cleanError(error), "error"); }
   }
-  pi.on("input", async (event, ctx) => {
-    if (event.source === "extension" || !event.text || event.text.startsWith("/") || event.text.startsWith("!") || event.text.startsWith("$")) return;
-    const independentImplementations = /^\s*(?:please\s+)?(?:implement|build|add|create|fix|refactor|compare|develop|try|give me|i want)\b[\s\S]*\b(?:two|2)\s+independent\s+implementations\b/i;
-    if (!/\bfeature\b/i.test(event.text) && !/^\s*(?:please\s+)?(?:implement|build|add|create|fix|refactor)\b[\s\S]*\b(?:in|for)\s+(?:(?:this|the|a)\s+)?(?:repo|repository|project)\b/i.test(event.text) && !independentImplementations.test(event.text)) return;
-    await kickoff(event.text.trim(), ctx.cwd, ctx.ui);
-    return { handled: true };
-  });
   pi.registerCommand("feature", { description: "Start a Tesselate feature (optionally --workflow <preset>) or resume a run", handler: async (args, ctx) => {
     const request = args.trim();
     if (request === "status" || request.startsWith("status ")) {
@@ -1670,21 +1664,27 @@ export default function tesselateExtension(pi: ExtensionAPI): void {
     const requestedGoal = goal || await ctx.ui.input("What feature should Tesselate build?");
     if (requestedGoal?.trim()) await kickoff(requestedGoal.trim(), ctx.cwd, ctx.ui, workflowName);
   } });
-  pi.registerTool({ name: "tesselate_feature_start", label: "Start Tesselate feature", description: "After agreeing on a specification, launch role-separated OMP processes in Tesselate workspaces. Requires a user-initiated /feature or feature input.",
+  pi.registerTool({
+    name: "tesselate_feature_start",
+    label: "Start Tesselate feature",
+    description: "Use when the user asks to delegate implementation to Tesselate, not during discussion or brainstorming. Clarify the goal, observable acceptance criteria, and constraints in conversation before calling. The tool asks the user to confirm the repository, scope, branch, workflow, and validation command before launching workers. Do not implement the delegated work in this session. Use the repository workflow and validation defaults unless the user requests otherwise; if validation has no default, propose a known safe repository build command or omit it to let the tool ask.",
     parameters: pi.zod.object({
       goal: pi.zod.string(), acceptance_criteria: pi.zod.string(), constraints: pi.zod.string(),
       validation_command: pi.zod.string().optional(), validation_override: pi.zod.string().optional(), workflow: pi.zod.string().optional(),
     }),
     async execute(_id, params, _signal, _update, ctx) {
-      if (!pending || pending.source_cwd !== ctx.cwd) return { content: [{ type: "text", text: "Use /feature or submit a feature request first; no workflow started." }] };
-      const request = pending;
+      const request = slashRequest?.sourceCwd === ctx.cwd ? slashRequest : undefined;
       if (!params.goal.trim() || !params.acceptance_criteria.trim()) return { content: [{ type: "text", text: "Goal and acceptance criteria are required." }] };
-      let workflow: Workflow;
-      try { workflow = resolveWorkflow(request.settings, request.workflowName ?? params.workflow); }
-      catch (error) {
+      let config: Config, repo: string, settings: RepoSettings, workflow: Workflow;
+      try {
+        config = configured();
+        repo = request?.cwd ?? await chooseRepo(ctx.cwd, config, ctx.ui);
+        settings = readRepoSettings(repo);
+        workflow = resolveWorkflow(settings, request?.workflowName ?? params.workflow);
+      } catch (error) {
         return { content: [{ type: "text", text: `${cleanError(error)} No run started.` }], isError: true };
       }
-      const configuredCommand = params.validation_override?.trim() || request.settings.validationCommand || params.validation_command?.trim();
+      const configuredCommand = params.validation_override?.trim() || settings.validationCommand || params.validation_command?.trim();
       const selected = configuredCommand || await ctx.ui.input(`No default or proposed build command. Which validation command should run in ${validationLocation(workflow)}?`);
       if (selected === undefined) return { content: [{ type: "text", text: "Validation selection cancelled; no run started." }] };
       const validation = selected.trim();
@@ -1693,9 +1693,9 @@ export default function tesselateExtension(pi: ExtensionAPI): void {
       catch (error) {
         return { content: [{ type: "text", text: `${cleanError(error)} No run started.` }], isError: true };
       }
-      pending = undefined;
+      slashRequest = undefined;
       try {
-        const result = await startFeature(configured(), request.cwd, { goal: params.goal, acceptance_criteria: params.acceptance_criteria, constraints: params.constraints, validation_command: validation, base_branch: "" }, ctx.ui, selectedModel(ctx), workflow);
+        const result = await startFeature(config, repo, { goal: params.goal, acceptance_criteria: params.acceptance_criteria, constraints: params.constraints, validation_command: validation, base_branch: "" }, ctx.ui, selectedModel(ctx), workflow);
         return {
           content: [{ type: "text", text: `Tesselate run ${result.run_id}: ${result.phase}. Integration branch ${result.branch}, ${result.integration_dir}. No push or main merge.` }],
           details: result.phase === "done" ? { completedRunId: result.run_id } : undefined,

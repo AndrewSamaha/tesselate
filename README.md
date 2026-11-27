@@ -153,11 +153,15 @@ bearer values. The installed CLI recovers an expired, non-revoked supervisor
 session only from its owner-only local credential file; socket/MCP authentication
 continues to reject expired credentials.
 
-Start OMP from a repository, or from `~/Development`, and ask for a new feature
-in a named repository. The integration asks for the feature goal and acceptance
-criteria, then uses Tesselate for the run, assigned coding worktrees, independent
-reviews, and durable history. `/feature` is the explicit alternative when a
-plain-language request is ambiguous. To register a repository directly:
+Start OMP in the repository, or from `~/Development` to select one. Discuss the
+feature with the driving agent, then say, “Have Tesselate implement the version
+we just agreed on.” Ordinary messages are not intercepted. The agent sends the
+agreed goal, acceptance criteria, and constraints directly to Tesselate. Before
+launching workers, Tesselate shows the selected repository and base, spec, UX
+scope, workflow, and exact validation command for approval.
+
+Use `/feature <goal>` if you want to explicitly open the guided intake instead.
+To register a repository directly:
 
 ```sh
 tesselate project ensure --repo ~/Development/bitwars
